@@ -23,8 +23,14 @@ api_test_() ->
         {"search finds similar documents", fun test_search/0},
         {"search with vector query", fun test_search_vector/0},
         {"delete removes document", fun test_delete/0},
+        {"update modifies document", fun test_update/0},
+        {"update returns not_found", fun test_update_not_found/0},
+        {"upsert inserts new", fun test_upsert_insert/0},
+        {"upsert updates existing", fun test_upsert_update/0},
+        {"peek returns documents", fun test_peek/0},
         {"count returns correct number", fun test_count/0},
-        {"stats returns store info", fun test_stats/0}
+        {"stats returns store info", fun test_stats/0},
+        {"persistence reload", fun test_persistence_reload/0}
       ]
      }
     }.
@@ -156,6 +162,59 @@ test_delete() ->
     ok = barrel_vectordb:delete(test_store, <<"del">>),
     ?assertEqual(not_found, barrel_vectordb:get(test_store, <<"del">>)).
 
+test_update() ->
+    %% Add a document
+    ok = barrel_vectordb:add_vector(test_store, <<"upd">>, <<"original">>, #{v => 1}, [1.0, 0.0, 0.0]),
+    {ok, Doc1} = barrel_vectordb:get(test_store, <<"upd">>),
+    ?assertEqual(<<"original">>, maps:get(text, Doc1)),
+    ?assertEqual(#{v => 1}, maps:get(metadata, Doc1)),
+
+    %% Update it
+    ok = barrel_vectordb:update(test_store, <<"upd">>, <<"updated text">>, #{v => 2}),
+    {ok, Doc2} = barrel_vectordb:get(test_store, <<"upd">>),
+    ?assertEqual(<<"updated text">>, maps:get(text, Doc2)),
+    ?assertEqual(#{v => 2}, maps:get(metadata, Doc2)).
+
+test_update_not_found() ->
+    ?assertEqual(not_found, barrel_vectordb:update(test_store, <<"nonexistent">>, <<"text">>, #{})).
+
+test_upsert_insert() ->
+    %% Upsert new document
+    ?assertEqual(not_found, barrel_vectordb:get(test_store, <<"ups1">>)),
+    ok = barrel_vectordb:upsert(test_store, <<"ups1">>, <<"upserted">>, #{source => upsert}),
+    {ok, Doc} = barrel_vectordb:get(test_store, <<"ups1">>),
+    ?assertEqual(<<"upserted">>, maps:get(text, Doc)),
+    ?assertEqual(#{source => upsert}, maps:get(metadata, Doc)).
+
+test_upsert_update() ->
+    %% Add then upsert (update)
+    ok = barrel_vectordb:add_vector(test_store, <<"ups2">>, <<"v1">>, #{v => 1}, [0.5, 0.5, 0.0]),
+    ok = barrel_vectordb:upsert(test_store, <<"ups2">>, <<"v2">>, #{v => 2}),
+    {ok, Doc} = barrel_vectordb:get(test_store, <<"ups2">>),
+    ?assertEqual(<<"v2">>, maps:get(text, Doc)),
+    ?assertEqual(#{v => 2}, maps:get(metadata, Doc)).
+
+test_peek() ->
+    %% Add some documents
+    ok = barrel_vectordb:add_vector(test_store, <<"p1">>, <<"peek 1">>, #{n => 1}, [1.0, 0.0, 0.0]),
+    ok = barrel_vectordb:add_vector(test_store, <<"p2">>, <<"peek 2">>, #{n => 2}, [0.0, 1.0, 0.0]),
+    ok = barrel_vectordb:add_vector(test_store, <<"p3">>, <<"peek 3">>, #{n => 3}, [0.0, 0.0, 1.0]),
+
+    %% Peek at 2 documents
+    {ok, Docs} = barrel_vectordb:peek(test_store, 2),
+    ?assertEqual(2, length(Docs)),
+
+    %% Each doc should have required fields
+    [First | _] = Docs,
+    ?assert(maps:is_key(key, First)),
+    ?assert(maps:is_key(text, First)),
+    ?assert(maps:is_key(metadata, First)),
+    ?assert(maps:is_key(vector, First)),
+
+    %% Peek at more than exists should return all
+    {ok, AllDocs} = barrel_vectordb:peek(test_store, 10),
+    ?assertEqual(3, length(AllDocs)).
+
 test_count() ->
     ?assertEqual(0, barrel_vectordb:count(test_store)),
 
@@ -173,3 +232,56 @@ test_stats() ->
     ?assertEqual(1, maps:get(count, Stats)),
     ?assert(maps:is_key(hnsw, Stats)),
     ?assert(maps:is_key(config, Stats)).
+
+test_persistence_reload() ->
+    %% This test uses its own store to test persistence across restarts
+    PersistDir = "/tmp/barrel_vectordb_persist_test_" ++
+                 integer_to_list(erlang:unique_integer([positive])),
+
+    %% Create store and add documents
+    {ok, _} = barrel_vectordb:start_link(#{
+        name => persist_test_store,
+        path => PersistDir,
+        dimension => 3,
+        hnsw => #{m => 4, ef_construction => 20}
+    }),
+
+    ok = barrel_vectordb:add_vector(persist_test_store, <<"p1">>, <<"text 1">>,
+                                    #{n => 1}, [1.0, 0.0, 0.0]),
+    ok = barrel_vectordb:add_vector(persist_test_store, <<"p2">>, <<"text 2">>,
+                                    #{n => 2}, [0.0, 1.0, 0.0]),
+    ok = barrel_vectordb:add_vector(persist_test_store, <<"p3">>, <<"text 3">>,
+                                    #{n => 3}, [0.0, 0.0, 1.0]),
+
+    ?assertEqual(3, barrel_vectordb:count(persist_test_store)),
+
+    %% Stop the store
+    ok = barrel_vectordb:stop(persist_test_store),
+    timer:sleep(100),
+
+    %% Restart from the same directory
+    {ok, _} = barrel_vectordb:start_link(#{
+        name => persist_test_store,
+        path => PersistDir,
+        dimension => 3,
+        hnsw => #{m => 4, ef_construction => 20}
+    }),
+
+    %% Verify count is preserved
+    ?assertEqual(3, barrel_vectordb:count(persist_test_store)),
+
+    %% Verify documents can be retrieved
+    {ok, Doc1} = barrel_vectordb:get(persist_test_store, <<"p1">>),
+    ?assertEqual(<<"text 1">>, maps:get(text, Doc1)),
+    ?assertEqual(#{n => 1}, maps:get(metadata, Doc1)),
+
+    %% Verify search still works
+    {ok, Results} = barrel_vectordb:search_vector(persist_test_store,
+                                                   [1.0, 0.0, 0.0], #{k => 2}),
+    ?assertEqual(2, length(Results)),
+    [First | _] = Results,
+    ?assertEqual(<<"p1">>, maps:get(key, First)),
+
+    %% Cleanup
+    ok = barrel_vectordb:stop(persist_test_store),
+    os:cmd("rm -rf " ++ PersistDir).

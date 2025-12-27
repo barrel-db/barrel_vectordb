@@ -19,7 +19,10 @@
     add_vector/5,
     add_batch/2,
     get/2,
+    update/4,
+    upsert/4,
     delete/2,
+    peek/2,
     search/3,
     search_vector/3,
     embed/2,
@@ -80,10 +83,25 @@ add_batch(Store, Docs) ->
 get(Store, Id) ->
     gen_server:call(Store, {get, Id}).
 
+%% @doc Update document metadata (re-embeds the text).
+-spec update(atom() | pid(), binary(), binary(), map()) -> ok | not_found | {error, term()}.
+update(Store, Id, Text, Metadata) ->
+    gen_server:call(Store, {update, Id, Text, Metadata}, infinity).
+
+%% @doc Insert or update document.
+-spec upsert(atom() | pid(), binary(), binary(), map()) -> ok | {error, term()}.
+upsert(Store, Id, Text, Metadata) ->
+    gen_server:call(Store, {upsert, Id, Text, Metadata}, infinity).
+
 %% @doc Delete document.
 -spec delete(atom() | pid(), binary()) -> ok | {error, term()}.
 delete(Store, Id) ->
     gen_server:call(Store, {delete, Id}).
+
+%% @doc Peek at documents (sample without search).
+-spec peek(atom() | pid(), pos_integer()) -> {ok, [map()]}.
+peek(Store, Limit) ->
+    gen_server:call(Store, {peek, Limit}).
 
 %% @doc Search with text query.
 -spec search(atom() | pid(), binary(), map()) -> {ok, [map()]} | {error, term()}.
@@ -206,6 +224,73 @@ handle_call({delete, Id}, _From, State) ->
         {error, _} = Error ->
             {reply, Error, State}
     end;
+
+handle_call({update, Id, Text, Metadata}, _From, State) ->
+    case do_get(Id, State) of
+        {ok, _Existing} ->
+            %% Document exists, delete and re-add with new text/metadata
+            case do_delete(Id, State) of
+                {ok, State1} ->
+                    case do_embed(Text, State1) of
+                        {ok, Vector} ->
+                            case do_add(Id, Text, Metadata, Vector, State1) of
+                                {ok, NewState} ->
+                                    {reply, ok, NewState};
+                                {error, _} = Error ->
+                                    {reply, Error, State}
+                            end;
+                        {error, _} = Error ->
+                            {reply, Error, State}
+                    end;
+                {error, _} = Error ->
+                    {reply, Error, State}
+            end;
+        not_found ->
+            {reply, not_found, State};
+        {error, _} = Error ->
+            {reply, Error, State}
+    end;
+
+handle_call({upsert, Id, Text, Metadata}, _From, State) ->
+    case do_get(Id, State) of
+        {ok, _Existing} ->
+            %% Exists: delete and re-add
+            case do_delete(Id, State) of
+                {ok, State1} ->
+                    case do_embed(Text, State1) of
+                        {ok, Vector} ->
+                            case do_add(Id, Text, Metadata, Vector, State1) of
+                                {ok, NewState} ->
+                                    {reply, ok, NewState};
+                                {error, _} = Error ->
+                                    {reply, Error, State}
+                            end;
+                        {error, _} = Error ->
+                            {reply, Error, State}
+                    end;
+                {error, _} = Error ->
+                    {reply, Error, State}
+            end;
+        not_found ->
+            %% Not found: just add
+            case do_embed(Text, State) of
+                {ok, Vector} ->
+                    case do_add(Id, Text, Metadata, Vector, State) of
+                        {ok, NewState} ->
+                            {reply, ok, NewState};
+                        {error, _} = Error ->
+                            {reply, Error, State}
+                    end;
+                {error, _} = Error ->
+                    {reply, Error, State}
+            end;
+        {error, _} = Error ->
+            {reply, Error, State}
+    end;
+
+handle_call({peek, Limit}, _From, State) ->
+    Result = do_peek(Limit, State),
+    {reply, Result, State};
 
 handle_call({search, Query, Opts}, _From, State) ->
     case do_embed(Query, State) of
@@ -461,6 +546,41 @@ do_delete(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
             {ok, State#state{hnsw_index = NewIndex}};
         {error, Reason} ->
             {error, {db_error, Reason}}
+    end.
+
+%% Peek at documents (sample without search)
+do_peek(Limit, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM, cf_text = CfT}) ->
+    case rocksdb:iterator(Db, CfV, []) of
+        {ok, Iter} ->
+            try
+                Docs = peek_loop(Db, Iter, rocksdb:iterator_move(Iter, first),
+                                 CfM, CfT, Limit, []),
+                {ok, Docs}
+            after
+                rocksdb:iterator_close(Iter)
+            end;
+        {error, _} ->
+            {ok, []}
+    end.
+
+peek_loop(_Db, _Iter, _, _CfM, _CfT, 0, Acc) ->
+    lists:reverse(Acc);
+peek_loop(_Db, _Iter, {error, _}, _CfM, _CfT, _Limit, Acc) ->
+    lists:reverse(Acc);
+peek_loop(Db, Iter, {ok, Key, VectorBin}, CfM, CfT, Limit, Acc) ->
+    case {rocksdb:get(Db, CfM, Key, []), rocksdb:get(Db, CfT, Key, [])} of
+        {{ok, MetadataBin}, {ok, Text}} ->
+            Doc = #{
+                key => Key,
+                vector => decode_vector(VectorBin),
+                metadata => binary_to_term(MetadataBin),
+                text => Text
+            },
+            peek_loop(Db, Iter, rocksdb:iterator_move(Iter, next),
+                      CfM, CfT, Limit - 1, [Doc | Acc]);
+        _ ->
+            peek_loop(Db, Iter, rocksdb:iterator_move(Iter, next),
+                      CfM, CfT, Limit, Acc)
     end.
 
 %% Search for similar documents

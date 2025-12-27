@@ -75,7 +75,10 @@
     add_vector/5,
     add_batch/2,
     get/2,
-    delete/2
+    update/4,
+    upsert/4,
+    delete/2,
+    peek/2
 ]).
 
 %% API - Search
@@ -325,6 +328,63 @@ get(Store, Id) ->
 -spec delete(store(), id()) -> ok | {error, term()}.
 delete(Store, Id) ->
     barrel_vectordb_server:delete(Store, Id).
+
+%% @doc Update a document.
+%%
+%% Updates an existing document by re-embedding the text and storing
+%% the new text and metadata. Returns `not_found' if the document
+%% does not exist.
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_vectordb:update(my_store, <<"doc-1">>, <<"New text">>, #{updated => true}).
+%% '''
+%%
+%% @param Store Store name or pid
+%% @param Id Document identifier
+%% @param Text New text to embed and store
+%% @param Metadata New metadata map
+%% @returns `ok' on success, `not_found', or `{error, Reason}'
+-spec update(store(), id(), text(), metadata()) -> ok | not_found | {error, term()}.
+update(Store, Id, Text, Metadata) ->
+    barrel_vectordb_server:update(Store, Id, Text, Metadata).
+
+%% @doc Insert or update a document.
+%%
+%% If the document exists, updates it. If not, inserts it.
+%% Always succeeds (unless there's an error).
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_vectordb:upsert(my_store, <<"doc-1">>, <<"Text">>, #{}).
+%% '''
+%%
+%% @param Store Store name or pid
+%% @param Id Document identifier
+%% @param Text Text to embed and store
+%% @param Metadata Metadata map
+%% @returns `ok' on success, `{error, Reason}' on failure
+-spec upsert(store(), id(), text(), metadata()) -> ok | {error, term()}.
+upsert(Store, Id, Text, Metadata) ->
+    barrel_vectordb_server:upsert(Store, Id, Text, Metadata).
+
+%% @doc Peek at documents.
+%%
+%% Returns a sample of documents without performing a search.
+%% Useful for inspecting the store contents.
+%%
+%% == Example ==
+%% ```
+%% {ok, Docs} = barrel_vectordb:peek(my_store, 10),
+%% [#{key := K, text := T, metadata := M} | _] = Docs.
+%% '''
+%%
+%% @param Store Store name or pid
+%% @param Limit Maximum number of documents to return
+%% @returns `{ok, Docs}' list of documents
+-spec peek(store(), pos_integer()) -> {ok, [map()]}.
+peek(Store, Limit) ->
+    barrel_vectordb_server:peek(Store, Limit).
 
 %%====================================================================
 %% Search API
