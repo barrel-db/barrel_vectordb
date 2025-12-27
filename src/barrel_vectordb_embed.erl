@@ -11,6 +11,7 @@
 %%% == Providers ==
 %%% - `local': Local Python with sentence-transformers (CPU, no external calls)
 %%% - `ollama': Local Ollama server
+%%% - `openai': OpenAI Embeddings API (requires API key)
 %%%
 %%% == Configuration ==
 %%% ```
@@ -24,6 +25,12 @@
 %%% Embedder = {ollama, #{
 %%%     url => <<"http://localhost:11434">>,
 %%%     model => <<"nomic-embed-text">>
+%%% }}.
+%%%
+%%% %% OpenAI API (requires API key)
+%%% Embedder = {openai, #{
+%%%     api_key => <<"sk-...">>,  %% or set OPENAI_API_KEY env var
+%%%     model => <<"text-embedding-3-small">>
 %%% }}.
 %%%
 %%% %% Provider chain with fallback
@@ -178,6 +185,7 @@ normalize_providers(Providers) when is_list(Providers) ->
 %% Map provider name to module
 provider_module(local) -> barrel_vectordb_embed_local;
 provider_module(ollama) -> barrel_vectordb_embed_ollama;
+provider_module(openai) -> barrel_vectordb_embed_openai;
 provider_module(Module) when is_atom(Module) -> Module.
 
 %% Initialize a provider

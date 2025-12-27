@@ -221,12 +221,38 @@ ollama pull nomic-embed-text
 | `all-minilm` | 384 | Fast |
 | `snowflake-arctic-embed` | 1024 | Multilingual |
 
+### OpenAI
+
+OpenAI Embeddings API. Requires an API key.
+
+```erlang
+embedder => {openai, #{
+    api_key => <<"sk-...">>,               %% API key (or set OPENAI_API_KEY env var)
+    model => <<"text-embedding-3-small">>, %% Model name (default, 1536 dims)
+    timeout => 30000                       %% Timeout in ms (default)
+}}
+```
+
+```bash
+# Set API key as environment variable (alternative to config)
+export OPENAI_API_KEY=sk-...
+```
+
+**Supported Models:**
+
+| Model | Dimensions | Notes |
+|-------|------------|-------|
+| `text-embedding-3-small` | 1536 | Default, fast and cheap |
+| `text-embedding-3-large` | 3072 | Higher quality |
+| `text-embedding-ada-002` | 1536 | Legacy model |
+
 ### Provider Chain
 
 Try providers in order until one succeeds.
 
 ```erlang
 embedder => [
+    {openai, #{api_key => <<"sk-...">>}},  %% Try OpenAI first
     {ollama, #{url => <<"http://localhost:11434">>}},
     {local, #{}}  %% Fallback to CPU
 ]
@@ -262,6 +288,9 @@ pip install sentence-transformers
 # Setup for Ollama provider
 ollama serve &
 ollama pull nomic-embed-text
+
+# Setup for OpenAI provider
+export OPENAI_API_KEY=sk-...
 
 # Run integration tests
 rebar3 eunit --module=barrel_vectordb_integration_tests
