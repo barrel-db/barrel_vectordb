@@ -141,8 +141,6 @@ normalize_providers(Providers) when is_list(Providers) ->
 %% Map provider name to module
 provider_module(local) -> barrel_vectordb_embed_local;
 provider_module(ollama) -> barrel_vectordb_embed_ollama;
-provider_module(openai) -> barrel_vectordb_embed_openai;
-provider_module(anthropic) -> barrel_vectordb_embed_anthropic;
 provider_module(Module) when is_atom(Module) -> Module.
 
 %% Initialize a provider
@@ -205,7 +203,7 @@ do_batch_embed(Module, Config, Texts, BatchSize) ->
     do_batch_embed_loop(Module, Config, Batches, []).
 
 do_batch_embed_loop(_Module, _Config, [], Acc) ->
-    {ok, lists:flatten(lists:reverse(Acc))};
+    {ok, lists:append(lists:reverse(Acc))};
 do_batch_embed_loop(Module, Config, [Batch | Rest], Acc) ->
     case barrel_vectordb_embed_provider:call_embed_batch(Module, Batch, Config) of
         {ok, Vectors} ->
