@@ -30,11 +30,16 @@
 
 -type hnsw_config() :: #hnsw_config{}.
 
-%% HNSW node
+%% Quantized vector: 8-bit signed integers with scale factor
+%% Format: <<Scale:32/float, Components/binary>> where each component is int8
+-type quantized_vector() :: binary().
+
+%% HNSW node with quantized vector and cached norm
 -record(hnsw_node, {
     id :: binary(),
-    vector :: [float()],
-    layer :: non_neg_integer(),        %% Max layer this node exists in
+    vector :: quantized_vector(),       %% 8-bit quantized vector binary
+    norm :: float(),                    %% Pre-computed L2 norm (of original)
+    layer :: non_neg_integer(),         %% Max layer this node exists in
     neighbors = #{} :: #{non_neg_integer() => [binary()]}
 }).
 
