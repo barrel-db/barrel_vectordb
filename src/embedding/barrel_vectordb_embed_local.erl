@@ -2,15 +2,33 @@
 %%% @doc Local Python embedding provider
 %%%
 %%% Uses a Python port with sentence-transformers for CPU-based embeddings.
-%%% This is the default provider (no GPU required).
+%%% No GPU required, runs entirely on CPU.
+%%%
+%%% == Requirements ==
+%%% ```
+%%% pip install sentence-transformers
+%%% '''
 %%%
 %%% == Configuration ==
 %%% ```
 %%% Config = #{
-%%%     python => "python3",
-%%%     model => "BAAI/bge-base-en-v1.5"
+%%%     python => "python3",                     %% Python executable (default)
+%%%     model => "BAAI/bge-base-en-v1.5",        %% Model name (default, 768 dims)
+%%%     timeout => 120000                        %% Timeout in ms (default)
 %%% }.
 %%% '''
+%%%
+%%% == Supported Models ==
+%%% Any model from sentence-transformers or HuggingFace:
+%%%
+%%% - `"BAAI/bge-base-en-v1.5"' - Default, 768 dimensions, good quality/speed balance
+%%% - `"BAAI/bge-small-en-v1.5"' - 384 dimensions, faster, slightly lower quality
+%%% - `"BAAI/bge-large-en-v1.5"' - 1024 dimensions, best quality, slower
+%%% - `"sentence-transformers/all-MiniLM-L6-v2"' - 384 dims, fast, general purpose
+%%% - `"sentence-transformers/all-mpnet-base-v2"' - 768 dims, high quality
+%%% - `"nomic-ai/nomic-embed-text-v1.5"' - 768 dims, long context (8192 tokens)
+%%%
+%%% Note: The dimension is auto-detected from the model on initialization.
 %%%
 %%% == Protocol ==
 %%% Communication via stdin/stdout using JSON lines:

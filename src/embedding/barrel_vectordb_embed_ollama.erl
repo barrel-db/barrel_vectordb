@@ -2,16 +2,33 @@
 %%% @doc Ollama embedding provider
 %%%
 %%% Uses Ollama's local API for embedding generation.
-%%% Default model: nomic-embed-text (768 dimensions)
+%%% Requires Ollama to be running locally.
+%%%
+%%% == Requirements ==
+%%% ```
+%%% # Install Ollama from https://ollama.ai
+%%% # Pull an embedding model:
+%%% ollama pull nomic-embed-text
+%%% '''
 %%%
 %%% == Configuration ==
 %%% ```
 %%% Config = #{
-%%%     url => <<"http://localhost:11434">>,
-%%%     model => <<"nomic-embed-text">>,
-%%%     timeout => 30000
+%%%     url => <<"http://localhost:11434">>,   %% Ollama API URL (default)
+%%%     model => <<"nomic-embed-text">>,       %% Model name (default, 768 dims)
+%%%     timeout => 30000                       %% Timeout in ms (default)
 %%% }.
 %%% '''
+%%%
+%%% == Supported Models ==
+%%% Any Ollama embedding model. Popular choices:
+%%%
+%%% - `<<"nomic-embed-text">>' - Default, 768 dims, general purpose
+%%% - `<<"mxbai-embed-large">>' - 1024 dims, high quality
+%%% - `<<"all-minilm">>' - 384 dims, fast
+%%% - `<<"snowflake-arctic-embed">>' - 1024 dims, multilingual
+%%%
+%%% Pull models with: `ollama pull MODEL_NAME'
 %%%
 %%% @end
 %%%-------------------------------------------------------------------

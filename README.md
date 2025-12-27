@@ -132,26 +132,94 @@ Local Python with sentence-transformers. CPU-based, no external API calls.
 
 ```erlang
 embedder => {local, #{
-    python => "python3",                %% Python executable
-    model => "BAAI/bge-base-en-v1.5"    %% Model name (768 dimensions)
+    python => "python3",                %% Python executable (default)
+    model => "BAAI/bge-base-en-v1.5",   %% Model name (default, 768 dims)
+    timeout => 120000                   %% Timeout in ms (default)
 }}
 ```
 
-Requires:
+**Setup with virtual environment (recommended):**
+
 ```bash
+# Create virtual environment
+python3 -m venv ~/.venv/barrel_embed
+source ~/.venv/barrel_embed/bin/activate
+
+# Install dependencies
 pip install sentence-transformers
+
+# Verify installation
+python -c "from sentence_transformers import SentenceTransformer; print('OK')"
 ```
+
+Then start the store with the virtual environment's Python path:
+
+```erlang
+{ok, _} = barrel_vectordb:start_link(#{
+    name => my_store,
+    path => "/tmp/vectors",
+    embedder => {local, #{
+        python => "/home/user/.venv/barrel_embed/bin/python"
+    }}
+}).
+```
+
+Or activate the venv before starting your Erlang application:
+
+```bash
+source ~/.venv/barrel_embed/bin/activate
+rebar3 shell
+```
+
+```erlang
+%% Now python3 will use the venv automatically
+{ok, _} = barrel_vectordb:start_link(#{
+    name => my_store,
+    path => "/tmp/vectors",
+    embedder => {local, #{}}  %% uses default python3
+}).
+```
+
+**Supported Models:**
+
+Any sentence-transformers or HuggingFace model works. Popular choices:
+
+| Model | Dimensions | Notes |
+|-------|------------|-------|
+| `BAAI/bge-base-en-v1.5` | 768 | Default, good quality/speed |
+| `BAAI/bge-small-en-v1.5` | 384 | Faster, smaller |
+| `BAAI/bge-large-en-v1.5` | 1024 | Best quality, slower |
+| `sentence-transformers/all-MiniLM-L6-v2` | 384 | Fast, general purpose |
+| `sentence-transformers/all-mpnet-base-v2` | 768 | High quality |
+| `nomic-ai/nomic-embed-text-v1.5` | 768 | Long context (8192 tokens) |
+
+The dimension is auto-detected from the model.
 
 ### Ollama
 
-Local Ollama server.
+Local Ollama server. Requires [Ollama](https://ollama.ai) to be running.
 
 ```erlang
 embedder => {ollama, #{
-    url => <<"http://localhost:11434">>,
-    model => <<"nomic-embed-text">>
+    url => <<"http://localhost:11434">>,   %% Ollama API URL (default)
+    model => <<"nomic-embed-text">>,       %% Model name (default, 768 dims)
+    timeout => 30000                       %% Timeout in ms (default)
 }}
 ```
+
+```bash
+# Pull embedding models:
+ollama pull nomic-embed-text
+```
+
+**Supported Models:**
+
+| Model | Dimensions | Notes |
+|-------|------------|-------|
+| `nomic-embed-text` | 768 | Default, general purpose |
+| `mxbai-embed-large` | 1024 | High quality |
+| `all-minilm` | 384 | Fast |
+| `snowflake-arctic-embed` | 1024 | Multilingual |
 
 ### Provider Chain
 
@@ -172,6 +240,36 @@ embedder => [
 | `ef_construction` | 200 | Build-time search width |
 | `ef_search` | 50 | Query-time search width |
 | `distance_fn` | cosine | `cosine` or `euclidean` |
+
+## Testing
+
+### Unit Tests
+
+Unit tests use mocking and don't require external dependencies:
+
+```bash
+rebar3 eunit
+```
+
+### Integration Tests
+
+Integration tests verify real embedding providers. They require backends to be available:
+
+```bash
+# Setup for local provider
+pip install sentence-transformers
+
+# Setup for Ollama provider
+ollama serve &
+ollama pull nomic-embed-text
+
+# Run integration tests
+rebar3 eunit --module=barrel_vectordb_integration_tests
+```
+
+Tests automatically skip if their required backend is unavailable.
+
+See `test/integration/README.md` for details.
 
 ## Architecture
 
