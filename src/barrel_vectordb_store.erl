@@ -278,7 +278,7 @@ rebuild_from_meta(Db, _IndexMeta, CfHnsw, CfVectors, Dimension, HnswConfig) ->
     Index = barrel_vectordb_hnsw:new(HnswConfig#{dimension => Dimension}),
 
     %% Iterate through all vectors and rebuild
-    case rocksdb:iterator(CfVectors, []) of
+    case rocksdb:iterator(Db, CfVectors, []) of
         {ok, Iter} ->
             try
                 rebuild_loop(Db, Iter, rocksdb:iterator_move(Iter, first), CfHnsw, Index)
@@ -443,11 +443,11 @@ do_search(QueryVector, K, Options, #state{db = Db, hnsw_index = Index,
     {ok, Results}.
 
 %% Rebuild the entire index
-do_rebuild_index(#state{cf_vectors = CfV, dimension = Dim, config = Config} = State) ->
+do_rebuild_index(#state{db = Db, cf_vectors = CfV, dimension = Dim, config = Config} = State) ->
     HnswConfig = maps:get(hnsw, Config, #{}),
     NewIndex = barrel_vectordb_hnsw:new(HnswConfig#{dimension => Dim}),
 
-    case rocksdb:iterator(CfV, []) of
+    case rocksdb:iterator(Db, CfV, []) of
         {ok, Iter} ->
             try
                 FinalIndex = rebuild_index_loop(Iter, rocksdb:iterator_move(Iter, first), NewIndex),
@@ -466,11 +466,11 @@ rebuild_index_loop(Iter, {ok, Key, VectorBin}, Index) ->
     NewIndex = barrel_vectordb_hnsw:insert(Index, Key, Vector),
     rebuild_index_loop(Iter, rocksdb:iterator_move(Iter, next), NewIndex).
 
-%% Vector encoding/decoding
+%% Vector encoding/decoding (64-bit floats for full precision)
 encode_vector(Vector) when is_list(Vector) ->
-    << <<F:32/float-little>> || F <- Vector >>;
+    << <<F:64/float-little>> || F <- Vector >>;
 encode_vector(Binary) when is_binary(Binary) ->
     Binary.
 
 decode_vector(Binary) ->
-    [F || <<F:32/float-little>> <= Binary].
+    [F || <<F:64/float-little>> <= Binary].

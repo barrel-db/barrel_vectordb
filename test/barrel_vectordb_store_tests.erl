@@ -52,6 +52,9 @@ setup_test() ->
         hnsw => #{m => 4, ef_construction => 20}
     },
 
+    %% Ensure meck is clean before starting
+    (catch meck:unload(barrel_vectordb_embed)),
+
     %% Start a mock embeddings server that just returns dummy vectors
     meck:new(barrel_vectordb_embed, [non_strict]),
     meck:expect(barrel_vectordb_embed, embed, fun(Text) ->
@@ -72,9 +75,10 @@ setup_test() ->
 cleanup_test({_Pid, TestDir}) ->
     %% Stop store
     catch barrel_vectordb_store:stop(),
+    timer:sleep(50),  %% Allow gen_server to stop
 
     %% Cleanup meck
-    catch meck:unload(barrel_vectordb_embed),
+    (catch meck:unload(barrel_vectordb_embed)),
 
     %% Remove test directory
     os:cmd("rm -rf " ++ TestDir),

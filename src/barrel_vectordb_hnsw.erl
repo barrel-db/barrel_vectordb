@@ -78,6 +78,7 @@ new(Options) ->
     }.
 
 %% @doc Insert a vector with given ID into the index
+%% If the ID already exists, the old entry is deleted first (update semantics).
 -spec insert(hnsw_index(), binary(), [float()]) -> hnsw_index().
 insert(#hnsw_index{entry_point = undefined, config = Config, dimension = Dim} = Index,
        Id, Vector) when length(Vector) =:= Dim ->
@@ -95,8 +96,20 @@ insert(#hnsw_index{entry_point = undefined, config = Config, dimension = Dim} = 
         nodes = #{Id => Node},
         size = 1
     };
-insert(#hnsw_index{dimension = Dim} = Index, Id, Vector) when length(Vector) =:= Dim ->
-    insert_node(Index, Id, Vector);
+insert(#hnsw_index{dimension = Dim, nodes = Nodes} = Index, Id, Vector) when length(Vector) =:= Dim ->
+    %% Check if ID already exists - if so, delete first (update semantics)
+    CleanIndex = case maps:is_key(Id, Nodes) of
+        true -> delete(Index, Id);
+        false -> Index
+    end,
+    %% Handle case where delete might have left index empty
+    case CleanIndex#hnsw_index.entry_point of
+        undefined ->
+            %% Re-insert as first node
+            insert(CleanIndex, Id, Vector);
+        _ ->
+            insert_node(CleanIndex, Id, Vector)
+    end;
 insert(#hnsw_index{dimension = Dim}, _Id, Vector) ->
     error({invalid_dimension, Dim, length(Vector)}).
 
