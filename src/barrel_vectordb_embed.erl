@@ -4,15 +4,32 @@
 %%% Manages a chain of embedding providers with automatic fallback.
 %%% Tries each provider in order until one succeeds.
 %%%
+%%% Embedder configuration is **explicit** - no default provider.
+%%% If no embedder is configured, only `add_vector/5` and `search_vector/3`
+%%% will work; text-based operations will return `{error, embedder_not_configured}`.
+%%%
+%%% == Providers ==
+%%% - `local': Local Python with sentence-transformers (CPU, no external calls)
+%%% - `ollama': Local Ollama server
+%%%
 %%% == Configuration ==
 %%% ```
-%%% %% Single provider
-%%% Embedder = {local, #{}}.
+%%% %% Local Python embeddings (requires Python + sentence-transformers)
+%%% Embedder = {local, #{
+%%%     python => "python3",
+%%%     model => "BAAI/bge-base-en-v1.5"
+%%% }}.
+%%%
+%%% %% Ollama server
+%%% Embedder = {ollama, #{
+%%%     url => <<"http://localhost:11434">>,
+%%%     model => <<"nomic-embed-text">>
+%%% }}.
 %%%
 %%% %% Provider chain with fallback
 %%% Embedder = [
-%%%     {ollama, #{url => <<"http://localhost:11434">>, model => <<"nomic-embed-text">>}},
-%%%     {local, #{}}  %% fallback
+%%%     {ollama, #{url => <<"http://localhost:11434">>}},
+%%%     {local, #{}}  %% fallback to CPU
 %%% ].
 %%% '''
 %%%
@@ -49,11 +66,24 @@
 %%====================================================================
 
 %% @doc Initialize embedding state from configuration.
-%% @param Config Map with embedder configuration
-%% @returns Initialized embedding state
--spec init(map()) -> {ok, embed_state()} | {error, term()}.
+%%
+%% If no `embedder' key is present in Config, returns `{ok, undefined}'.
+%% This allows the store to work without embeddings (vector-only mode).
+%%
+%% @param Config Map with optional embedder configuration
+%% @returns `{ok, embed_state()}', `{ok, undefined}', or `{error, term()}'
+-spec init(map()) -> {ok, embed_state() | undefined} | {error, term()}.
 init(Config) ->
-    EmbedderConfig = maps:get(embedder, Config, default_embedder()),
+    case maps:get(embedder, Config, undefined) of
+        undefined ->
+            %% No embedder configured - vector-only mode
+            {ok, undefined};
+        EmbedderConfig ->
+            init_with_embedder(EmbedderConfig, Config)
+    end.
+
+%% @private
+init_with_embedder(EmbedderConfig, Config) ->
     Dimension = maps:get(dimensions, Config, ?DEFAULT_DIMENSION),
     BatchSize = maps:get(batch_size, Config, ?DEFAULT_BATCH_SIZE),
 
@@ -90,36 +120,47 @@ init(Config) ->
     end.
 
 %% @doc Generate embedding for a single text.
--spec embed(binary(), embed_state()) -> {ok, [float()]} | {error, term()}.
+-spec embed(binary(), embed_state() | undefined) -> {ok, [float()]} | {error, term()}.
+embed(_Text, undefined) ->
+    {error, embedder_not_configured};
 embed(Text, #{providers := Providers}) when is_binary(Text) ->
     try_providers_embed(Providers, Text);
 embed(Text, State) when is_list(Text) ->
     embed(list_to_binary(Text), State).
 
 %% @doc Generate embeddings for multiple texts.
--spec embed_batch([binary()], embed_state()) -> {ok, [[float()]]} | {error, term()}.
+-spec embed_batch([binary()], embed_state() | undefined) -> {ok, [[float()]]} | {error, term()}.
+embed_batch(_Texts, undefined) ->
+    {error, embedder_not_configured};
 embed_batch(Texts, State) ->
     embed_batch(Texts, #{}, State).
 
 %% @doc Generate embeddings for multiple texts with options.
--spec embed_batch([binary()], map(), embed_state()) -> {ok, [[float()]]} | {error, term()}.
+-spec embed_batch([binary()], map(), embed_state() | undefined) -> {ok, [[float()]]} | {error, term()}.
+embed_batch(_Texts, _Options, undefined) ->
+    {error, embedder_not_configured};
 embed_batch(Texts, Options, #{providers := Providers, batch_size := DefaultBatchSize}) ->
     BatchSize = maps:get(batch_size, Options, DefaultBatchSize),
     try_providers_embed_batch(Providers, Texts, BatchSize).
 
 %% @doc Get the dimension of embeddings.
--spec dimension(embed_state()) -> pos_integer().
+-spec dimension(embed_state() | undefined) -> pos_integer() | undefined.
+dimension(undefined) ->
+    undefined;
 dimension(#{dimension := Dimension}) ->
     Dimension.
 
 %% @doc Get information about the current embedding configuration.
--spec info(embed_state()) -> map().
+-spec info(embed_state() | undefined) -> map().
+info(undefined) ->
+    #{configured => false};
 info(#{providers := Providers, dimension := Dimension}) ->
     ProviderInfo = [
         #{module => Module, name => Module:name()}
         || {Module, _Config} <- Providers
     ],
     #{
+        configured => true,
         providers => ProviderInfo,
         dimension => Dimension
     }.
@@ -127,10 +168,6 @@ info(#{providers := Providers, dimension := Dimension}) ->
 %%====================================================================
 %% Internal Functions
 %%====================================================================
-
-%% Default embedder configuration - local CPU
-default_embedder() ->
-    {local, #{}}.
 
 %% Normalize embedder config to provider chain
 normalize_providers({Name, Config}) when is_atom(Name) ->

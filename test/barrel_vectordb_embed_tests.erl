@@ -15,17 +15,21 @@ embed_test_() ->
      fun setup/0,
      fun cleanup/1,
      [
-       {"init with default config", fun test_init_default/0},
+       {"init without embedder returns undefined", fun test_init_no_embedder/0},
+       {"init with embedder", fun test_init_with_embedder/0},
        {"init with custom dimension", fun test_init_dimension/0},
        {"init with provider chain", fun test_init_chain/0},
-       {"init fails with no providers", fun test_init_no_providers/0},
+       {"init fails when provider fails", fun test_init_provider_fails/0},
        {"embed single text", fun test_embed/0},
        {"embed with string input", fun test_embed_string/0},
+       {"embed without embedder returns error", fun test_embed_no_embedder/0},
        {"embed_batch multiple texts", fun test_embed_batch/0},
        {"embed_batch with custom batch size", fun test_embed_batch_size/0},
        {"embed_batch chunking", fun test_embed_batch_chunking/0},
        {"dimension returns configured value", fun test_dimension/0},
+       {"dimension returns undefined when no embedder", fun test_dimension_no_embedder/0},
        {"info returns provider details", fun test_info/0},
+       {"info returns not configured when no embedder", fun test_info_no_embedder/0},
        {"fallback to next provider", fun test_fallback/0},
        {"all providers fail", fun test_all_fail/0}
      ]
@@ -67,14 +71,22 @@ cleanup(_) ->
 %% Test Cases
 %%====================================================================
 
-test_init_default() ->
+test_init_no_embedder() ->
+    %% No embedder config -> returns undefined
     {ok, State} = barrel_vectordb_embed:init(#{}),
+    ?assertEqual(undefined, State).
+
+test_init_with_embedder() ->
+    {ok, State} = barrel_vectordb_embed:init(#{embedder => {local, #{}}}),
     ?assertEqual(768, maps:get(dimension, State)),
     ?assertEqual(32, maps:get(batch_size, State)),
     ?assert(length(maps:get(providers, State)) > 0).
 
 test_init_dimension() ->
-    {ok, State} = barrel_vectordb_embed:init(#{dimensions => 384}),
+    {ok, State} = barrel_vectordb_embed:init(#{
+        embedder => {local, #{}},
+        dimensions => 384
+    }),
     ?assertEqual(384, maps:get(dimension, State)).
 
 test_init_chain() ->
@@ -87,12 +99,12 @@ test_init_chain() ->
     {ok, State} = barrel_vectordb_embed:init(Config),
     ?assertEqual(2, length(maps:get(providers, State))).
 
-test_init_no_providers() ->
+test_init_provider_fails() ->
     %% Mock init to fail
     meck:expect(barrel_vectordb_embed_local, init, fun(_) ->
         {error, not_available}
     end),
-    Result = barrel_vectordb_embed:init(#{}),
+    Result = barrel_vectordb_embed:init(#{embedder => {local, #{}}}),
     ?assertEqual({error, no_providers_available}, Result),
     %% Restore
     meck:expect(barrel_vectordb_embed_local, init, fun(Config) ->
@@ -100,18 +112,23 @@ test_init_no_providers() ->
     end).
 
 test_embed() ->
-    {ok, State} = barrel_vectordb_embed:init(#{}),
+    {ok, State} = barrel_vectordb_embed:init(#{embedder => {local, #{}}}),
     {ok, Vec} = barrel_vectordb_embed:embed(<<"hello world">>, State),
     ?assertEqual(768, length(Vec)),
     ?assert(is_float(hd(Vec))).
 
 test_embed_string() ->
-    {ok, State} = barrel_vectordb_embed:init(#{}),
+    {ok, State} = barrel_vectordb_embed:init(#{embedder => {local, #{}}}),
     {ok, Vec} = barrel_vectordb_embed:embed("hello world", State),
     ?assertEqual(768, length(Vec)).
 
-test_embed_batch() ->
+test_embed_no_embedder() ->
     {ok, State} = barrel_vectordb_embed:init(#{}),
+    Result = barrel_vectordb_embed:embed(<<"hello">>, State),
+    ?assertEqual({error, embedder_not_configured}, Result).
+
+test_embed_batch() ->
+    {ok, State} = barrel_vectordb_embed:init(#{embedder => {local, #{}}}),
     Texts = [<<"one">>, <<"two">>, <<"three">>],
     {ok, Vecs} = barrel_vectordb_embed:embed_batch(Texts, State),
     ?assertEqual(3, length(Vecs)),
@@ -120,7 +137,10 @@ test_embed_batch() ->
     end, Vecs).
 
 test_embed_batch_size() ->
-    {ok, State} = barrel_vectordb_embed:init(#{batch_size => 10}),
+    {ok, State} = barrel_vectordb_embed:init(#{
+        embedder => {local, #{}},
+        batch_size => 10
+    }),
     ?assertEqual(10, maps:get(batch_size, State)).
 
 test_embed_batch_chunking() ->
@@ -132,7 +152,10 @@ test_embed_batch_chunking() ->
         {ok, Vecs}
     end),
 
-    {ok, State} = barrel_vectordb_embed:init(#{batch_size => 2}),
+    {ok, State} = barrel_vectordb_embed:init(#{
+        embedder => {local, #{}},
+        batch_size => 2
+    }),
     Texts = [<<"a">>, <<"b">>, <<"c">>, <<"d">>, <<"e">>],
     {ok, Vecs} = barrel_vectordb_embed:embed_batch(Texts, State),
 
@@ -143,16 +166,29 @@ test_embed_batch_chunking() ->
     ?assertEqual([2, 2, 1], Sizes).
 
 test_dimension() ->
-    {ok, State} = barrel_vectordb_embed:init(#{dimensions => 512}),
+    {ok, State} = barrel_vectordb_embed:init(#{
+        embedder => {local, #{}},
+        dimensions => 512
+    }),
     ?assertEqual(512, barrel_vectordb_embed:dimension(State)).
 
-test_info() ->
+test_dimension_no_embedder() ->
     {ok, State} = barrel_vectordb_embed:init(#{}),
+    ?assertEqual(undefined, barrel_vectordb_embed:dimension(State)).
+
+test_info() ->
+    {ok, State} = barrel_vectordb_embed:init(#{embedder => {local, #{}}}),
     Info = barrel_vectordb_embed:info(State),
+    ?assertEqual(true, maps:get(configured, Info)),
     ?assert(maps:is_key(providers, Info)),
     ?assert(maps:is_key(dimension, Info)),
     [Provider | _] = maps:get(providers, Info),
     ?assertEqual(local, maps:get(name, Provider)).
+
+test_info_no_embedder() ->
+    {ok, State} = barrel_vectordb_embed:init(#{}),
+    Info = barrel_vectordb_embed:info(State),
+    ?assertEqual(false, maps:get(configured, Info)).
 
 test_fallback() ->
     %% Create a mock failing provider
@@ -184,7 +220,7 @@ test_all_fail() ->
         {error, failed}
     end),
 
-    {ok, State} = barrel_vectordb_embed:init(#{}),
+    {ok, State} = barrel_vectordb_embed:init(#{embedder => {local, #{}}}),
     Result = barrel_vectordb_embed:embed(<<"test">>, State),
     ?assertEqual({error, all_providers_failed}, Result).
     %% No need to restore - foreach runs setup/cleanup for each test

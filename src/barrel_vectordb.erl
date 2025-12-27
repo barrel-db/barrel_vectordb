@@ -1,39 +1,59 @@
 %%%-------------------------------------------------------------------
 %%% @doc barrel_vectordb - Erlang Vector Database
 %%%
-%%% An Erlang library for storing and searching vectors with built-in
-%%% embedding support. Use it to add semantic search to your application.
+%%% An Erlang library for storing and searching vectors. Supports optional
+%%% embedding providers for text-to-vector conversion.
 %%%
-%%% == Quick Start ==
+%%% == Quick Start (with embeddings) ==
 %%% ```
-%%% %% Start a store
+%%% %% Start a store with local Python embeddings
+%%% {ok, _} = barrel_vectordb:start_link(#{
+%%%     name => my_store,
+%%%     path => "/tmp/vectors",
+%%%     embedder => {local, #{}}  %% requires Python + sentence-transformers
+%%% }).
+%%%
+%%% %% Add a document (embeds the text automatically)
+%%% ok = barrel_vectordb:add(my_store, <<"doc-1">>, <<"Hello world">>, #{}).
+%%%
+%%% %% Search with text query
+%%% {ok, Results} = barrel_vectordb:search(my_store, <<"greetings">>, #{k => 5}).
+%%% '''
+%%%
+%%% == Quick Start (vector-only, no embedder) ==
+%%% ```
+%%% %% Start a store without embedder
 %%% {ok, _} = barrel_vectordb:start_link(#{
 %%%     name => my_store,
 %%%     path => "/tmp/vectors",
 %%%     dimensions => 768
 %%% }).
 %%%
-%%% %% Add a document (auto-embeds the text)
-%%% ok = barrel_vectordb:add(my_store, <<"doc-1">>, <<"Hello world">>, #{type => greeting}).
+%%% %% Add with pre-computed vector
+%%% ok = barrel_vectordb:add_vector(my_store, <<"doc-1">>, <<"Hello">>, #{}, Vector).
 %%%
-%%% %% Search for similar documents
-%%% {ok, Results} = barrel_vectordb:search(my_store, <<"greetings">>, #{k => 5}).
+%%% %% Search with vector query
+%%% {ok, Results} = barrel_vectordb:search_vector(my_store, QueryVector, #{k => 5}).
 %%% '''
 %%%
 %%% == Configuration ==
 %%% ```
 %%% #{
 %%%     name => atom(),              %% Store name (required)
-%%%     path => string(),            %% RocksDB path (default: "priv/barrel_vectordb_data")
+%%%     path => string(),            %% RocksDB path
 %%%     dimensions => pos_integer(), %% Vector dimensions (default: 768)
-%%%     embedder => EmbedderConfig,  %% Embedding provider config
+%%%     embedder => EmbedderConfig,  %% Embedding provider (optional)
 %%%     hnsw => HnswConfig           %% HNSW index parameters
 %%% }
 %%% '''
 %%%
 %%% == Embedding Providers ==
+%%%
+%%% Embedder is **explicit** - if not configured, only `add_vector/5' and
+%%% `search_vector/3' work. Text-based operations return `{error, embedder_not_configured}'.
+%%%
 %%% ```
-%%% %% Local CPU (default) - no GPU required
+%%% %% Local Python with sentence-transformers (CPU, no external calls)
 %%% embedder => {local, #{
 %%%     python => "python3",
 %%%     model => "BAAI/bge-base-en-v1.5"
@@ -43,12 +63,6 @@
 %%% embedder => {ollama, #{
 %%%     url => <<"http://localhost:11434">>,
 %%%     model => <<"nomic-embed-text">>
-%%% }}
-%%%
-%%% %% OpenAI API
-%%% embedder => {openai, #{
-%%%     api_key => "sk-...",
-%%%     model => "text-embedding-3-small"
 %%% }}
 %%%
 %%% %% Provider chain with fallback
