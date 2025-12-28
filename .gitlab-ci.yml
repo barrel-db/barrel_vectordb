@@ -1,0 +1,67 @@
+stages:
+  - build
+  - test
+
+variables:
+  MIX_ENV: test
+
+default:
+  image: erlang:27
+  before_script:
+    - apt-get update && apt-get install -y cmake libsnappy-dev liblz4-dev libzstd-dev
+    - rebar3 --version
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - _build/
+    - ~/.cache/rebar3/
+
+compile:
+  stage: build
+  script:
+    - rebar3 compile
+  artifacts:
+    paths:
+      - _build/
+    expire_in: 1 hour
+
+eunit:
+  stage: test
+  needs:
+    - compile
+  script:
+    - rebar3 eunit --module=barrel_vectordb_tests
+    - rebar3 eunit --module=barrel_vectordb_store_tests
+    - rebar3 eunit --module=barrel_vectordb_hnsw_tests
+    - rebar3 eunit --module=barrel_vectordb_embed_tests
+    - rebar3 eunit --module=barrel_vectordb_embed_provider_tests
+    - rebar3 eunit --module=barrel_vectordb_embed_ollama_tests
+    - rebar3 eunit --module=barrel_vectordb_embed_openai_tests
+    - rebar3 eunit --module=barrel_vectordb_embed_local_tests
+    - rebar3 eunit --module=barrel_vectordb_comprehensive_tests
+
+dialyzer:
+  stage: test
+  needs:
+    - compile
+  script:
+    - rebar3 dialyzer
+  allow_failure: true
+  cache:
+    key: dialyzer-${CI_COMMIT_REF_SLUG}
+    paths:
+      - _build/
+      - ~/.cache/rebar3/
+
+cover:
+  stage: test
+  needs:
+    - compile
+  script:
+    - rebar3 cover --verbose
+  coverage: '/Total\s+\|\s+(\d+(?:\.\d+)?)%/'
+  artifacts:
+    paths:
+      - _build/test/cover/
+    expire_in: 1 week
