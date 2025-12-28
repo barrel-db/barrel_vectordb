@@ -88,7 +88,7 @@ available(Config) ->
 
     case hackney:request(get, ApiUrl, [], <<>>, [{recv_timeout, Timeout}]) of
         {ok, 200, _, ClientRef} ->
-            hackney:skip_body(ClientRef),
+            _ = hackney:skip_body(ClientRef),
             true;
         _ ->
             false

@@ -345,8 +345,8 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, #state{db = Db, hnsw_index = Index, cf_hnsw = CfHnsw}) ->
     %% Persist HNSW index metadata before closing
-    persist_hnsw_meta(Db, CfHnsw, Index),
-    rocksdb:close(Db),
+    _ = persist_hnsw_meta(Db, CfHnsw, Index),
+    _ = rocksdb:close(Db),
     ok.
 
 %%====================================================================
@@ -440,7 +440,7 @@ rebuild_loop(Db, Iter, {ok, Key, VectorBin}, CfHnsw, Index) ->
     Vector = decode_vector(VectorBin),
     NewIndex = barrel_vectordb_hnsw:insert(Index, Key, Vector),
 
-    case barrel_vectordb_hnsw:get_node(NewIndex, Key) of
+    _ = case barrel_vectordb_hnsw:get_node(NewIndex, Key) of
         {ok, Node} ->
             NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
             rocksdb:put(Db, CfHnsw, Key, NodeBin, []);
@@ -478,7 +478,7 @@ do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
         ok ->
             NewIndex = barrel_vectordb_hnsw:insert(Index, Id, Vector),
 
-            case barrel_vectordb_hnsw:get_node(NewIndex, Id) of
+            _ = case barrel_vectordb_hnsw:get_node(NewIndex, Id) of
                 {ok, Node} ->
                     NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
                     rocksdb:put(Db, CfH, Id, NodeBin, []);
@@ -621,9 +621,7 @@ do_search(QueryVector, Opts, #state{db = Db, hnsw_index = Index,
 %%====================================================================
 
 encode_vector(Vector) when is_list(Vector) ->
-    << <<F:64/float-little>> || F <- Vector >>;
-encode_vector(Binary) when is_binary(Binary) ->
-    Binary.
+    << <<F:64/float-little>> || F <- Vector >>.
 
 decode_vector(Binary) ->
     [F || <<F:64/float-little>> <= Binary].

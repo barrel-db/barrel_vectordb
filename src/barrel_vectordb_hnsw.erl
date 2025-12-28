@@ -403,12 +403,10 @@ serialize_node(#hnsw_node{layer = Layer, neighbors = Neighbors}) ->
 -spec deserialize_node(binary()) -> {ok, map()} | {error, term()}.
 deserialize_node(<<?HNSW_NODE_VERSION:8, Layer:8, NumLayers:8, Rest/binary>>) ->
     case deserialize_neighbors(Rest, NumLayers, #{}) of
-        {ok, Neighbors, <<>>} ->
+        {Neighbors, <<>>} ->
             {ok, #{layer => Layer, neighbors => Neighbors}};
-        {ok, _, _} ->
-            {error, trailing_data};
-        {error, _} = Error ->
-            Error
+        {_, _} ->
+            {error, trailing_data}
     end;
 deserialize_node(_) ->
     {error, invalid_node_format}.

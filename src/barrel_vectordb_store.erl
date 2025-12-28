@@ -41,6 +41,7 @@
     cf_hnsw :: rocksdb:cf_handle(),
     hnsw_index :: hnsw_index(),
     dimension :: pos_integer(),
+    embed_state :: barrel_vectordb_embed:embed_state() | undefined,
     config :: map()
 }).
 
@@ -114,24 +115,30 @@ init(Config) ->
     Dimension = maps:get(dimension, Config, ?DEFAULT_DIMENSION),
     HnswConfig = maps:get(hnsw, Config, #{}),
 
-    case init_rocksdb(DbPath) of
-        {ok, Db, CfHandles} ->
-            %% Load or create HNSW index
-            HnswIndex = load_or_create_index(Db, CfHandles, Dimension, HnswConfig),
+    case barrel_vectordb_embed:init(Config) of
+        {ok, EmbedState} ->
+            case init_rocksdb(DbPath) of
+                {ok, Db, CfHandles} ->
+                    %% Load or create HNSW index
+                    HnswIndex = load_or_create_index(Db, CfHandles, Dimension, HnswConfig),
 
-            State = #state{
-                db = Db,
-                cf_vectors = maps:get(vectors, CfHandles),
-                cf_metadata = maps:get(metadata, CfHandles),
-                cf_text = maps:get(text, CfHandles),
-                cf_hnsw = maps:get(hnsw, CfHandles),
-                hnsw_index = HnswIndex,
-                dimension = Dimension,
-                config = Config
-            },
-            {ok, State};
+                    State = #state{
+                        db = Db,
+                        cf_vectors = maps:get(vectors, CfHandles),
+                        cf_metadata = maps:get(metadata, CfHandles),
+                        cf_text = maps:get(text, CfHandles),
+                        cf_hnsw = maps:get(hnsw, CfHandles),
+                        hnsw_index = HnswIndex,
+                        dimension = Dimension,
+                        embed_state = EmbedState,
+                        config = Config
+                    },
+                    {ok, State};
+                {error, Reason} ->
+                    {stop, {db_open_failed, Reason}}
+            end;
         {error, Reason} ->
-            {stop, {db_open_failed, Reason}}
+            {stop, {embedder_init_failed, Reason}}
     end.
 
 handle_call({add, ChunkId, Text, Metadata, VectorSpec}, _From, State) ->
@@ -194,8 +201,8 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, #state{db = Db, hnsw_index = Index, cf_hnsw = CfHnsw}) ->
     %% Persist HNSW index metadata before closing
-    persist_hnsw_meta(Db, CfHnsw, Index),
-    rocksdb:close(Db),
+    _ = persist_hnsw_meta(Db, CfHnsw, Index),
+    _ = rocksdb:close(Db),
     ok.
 
 %%====================================================================
@@ -296,7 +303,7 @@ rebuild_loop(Db, Iter, {ok, Key, VectorBin}, CfHnsw, Index) ->
     NewIndex = barrel_vectordb_hnsw:insert(Index, Key, Vector),
 
     %% Persist node to HNSW graph
-    case barrel_vectordb_hnsw:get_node(NewIndex, Key) of
+    _ = case barrel_vectordb_hnsw:get_node(NewIndex, Key) of
         {ok, Node} ->
             NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
             rocksdb:put(Db, CfHnsw, Key, NodeBin, []);
@@ -307,9 +314,9 @@ rebuild_loop(Db, Iter, {ok, Key, VectorBin}, CfHnsw, Index) ->
     rebuild_loop(Db, Iter, rocksdb:iterator_move(Iter, next), CfHnsw, NewIndex).
 
 %% Get vector for add operation
-get_vector_for_add(auto, Text, #state{dimension = Dim}) ->
+get_vector_for_add(auto, Text, #state{dimension = Dim, embed_state = EmbedState}) ->
     %% Call embedding service
-    case barrel_vectordb_embed:embed(Text) of
+    case barrel_vectordb_embed:embed(Text, EmbedState) of
         {ok, Vector} when length(Vector) =:= Dim ->
             {ok, Vector};
         {ok, Vector} ->
@@ -343,7 +350,7 @@ do_add(ChunkId, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
             NewIndex = barrel_vectordb_hnsw:insert(Index, ChunkId, Vector),
 
             %% Persist HNSW node
-            case barrel_vectordb_hnsw:get_node(NewIndex, ChunkId) of
+            _ = case barrel_vectordb_hnsw:get_node(NewIndex, ChunkId) of
                 {ok, Node} ->
                     NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
                     rocksdb:put(Db, CfH, ChunkId, NodeBin, []);
@@ -397,10 +404,10 @@ do_delete(ChunkId, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
     end.
 
 %% Search for similar chunks
-do_search(Query, K, Options, #state{dimension = Dim} = State)
+do_search(Query, K, Options, #state{dimension = Dim, embed_state = EmbedState} = State)
     when is_binary(Query) ->
     %% Text query - need to embed first
-    case barrel_vectordb_embed:embed(Query) of
+    case barrel_vectordb_embed:embed(Query, EmbedState) of
         {ok, Vector} when length(Vector) =:= Dim ->
             do_search(Vector, K, Options, State);
         {ok, Vector} ->
@@ -468,9 +475,7 @@ rebuild_index_loop(Iter, {ok, Key, VectorBin}, Index) ->
 
 %% Vector encoding/decoding (64-bit floats for full precision)
 encode_vector(Vector) when is_list(Vector) ->
-    << <<F:64/float-little>> || F <- Vector >>;
-encode_vector(Binary) when is_binary(Binary) ->
-    Binary.
+    << <<F:64/float-little>> || F <- Vector >>.
 
 decode_vector(Binary) ->
     [F || <<F:64/float-little>> <= Binary].

@@ -57,7 +57,10 @@ setup_test() ->
 
     %% Start a mock embeddings server that just returns dummy vectors
     meck:new(barrel_vectordb_embed, [non_strict]),
-    meck:expect(barrel_vectordb_embed, embed, fun(Text) ->
+    meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
+        {ok, #{providers => [], dimension => 3, batch_size => 32}}
+    end),
+    meck:expect(barrel_vectordb_embed, embed, fun(Text, _EmbedState) ->
         %% Generate deterministic vector from text
         Hash = erlang:phash2(Text, 1000000),
         Vec = [
