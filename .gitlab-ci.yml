@@ -1,6 +1,7 @@
 stages:
   - build
   - test
+  - benchmark
 
 variables:
   MIX_ENV: test
@@ -65,3 +66,59 @@ cover:
     paths:
       - _build/test/cover/
     expire_in: 1 week
+
+# Performance benchmarks - runs on schedule or manual trigger
+benchmark:
+  stage: benchmark
+  needs:
+    - compile
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+    - if: $CI_COMMIT_TAG
+      when: manual
+  variables:
+    BENCH_ITERATIONS: "50"
+    BENCH_WARMUP: "10"
+  script:
+    - rebar3 as bench compile
+    - |
+      erl -pa _build/bench/lib/*/ebin \
+          -pa _build/bench/lib/*/bench \
+          -pa _build/default/lib/*/ebin \
+          -noshell \
+          -eval "
+      application:ensure_all_started(barrel_vectordb),
+      barrel_vectordb_bench:run_all(#{
+          iterations => ${BENCH_ITERATIONS},
+          warmup_iterations => ${BENCH_WARMUP},
+          output_format => all
+      }),
+      halt().
+      "
+  artifacts:
+    paths:
+      - bench_results.json
+      - bench_results.csv
+    expire_in: 30 days
+
+# Compare benchmarks against baseline (manual)
+benchmark_compare:
+  stage: benchmark
+  needs:
+    - benchmark
+  rules:
+    - if: $BASELINE_JOB_ID
+      when: manual
+  script:
+    - |
+      if [ -n "$BASELINE_JOB_ID" ]; then
+        curl --output baseline.json "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/jobs/${BASELINE_JOB_ID}/artifacts/bench_results.json"
+        erl -pa _build/bench/lib/*/ebin \
+            -pa _build/bench/lib/*/bench \
+            -pa _build/default/lib/*/ebin \
+            -noshell \
+            -eval "barrel_vectordb_bench_compare:compare(\"baseline.json\", \"bench_results.json\"), halt()."
+      fi
+  allow_failure: true
