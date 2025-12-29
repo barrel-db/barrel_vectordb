@@ -240,15 +240,27 @@ bench_delete_single(#{store := Store, dimension := Dim}) ->
     ok = barrel_vectordb:delete(Store, Id),
     1.
 
-bench_index_build_1k(#{store := Store, dimension := Dim}) ->
-    Docs = make_batch_docs(1000, Dim),
-    add_vector_batch(Store, Docs),
-    1000.
+%% Index build benchmarks measure time to build a fresh index
+%% Each iteration creates a new store to measure cold-start performance
+bench_index_build_1k(#{dimension := Dim}) ->
+    {Store, TestDir} = setup_bench_store(#{dimension => Dim}),
+    try
+        Docs = make_batch_docs(1000, Dim),
+        add_vector_batch(Store, Docs),
+        1000
+    after
+        cleanup_bench_store(Store, TestDir)
+    end.
 
-bench_index_build_10k(#{store := Store, dimension := Dim}) ->
-    Docs = make_batch_docs(10000, Dim),
-    add_vector_batch(Store, Docs),
-    10000.
+bench_index_build_10k(#{dimension := Dim}) ->
+    {Store, TestDir} = setup_bench_store(#{dimension => Dim}),
+    try
+        Docs = make_batch_docs(10000, Dim),
+        add_vector_batch(Store, Docs),
+        10000
+    after
+        cleanup_bench_store(Store, TestDir)
+    end.
 
 %%====================================================================
 %% Internal Functions
@@ -482,8 +494,7 @@ ensure_indexed(#{store := Store, dimension := Dim}, Count) ->
             ok
     end.
 
-%% Add a batch of vectors (since there's no built-in batch vector add)
+%% Add a batch of vectors using the bulk insert API
 add_vector_batch(Store, Docs) ->
-    lists:foreach(fun({Id, Text, Meta, Vector}) ->
-        ok = barrel_vectordb:add_vector(Store, Id, Text, Meta, Vector)
-    end, Docs).
+    {ok, _} = barrel_vectordb:add_vector_batch(Store, Docs),
+    ok.

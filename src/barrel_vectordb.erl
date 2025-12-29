@@ -88,6 +88,7 @@
     add/5,
     add_vector/5,
     add_batch/2,
+    add_vector_batch/2,
     get/2,
     update/4,
     upsert/4,
@@ -308,6 +309,28 @@ add_vector(Store, Id, Text, Metadata, Vector) ->
     {ok, #{inserted := non_neg_integer()}} | {error, term()}.
 add_batch(Store, Docs) ->
     barrel_vectordb_server:add_batch(Store, Docs).
+
+%% @doc Add multiple documents with pre-computed vectors in batch.
+%%
+%% Efficiently adds multiple documents with their vectors in a single
+%% atomic RocksDB write. Much faster than calling `add_vector/5' multiple times.
+%%
+%% == Example ==
+%% ```
+%% Docs = [
+%%     {<<"id-1">>, <<"text 1">>, #{type => a}, Vector1},
+%%     {<<"id-2">>, <<"text 2">>, #{type => b}, Vector2}
+%% ],
+%% {ok, #{inserted := 2}} = barrel_vectordb:add_vector_batch(my_store, Docs).
+%% '''
+%%
+%% @param Store Store name or pid
+%% @param Docs List of `{Id, Text, Metadata, Vector}' tuples
+%% @returns `{ok, Stats}' on success, `{error, Reason}' on failure
+-spec add_vector_batch(store(), [{id(), text(), metadata(), vector()}]) ->
+    {ok, #{inserted := non_neg_integer()}} | {error, term()}.
+add_vector_batch(Store, Docs) ->
+    barrel_vectordb_server:add_vector_batch(Store, Docs).
 
 %% @doc Get a document by ID.
 %%

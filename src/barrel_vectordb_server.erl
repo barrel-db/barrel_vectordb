@@ -18,6 +18,7 @@
     add/4,
     add_vector/5,
     add_batch/2,
+    add_vector_batch/2,
     get/2,
     update/4,
     upsert/4,
@@ -77,6 +78,12 @@ add_vector(Store, Id, Text, Metadata, Vector) ->
     {ok, #{inserted := non_neg_integer()}} | {error, term()}.
 add_batch(Store, Docs) ->
     gen_server:call(Store, {add_batch, Docs}, infinity).
+
+%% @doc Add multiple documents with pre-computed vectors (bulk insert).
+-spec add_vector_batch(atom() | pid(), [{binary(), binary(), map(), [float()]}]) ->
+    {ok, #{inserted := non_neg_integer()}} | {error, term()}.
+add_vector_batch(Store, Docs) ->
+    gen_server:call(Store, {add_vector_batch, Docs}, infinity).
 
 %% @doc Get document by ID.
 -spec get(atom() | pid(), binary()) -> {ok, map()} | not_found | {error, term()}.
@@ -207,6 +214,14 @@ handle_call({add_vector, Id, Text, Metadata, Vector}, _From, #state{dimension = 
 handle_call({add_batch, Docs}, _From, State) ->
     Result = do_add_batch(Docs, State),
     case Result of
+        {ok, Stats, NewState} ->
+            {reply, {ok, Stats}, NewState};
+        {error, _} = Error ->
+            {reply, Error, State}
+    end;
+
+handle_call({add_vector_batch, Docs}, _From, State) ->
+    case do_add_vector_batch(Docs, State) of
         {ok, Stats, NewState} ->
             {reply, {ok, Stats}, NewState};
         {error, _} = Error ->
@@ -474,18 +489,20 @@ do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
     ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
     ok = rocksdb:batch_put(Batch, CfT, Id, Text),
 
+    %% Update HNSW index in memory first
+    NewIndex = barrel_vectordb_hnsw:insert(Index, Id, Vector),
+
+    %% Add HNSW node to the same batch (atomic write)
+    _ = case barrel_vectordb_hnsw:get_node(NewIndex, Id) of
+        {ok, Node} ->
+            NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
+            rocksdb:batch_put(Batch, CfH, Id, NodeBin);
+        not_found ->
+            ok
+    end,
+
     case rocksdb:write_batch(Db, Batch, []) of
         ok ->
-            NewIndex = barrel_vectordb_hnsw:insert(Index, Id, Vector),
-
-            _ = case barrel_vectordb_hnsw:get_node(NewIndex, Id) of
-                {ok, Node} ->
-                    NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
-                    rocksdb:put(Db, CfH, Id, NodeBin, []);
-                not_found ->
-                    ok
-            end,
-
             {ok, State#state{hnsw_index = NewIndex}};
         {error, Reason} ->
             {error, {db_error, Reason}}
@@ -507,6 +524,47 @@ do_add_batch([{Id, Text, Metadata} | Rest], Count, State) ->
                     Error
             end;
         {error, _} = Error ->
+            Error
+    end.
+
+%% Add multiple documents with pre-computed vectors (bulk insert)
+%% All documents are written in a single atomic RocksDB batch
+do_add_vector_batch(Docs, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
+                                  cf_text = CfT, cf_hnsw = CfH,
+                                  hnsw_index = Index, dimension = Dim} = State) ->
+    {ok, Batch} = rocksdb:batch(),
+    try
+        {NewIndex, Count} = lists:foldl(fun({Id, Text, Meta, Vector}, {AccIndex, AccCount}) ->
+            case length(Vector) of
+                Dim ->
+                    VectorBin = encode_vector(Vector),
+                    MetadataBin = term_to_binary(Meta),
+                    ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
+                    ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
+                    ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+                    %% Update HNSW index in memory
+                    UpdatedIndex = barrel_vectordb_hnsw:insert(AccIndex, Id, Vector),
+                    %% Add HNSW node to batch
+                    case barrel_vectordb_hnsw:get_node(UpdatedIndex, Id) of
+                        {ok, Node} ->
+                            NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
+                            ok = rocksdb:batch_put(Batch, CfH, Id, NodeBin);
+                        not_found ->
+                            ok
+                    end,
+                    {UpdatedIndex, AccCount + 1};
+                Other ->
+                    throw({error, {dimension_mismatch, Dim, Other}})
+            end
+        end, {Index, 0}, Docs),
+        case rocksdb:write_batch(Db, Batch, []) of
+            ok ->
+                {ok, #{inserted => Count}, State#state{hnsw_index = NewIndex}};
+            {error, Reason} ->
+                {error, {db_error, Reason}}
+        end
+    catch
+        throw:{error, _} = Error ->
             Error
     end.
 
