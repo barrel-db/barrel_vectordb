@@ -20,6 +20,9 @@ api_test_() ->
       [
         {"add and get document", fun test_add_get/0},
         {"add with explicit vector", fun test_add_vector/0},
+        {"add_vector_batch inserts multiple", fun test_add_vector_batch/0},
+        {"add_vector_batch dimension mismatch", fun test_add_vector_batch_dimension_mismatch/0},
+        {"add_vector_batch searchable", fun test_add_vector_batch_searchable/0},
         {"search finds similar documents", fun test_search/0},
         {"search with vector query", fun test_search_vector/0},
         {"delete removes document", fun test_delete/0},
@@ -122,6 +125,68 @@ test_add_vector() ->
 
     {ok, Doc} = barrel_vectordb:get(test_store, <<"vec1">>),
     ?assertEqual(Vector, maps:get(vector, Doc)).
+
+test_add_vector_batch() ->
+    %% Create batch of documents with vectors
+    Docs = [
+        {<<"batch1">>, <<"text 1">>, #{n => 1}, [1.0, 0.0, 0.0]},
+        {<<"batch2">>, <<"text 2">>, #{n => 2}, [0.0, 1.0, 0.0]},
+        {<<"batch3">>, <<"text 3">>, #{n => 3}, [0.0, 0.0, 1.0]}
+    ],
+
+    %% Insert batch
+    {ok, Stats} = barrel_vectordb:add_vector_batch(test_store, Docs),
+    ?assertEqual(3, maps:get(inserted, Stats)),
+
+    %% Verify count
+    ?assertEqual(3, barrel_vectordb:count(test_store)),
+
+    %% Verify each document
+    {ok, Doc1} = barrel_vectordb:get(test_store, <<"batch1">>),
+    ?assertEqual(<<"text 1">>, maps:get(text, Doc1)),
+    ?assertEqual(#{n => 1}, maps:get(metadata, Doc1)),
+    ?assertEqual([1.0, 0.0, 0.0], maps:get(vector, Doc1)),
+
+    {ok, Doc2} = barrel_vectordb:get(test_store, <<"batch2">>),
+    ?assertEqual(<<"text 2">>, maps:get(text, Doc2)),
+    ?assertEqual([0.0, 1.0, 0.0], maps:get(vector, Doc2)),
+
+    {ok, Doc3} = barrel_vectordb:get(test_store, <<"batch3">>),
+    ?assertEqual(<<"text 3">>, maps:get(text, Doc3)),
+    ?assertEqual([0.0, 0.0, 1.0], maps:get(vector, Doc3)).
+
+test_add_vector_batch_dimension_mismatch() ->
+    %% One document has wrong dimension
+    Docs = [
+        {<<"ok1">>, <<"text 1">>, #{}, [1.0, 0.0, 0.0]},
+        {<<"bad">>, <<"text 2">>, #{}, [1.0, 0.0]},  % Wrong dimension (2 instead of 3)
+        {<<"ok2">>, <<"text 3">>, #{}, [0.0, 0.0, 1.0]}
+    ],
+
+    %% Should fail with dimension mismatch
+    Result = barrel_vectordb:add_vector_batch(test_store, Docs),
+    ?assertMatch({error, {dimension_mismatch, 3, 2}}, Result),
+
+    %% No documents should be inserted (atomic operation)
+    ?assertEqual(0, barrel_vectordb:count(test_store)).
+
+test_add_vector_batch_searchable() ->
+    %% Insert batch
+    Docs = [
+        {<<"s1">>, <<"apple">>, #{type => fruit}, [1.0, 0.0, 0.0]},
+        {<<"s2">>, <<"banana">>, #{type => fruit}, [0.9, 0.1, 0.0]},
+        {<<"s3">>, <<"carrot">>, #{type => vegetable}, [0.0, 1.0, 0.0]}
+    ],
+    {ok, _} = barrel_vectordb:add_vector_batch(test_store, Docs),
+
+    %% Search should find inserted documents
+    {ok, Results} = barrel_vectordb:search_vector(test_store, [1.0, 0.0, 0.0], #{k => 2}),
+    ?assertEqual(2, length(Results)),
+
+    %% First result should be s1 (exact match)
+    [First | _] = Results,
+    ?assertEqual(<<"s1">>, maps:get(key, First)),
+    ?assert(maps:get(score, First) > 0.99).
 
 test_search() ->
     %% Add some documents
