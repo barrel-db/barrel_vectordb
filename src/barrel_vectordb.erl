@@ -115,6 +115,11 @@
     embedder_info/1
 ]).
 
+%% API - Maintenance
+-export([
+    checkpoint/1
+]).
+
 %% Types
 -type store() :: atom() | pid().
 %% A store reference - either a registered name or a pid.
@@ -558,6 +563,25 @@ count(Store) ->
 -spec embedder_info(store()) -> {ok, map()}.
 embedder_info(Store) ->
     barrel_vectordb_server:embedder_info(Store).
+
+%% @doc Checkpoint the HNSW index to disk.
+%%
+%% Persists the current in-memory HNSW index metadata to RocksDB.
+%% This can speed up restart by avoiding a full index rebuild.
+%%
+%% Note: The index is automatically rebuilt from vectors on startup
+%% if no checkpoint exists, so this is optional but improves restart time.
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_vectordb:checkpoint(my_store).
+%% '''
+%%
+%% @param Store Store name or pid
+%% @returns `ok' on success
+-spec checkpoint(store()) -> ok.
+checkpoint(Store) ->
+    barrel_vectordb_server:checkpoint(Store).
 
 %%====================================================================
 %% Internal Functions

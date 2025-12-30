@@ -34,7 +34,8 @@
     embed_batch/2,
     stats/1,
     count/1,
-    embedder_info/1
+    embedder_info/1,
+    checkpoint/1
 ]).
 
 %% gen_batch_server callbacks
@@ -167,6 +168,11 @@ count(Store) ->
 -spec embedder_info(atom() | pid()) -> {ok, map()}.
 embedder_info(Store) ->
     gen_batch_server:call(Store, embedder_info).
+
+%% @doc Checkpoint HNSW index to disk.
+-spec checkpoint(atom() | pid()) -> ok.
+checkpoint(Store) ->
+    gen_batch_server:call(Store, checkpoint).
 
 %%====================================================================
 %% gen_batch_server callbacks
@@ -359,6 +365,11 @@ process_single_op({call, From, count}, #state{hnsw_index = Index} = State) ->
 process_single_op({call, From, embedder_info}, #state{embed_state = EmbedState} = State) ->
     Info = barrel_vectordb_embed:info(EmbedState),
     {{reply, From, {ok, Info}}, State};
+
+process_single_op({call, From, checkpoint}, #state{db = Db, cf_hnsw = CfHnsw,
+                                                    hnsw_index = Index} = State) ->
+    _ = persist_hnsw_meta(Db, CfHnsw, Index),
+    {{reply, From, ok}, State};
 
 process_single_op({call, From, _Unknown}, State) ->
     {{reply, From, {error, unknown_request}}, State}.

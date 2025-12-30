@@ -33,6 +33,7 @@ api_test_() ->
         {"peek returns documents", fun test_peek/0},
         {"count returns correct number", fun test_count/0},
         {"stats returns store info", fun test_stats/0},
+        {"checkpoint persists index", fun test_checkpoint/0},
         {"persistence reload", fun test_persistence_reload/0},
         {"concurrent add_vector batching", fun test_concurrent_add_vector/0},
         {"multiple writers stress test", fun test_multiple_writers/0},
@@ -300,6 +301,22 @@ test_stats() ->
     ?assertEqual(1, maps:get(count, Stats)),
     ?assert(maps:is_key(hnsw, Stats)),
     ?assert(maps:is_key(config, Stats)).
+
+test_checkpoint() ->
+    %% Add some documents
+    ok = barrel_vectordb:add_vector(test_store, <<"cp1">>, <<"text 1">>, #{}, [1.0, 0.0, 0.0]),
+    ok = barrel_vectordb:add_vector(test_store, <<"cp2">>, <<"text 2">>, #{}, [0.0, 1.0, 0.0]),
+
+    %% Checkpoint should succeed
+    ok = barrel_vectordb:checkpoint(test_store),
+
+    %% Store should still work after checkpoint
+    {ok, Doc} = barrel_vectordb:get(test_store, <<"cp1">>),
+    ?assertEqual(<<"cp1">>, maps:get(key, Doc)),
+
+    %% Search should still work
+    {ok, Results} = barrel_vectordb:search_vector(test_store, [1.0, 0.0, 0.0], #{k => 1}),
+    ?assertEqual(1, length(Results)).
 
 test_persistence_reload() ->
     %% This test uses its own store to test persistence across restarts
