@@ -690,13 +690,25 @@ do_delete(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
     end.
 
 %% Peek at documents (sample without search)
+%% Optimized: collect keys from iterator, then batch fetch metadata/text
 do_peek(Limit, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM, cf_text = CfT}) ->
     case rocksdb:iterator(Db, CfV, []) of
         {ok, Iter} ->
             try
-                Docs = peek_loop(Db, Iter, rocksdb:iterator_move(Iter, first),
-                                 CfM, CfT, Limit, []),
-                {ok, Docs}
+                %% Phase 1: Collect keys and vectors from iterator
+                KeyVectors = collect_keys(Iter, rocksdb:iterator_move(Iter, first), Limit, []),
+                case KeyVectors of
+                    [] ->
+                        {ok, []};
+                    _ ->
+                        %% Phase 2: Batch fetch metadata and text
+                        Keys = [K || {K, _} <- KeyVectors],
+                        MetaResults = rocksdb:multi_get(Db, CfM, Keys, []),
+                        TextResults = rocksdb:multi_get(Db, CfT, Keys, []),
+                        %% Phase 3: Combine results
+                        Docs = combine_peek_results(KeyVectors, MetaResults, TextResults, []),
+                        {ok, Docs}
+                end
             after
                 rocksdb:iterator_close(Iter)
             end;
@@ -704,12 +716,19 @@ do_peek(Limit, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM, cf_text = Cf
             {ok, []}
     end.
 
-peek_loop(_Db, _Iter, _, _CfM, _CfT, 0, Acc) ->
+%% Collect keys and vector binaries from iterator
+collect_keys(_Iter, _, 0, Acc) ->
     lists:reverse(Acc);
-peek_loop(_Db, _Iter, {error, _}, _CfM, _CfT, _Limit, Acc) ->
+collect_keys(_Iter, {error, _}, _Limit, Acc) ->
     lists:reverse(Acc);
-peek_loop(Db, Iter, {ok, Key, VectorBin}, CfM, CfT, Limit, Acc) ->
-    case {rocksdb:get(Db, CfM, Key, []), rocksdb:get(Db, CfT, Key, [])} of
+collect_keys(Iter, {ok, Key, VectorBin}, Limit, Acc) ->
+    collect_keys(Iter, rocksdb:iterator_move(Iter, next), Limit - 1, [{Key, VectorBin} | Acc]).
+
+%% Combine key-vectors with batched metadata/text results
+combine_peek_results([], [], [], Acc) ->
+    lists:reverse(Acc);
+combine_peek_results([{Key, VectorBin} | KVs], [MetaResult | Ms], [TextResult | Ts], Acc) ->
+    case {MetaResult, TextResult} of
         {{ok, MetadataBin}, {ok, Text}} ->
             Doc = #{
                 key => Key,
@@ -717,11 +736,10 @@ peek_loop(Db, Iter, {ok, Key, VectorBin}, CfM, CfT, Limit, Acc) ->
                 metadata => binary_to_term(MetadataBin),
                 text => Text
             },
-            peek_loop(Db, Iter, rocksdb:iterator_move(Iter, next),
-                      CfM, CfT, Limit - 1, [Doc | Acc]);
+            combine_peek_results(KVs, Ms, Ts, [Doc | Acc]);
         _ ->
-            peek_loop(Db, Iter, rocksdb:iterator_move(Iter, next),
-                      CfM, CfT, Limit, Acc)
+            %% Skip documents with missing metadata or text
+            combine_peek_results(KVs, Ms, Ts, Acc)
     end.
 
 %% Search for similar documents
