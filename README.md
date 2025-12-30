@@ -82,6 +82,13 @@ ok = barrel_vectordb:add_vector(Store, Id, Text, Metadata, Vector).
     k => 10,
     filter => fun(Meta) -> maps:get(type, Meta) =:= important end
 }).
+
+%% Search with optimized options (skip text/metadata for faster results)
+{ok, Results} = barrel_vectordb:search_vector(Store, Vector, #{
+    k => 50,
+    include_text => false,      %% Skip text lookup
+    include_metadata => false   %% Skip metadata lookup
+}).
 ```
 
 ### Document Operations
@@ -117,6 +124,10 @@ barrel_vectordb:start_link(#{
     hnsw => #{                     %% HNSW index parameters
         m => 16,
         ef_construction => 200
+    },
+    batch => #{                    %% Write batching options
+        min_batch_size => 4,       %% Min requests before batching
+        max_batch_size => 256      %% Max batch size
     }
 }).
 ```
@@ -300,12 +311,39 @@ Tests automatically skip if their required backend is unavailable.
 
 See `test/integration/README.md` for details.
 
+## Performance
+
+### Search Latency
+
+| Metric | Typical Value |
+|--------|---------------|
+| P50 | ~1ms |
+| P99 | ~5ms |
+
+### Optimizations
+
+- **Batch writes**: Concurrent writes are automatically batched via gen_batch_server
+- **Batch lookups**: Search uses `rocksdb:multi_get` for efficient result fetching
+- **Skip options**: Use `include_text => false` to skip unnecessary RocksDB reads
+- **HNSW optimization**: O(log N) candidate management with balanced trees
+
+### Benchmarking
+
+Run the benchmark suite:
+
+```bash
+rebar3 as bench compile && rebar3 as bench eunit --module=barrel_vectordb_bench
+```
+
 ## Architecture
 
 - **Storage**: RocksDB with column families
 - **Index**: HNSW for approximate nearest neighbor search
 - **Vectors**: 8-bit quantization with norm caching
 - **Embeddings**: Pluggable providers with fallback
+- **Batching**: gen_batch_server for automatic write coalescing
+
+See [doc/design.md](doc/design.md) for detailed architecture documentation.
 
 ## License
 
