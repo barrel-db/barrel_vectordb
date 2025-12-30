@@ -595,14 +595,16 @@ search_layer(#hnsw_index{nodes = Nodes, config = Config}, QueryQ, QueryNorm, Sta
     Visited = sets:from_list([StartId]),
     %% Candidates: min-heap with {Distance, Id} as key to handle duplicates
     Candidates = gb_trees:from_orddict([{{StartDist, StartId}, true}]),
-    %% Results: list of {Distance, Id}, we track the furthest distance separately
-    Results = [{StartDist, StartId}],
+    %% Results: also gb_trees for O(log N) insert/trim instead of O(N log N) sort
+    Results = gb_trees:from_orddict([{{StartDist, StartId}, true}]),
     FurthestDist = StartDist,
 
-    search_layer_loop(Nodes, QueryQ, QueryNorm, Layer, Config, Ef, Visited, Candidates, Results, FurthestDist).
+    FinalResults = search_layer_loop(Nodes, QueryQ, QueryNorm, Layer, Config, Ef, Visited, Candidates, Results, FurthestDist),
+    %% Convert gb_trees results back to list
+    [{Dist, Id} || {{Dist, Id}, _} <- gb_trees:to_list(FinalResults)].
 
 search_layer_loop(_Nodes, _QueryQ, _QueryNorm, _Layer, _Config, _Ef, _Visited, {0, nil}, Results, _FurthestDist) ->
-    %% Empty gb_trees
+    %% Empty candidates gb_trees
     Results;
 search_layer_loop(Nodes, QueryQ, QueryNorm, Layer, Config, Ef, Visited, Candidates, Results, FurthestDist) ->
     %% Get smallest distance candidate
@@ -625,24 +627,31 @@ search_layer_loop(Nodes, QueryQ, QueryNorm, Layer, Config, Ef, Visited, Candidat
                             {ok, NeighborNode} ->
                                 Dist = distance_quantized(QueryQ, QueryNorm, NeighborNode,
                                                          Config#hnsw_config.distance_fn),
-                                if Dist < FurthAcc orelse length(ResAcc) < Ef ->
-                                    %% Add to candidates with {Dist, Id} key
-                                    NewCandAcc = gb_trees:insert({Dist, NeighborId}, true, CandAcc),
-                                    %% Add to results
-                                    NewResAcc0 = [{Dist, NeighborId} | ResAcc],
-                                    %% Trim if too many, update furthest
-                                    {NewResAcc, NewFurthAcc} = if length(NewResAcc0) > Ef ->
-                                        Sorted = lists:sort(NewResAcc0),
-                                        Trimmed = lists:sublist(Sorted, Ef),
-                                        {LastDist, _} = lists:last(Trimmed),
-                                        {Trimmed, LastDist};
+                                ResSize = gb_trees:size(ResAcc),
+                                ShouldAdd = Dist < FurthAcc orelse ResSize < Ef,
+                                case ShouldAdd of
                                     true ->
-                                        MaxDist = lists:max([D || {D, _} <- NewResAcc0]),
-                                        {NewResAcc0, MaxDist}
-                                    end,
-                                    {NewVisAcc, NewCandAcc, NewResAcc, NewFurthAcc};
-                                true ->
-                                    {NewVisAcc, CandAcc, ResAcc, FurthAcc}
+                                        %% Add to candidates with {Dist, Id} key
+                                        NewCandAcc = gb_trees:insert({Dist, NeighborId}, true, CandAcc),
+                                        %% Add to results (gb_trees, O(log N))
+                                        NewResAcc0 = gb_trees:insert({Dist, NeighborId}, true, ResAcc),
+                                        %% Trim if too many, update furthest (O(log N) operations)
+                                        NewResSize = gb_trees:size(NewResAcc0),
+                                        {NewResAcc, NewFurthAcc} = case NewResSize > Ef of
+                                            true ->
+                                                %% Remove largest (furthest) - O(log N)
+                                                {_, _, Trimmed} = gb_trees:take_largest(NewResAcc0),
+                                                %% Get new furthest - O(log N)
+                                                {{LastDist, _}, _} = gb_trees:largest(Trimmed),
+                                                {Trimmed, LastDist};
+                                            false ->
+                                                %% Get current max distance - O(log N)
+                                                {{MaxDist, _}, _} = gb_trees:largest(NewResAcc0),
+                                                {NewResAcc0, MaxDist}
+                                        end,
+                                        {NewVisAcc, NewCandAcc, NewResAcc, NewFurthAcc};
+                                    false ->
+                                        {NewVisAcc, CandAcc, ResAcc, FurthAcc}
                                 end;
                             error ->
                                 {NewVisAcc, CandAcc, ResAcc, FurthAcc}
