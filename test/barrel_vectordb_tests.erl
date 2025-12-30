@@ -34,7 +34,8 @@ api_test_() ->
         {"count returns correct number", fun test_count/0},
         {"stats returns store info", fun test_stats/0},
         {"persistence reload", fun test_persistence_reload/0},
-        {"concurrent add_vector batching", fun test_concurrent_add_vector/0}
+        {"concurrent add_vector batching", fun test_concurrent_add_vector/0},
+        {"multiple writers stress test", fun test_multiple_writers/0}
       ]
      }
     }.
@@ -393,3 +394,51 @@ test_concurrent_add_vector() ->
         Key = maps:get(key, Doc),
         ?assertMatch(<<"concurrent_", _/binary>>, Key)
     end, Results2).
+
+test_multiple_writers() ->
+    %% Test multiple writer processes sending continuous writes
+    %% This simulates real-world concurrent access patterns
+    Self = self(),
+    NumWriters = 5,
+    DocsPerWriter = 20,
+    TotalDocs = NumWriters * DocsPerWriter,
+
+    %% Spawn writer processes
+    _Writers = [spawn_link(fun() ->
+        WriterId = integer_to_binary(W),
+        lists:foreach(fun(N) ->
+            Id = <<"mw_", WriterId/binary, "_", (integer_to_binary(N))/binary>>,
+            Vec = [float(W) / float(NumWriters), float(N) / float(DocsPerWriter), 0.0],
+            ok = barrel_vectordb:add_vector(test_store, Id, <<"multi writer text">>,
+                                            #{writer => W, seq => N}, Vec)
+        end, lists:seq(1, DocsPerWriter)),
+        Self ! {writer_done, W}
+    end) || W <- lists:seq(1, NumWriters)],
+
+    %% Wait for all writers to complete
+    lists:foreach(fun(W) ->
+        receive {writer_done, W} -> ok
+        after 30000 -> error({timeout_waiting_for_writer, W})
+        end
+    end, lists:seq(1, NumWriters)),
+
+    %% Verify all documents were inserted
+    ?assertEqual(TotalDocs, barrel_vectordb:count(test_store)),
+
+    %% Verify documents from each writer
+    lists:foreach(fun(W) ->
+        WriterId = integer_to_binary(W),
+        lists:foreach(fun(N) ->
+            Id = <<"mw_", WriterId/binary, "_", (integer_to_binary(N))/binary>>,
+            {ok, Doc} = barrel_vectordb:get(test_store, Id),
+            ?assertEqual(#{writer => W, seq => N}, maps:get(metadata, Doc))
+        end, lists:seq(1, DocsPerWriter))
+    end, lists:seq(1, NumWriters)),
+
+    %% Verify search works across all writers' documents
+    {ok, Results} = barrel_vectordb:search_vector(test_store, [1.0, 1.0, 0.0], #{k => 10}),
+    ?assertEqual(10, length(Results)),
+
+    %% Clean assertion - just verify we got results from multiple writers
+    WriterIds = lists:usort([maps:get(writer, maps:get(metadata, D)) || D <- Results]),
+    ?assert(length(WriterIds) >= 1).

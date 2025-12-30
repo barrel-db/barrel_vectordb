@@ -58,9 +58,20 @@
 %%====================================================================
 
 %% @doc Start a named store.
+%% Config options:
+%%   - db_path: RocksDB storage path
+%%   - dimension: Vector dimension
+%%   - hnsw: HNSW index configuration
+%%   - batch: gen_batch_server options (max_batch_size, min_batch_size)
 -spec start_link(atom(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Name, Config) ->
-    gen_batch_server:start_link({local, Name}, ?MODULE, {Name, Config}, []).
+    BatchOpts = maps:get(batch, Config, #{}),
+    GBOpts = maps:fold(fun
+        (max_batch_size, V, Acc) -> [{max_batch_size, V} | Acc];
+        (min_batch_size, V, Acc) -> [{min_batch_size, V} | Acc];
+        (_, _, Acc) -> Acc
+    end, [], BatchOpts),
+    gen_batch_server:start_link({local, Name}, ?MODULE, {Name, Config}, [{gen_batch_server, GBOpts}]).
 
 %% @doc Stop a store.
 -spec stop(atom() | pid()) -> ok.
