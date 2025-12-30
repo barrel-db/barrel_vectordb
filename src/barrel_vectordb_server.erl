@@ -450,7 +450,7 @@ prepare_batch_embeddings(Docs, State) ->
 
 %% Apply a single write operation to the batch
 apply_write_to_batch({add_vector, Id, Text, Metadata, Vector}, _PreparedData,
-                      Batch, CfV, CfM, CfT, CfH, Index, Dim) ->
+                      Batch, CfV, CfM, CfT, _CfH, Index, Dim) ->
     case length(Vector) of
         Dim ->
             VectorBin = encode_vector(Vector),
@@ -458,21 +458,15 @@ apply_write_to_batch({add_vector, Id, Text, Metadata, Vector}, _PreparedData,
             ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
             ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
             ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+            %% HNSW index updated in-memory only (rebuilt from vectors on startup)
             NewIndex = barrel_vectordb_hnsw:insert(Index, Id, Vector),
-            case barrel_vectordb_hnsw:get_node(NewIndex, Id) of
-                {ok, Node} ->
-                    NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
-                    ok = rocksdb:batch_put(Batch, CfH, Id, NodeBin);
-                not_found ->
-                    ok
-            end,
             {ok, NewIndex, ok};
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end;
 
 apply_write_to_batch({add_vector_batch, Docs}, _PreparedData,
-                      Batch, CfV, CfM, CfT, CfH, Index, Dim) ->
+                      Batch, CfV, CfM, CfT, _CfH, Index, Dim) ->
     try
         {NewIndex, Count} = lists:foldl(fun({Id, Text, Meta, Vector}, {AccIndex, AccCount}) ->
             case length(Vector) of
@@ -482,14 +476,8 @@ apply_write_to_batch({add_vector_batch, Docs}, _PreparedData,
                     ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
                     ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
                     ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+                    %% HNSW index updated in-memory only (rebuilt from vectors on startup)
                     UpdatedIndex = barrel_vectordb_hnsw:insert(AccIndex, Id, Vector),
-                    case barrel_vectordb_hnsw:get_node(UpdatedIndex, Id) of
-                        {ok, Node} ->
-                            NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
-                            ok = rocksdb:batch_put(Batch, CfH, Id, NodeBin);
-                        not_found ->
-                            ok
-                    end,
                     {UpdatedIndex, AccCount + 1};
                 Other ->
                     throw({dimension_mismatch, Dim, Other})
@@ -577,14 +565,14 @@ persist_hnsw_meta(Db, CfHnsw, Index) ->
     Binary = term_to_binary(Meta),
     rocksdb:put(Db, CfHnsw, ?HNSW_META_KEY, Binary, []).
 
-%% Rebuild index from stored vectors
-rebuild_from_vectors(Db, CfVectors, CfHnsw, Dimension, HnswConfig) ->
+%% Rebuild index from stored vectors (HNSW is in-memory only)
+rebuild_from_vectors(Db, CfVectors, _CfHnsw, Dimension, HnswConfig) ->
     Index = barrel_vectordb_hnsw:new(HnswConfig#{dimension => Dimension}),
 
     case rocksdb:iterator(Db, CfVectors, []) of
         {ok, Iter} ->
             try
-                rebuild_loop(Db, Iter, rocksdb:iterator_move(Iter, first), CfHnsw, Index)
+                rebuild_loop(Iter, rocksdb:iterator_move(Iter, first), Index)
             after
                 rocksdb:iterator_close(Iter)
             end;
@@ -592,21 +580,12 @@ rebuild_from_vectors(Db, CfVectors, CfHnsw, Dimension, HnswConfig) ->
             Index
     end.
 
-rebuild_loop(_Db, _Iter, {error, _}, _CfHnsw, Index) ->
+rebuild_loop(_Iter, {error, _}, Index) ->
     Index;
-rebuild_loop(Db, Iter, {ok, Key, VectorBin}, CfHnsw, Index) ->
+rebuild_loop(Iter, {ok, Key, VectorBin}, Index) ->
     Vector = decode_vector(VectorBin),
     NewIndex = barrel_vectordb_hnsw:insert(Index, Key, Vector),
-
-    _ = case barrel_vectordb_hnsw:get_node(NewIndex, Key) of
-        {ok, Node} ->
-            NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
-            rocksdb:put(Db, CfHnsw, Key, NodeBin, []);
-        not_found ->
-            ok
-    end,
-
-    rebuild_loop(Db, Iter, rocksdb:iterator_move(Iter, next), CfHnsw, NewIndex).
+    rebuild_loop(Iter, rocksdb:iterator_move(Iter, next), NewIndex).
 
 %%====================================================================
 %% Internal Functions - Operations
@@ -623,7 +602,7 @@ do_embed_batch(Texts, #state{embed_state = EmbedState}) ->
 %% Add a document
 do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
                                           cf_metadata = CfM, cf_text = CfT,
-                                          cf_hnsw = CfH, hnsw_index = Index} = State) ->
+                                          hnsw_index = Index} = State) ->
     VectorBin = encode_vector(Vector),
     MetadataBin = term_to_binary(Metadata),
 
@@ -632,17 +611,8 @@ do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
     ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
     ok = rocksdb:batch_put(Batch, CfT, Id, Text),
 
-    %% Update HNSW index in memory first
+    %% HNSW index updated in-memory only (rebuilt from vectors on startup)
     NewIndex = barrel_vectordb_hnsw:insert(Index, Id, Vector),
-
-    %% Add HNSW node to the same batch (atomic write)
-    _ = case barrel_vectordb_hnsw:get_node(NewIndex, Id) of
-        {ok, Node} ->
-            NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
-            rocksdb:batch_put(Batch, CfH, Id, NodeBin);
-        not_found ->
-            ok
-    end,
 
     case rocksdb:write_batch(Db, Batch, []) of
         ok ->
