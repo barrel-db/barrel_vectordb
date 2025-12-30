@@ -730,32 +730,54 @@ do_search(QueryVector, Opts, #state{db = Db, hnsw_index = Index,
     K = maps:get(k, Opts, 5),
     HnswResults = barrel_vectordb_hnsw:search(Index, QueryVector, K, Opts),
 
-    Filter = maps:get(filter, Opts, fun(_) -> true end),
+    case HnswResults of
+        [] ->
+            {ok, []};
+        _ ->
+            %% Extract IDs and distances
+            {Ids, Distances} = lists:unzip(HnswResults),
 
-    Results = lists:filtermap(
-        fun({Id, Distance}) ->
-            case {rocksdb:get(Db, CfM, Id, []), rocksdb:get(Db, CfT, Id, [])} of
-                {{ok, MetadataBin}, {ok, Text}} ->
-                    Metadata = binary_to_term(MetadataBin),
-                    case Filter(Metadata) of
-                        true ->
-                            {true, #{
-                                key => Id,
-                                text => Text,
-                                metadata => Metadata,
-                                score => 1.0 - Distance
-                            }};
-                        false ->
-                            false
-                    end;
-                _ ->
-                    false
-            end
-        end,
-        HnswResults
-    ),
+            %% Batch lookup metadata and text using multi_get
+            MetaResults = rocksdb:multi_get(Db, CfM, Ids, []),
+            TextResults = rocksdb:multi_get(Db, CfT, Ids, []),
 
-    {ok, Results}.
+            Filter = maps:get(filter, Opts, fun(_) -> true end),
+
+            %% Combine results
+            Results = combine_search_results(Ids, Distances, MetaResults, TextResults, Filter),
+            {ok, Results}
+    end.
+
+%% Combine HNSW results with fetched metadata/text
+combine_search_results(Ids, Distances, MetaResults, TextResults, Filter) ->
+    combine_search_results(Ids, Distances, MetaResults, TextResults, Filter, []).
+
+combine_search_results([], [], [], [], _Filter, Acc) ->
+    lists:reverse(Acc);
+combine_search_results([Id | Ids], [Distance | Distances],
+                       [MetaRes | MetaResults], [TextRes | TextResults],
+                       Filter, Acc) ->
+    case {MetaRes, TextRes} of
+        {{ok, MetadataBin}, {ok, Text}} ->
+            Metadata = binary_to_term(MetadataBin),
+            case Filter(Metadata) of
+                true ->
+                    Result = #{
+                        key => Id,
+                        text => Text,
+                        metadata => Metadata,
+                        score => 1.0 - Distance
+                    },
+                    combine_search_results(Ids, Distances, MetaResults, TextResults,
+                                           Filter, [Result | Acc]);
+                false ->
+                    combine_search_results(Ids, Distances, MetaResults, TextResults,
+                                           Filter, Acc)
+            end;
+        _ ->
+            %% Skip entries with missing data
+            combine_search_results(Ids, Distances, MetaResults, TextResults, Filter, Acc)
+    end.
 
 %%====================================================================
 %% Internal Functions - Encoding
