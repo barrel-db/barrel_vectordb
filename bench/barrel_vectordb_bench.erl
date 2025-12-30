@@ -149,25 +149,21 @@ run(Name, Opts) ->
         %% Get benchmark function
         BenchFun = get_bench_fun(Name),
 
-        %% Run warmup
+        %% Run warmup (keep store warm for actual run)
         WarmupIters = maps:get(warmup_iterations, MergedOpts),
         io:format("Warmup: ~p iterations...~n", [WarmupIters]),
         _ = run_iterations(BenchFun, Store, WarmupIters, MergedOpts),
 
-        %% Clear store between warmup and actual run
-        cleanup_bench_store(Store, TestDir),
-        {Store2, TestDir2} = setup_bench_store(MergedOpts),
-
-        %% Run actual benchmark
+        %% Run actual benchmark (reuse warm store - don't reset!)
         Iterations = maps:get(iterations, MergedOpts),
         io:format("Running: ~p iterations...~n", [Iterations]),
-        {Timings, OpCounts} = run_iterations(BenchFun, Store2, Iterations, MergedOpts),
+        {Timings, OpCounts} = run_iterations(BenchFun, Store, Iterations, MergedOpts),
 
         %% Calculate statistics
         Stats = calculate_stats(Name, Timings, OpCounts, MergedOpts),
         print_stats(Stats),
 
-        cleanup_bench_store(Store2, TestDir2),
+        cleanup_bench_store(Store, TestDir),
         {ok, Stats}
     catch
         E:R:ST ->
