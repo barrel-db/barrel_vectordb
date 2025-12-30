@@ -35,7 +35,8 @@ api_test_() ->
         {"stats returns store info", fun test_stats/0},
         {"persistence reload", fun test_persistence_reload/0},
         {"concurrent add_vector batching", fun test_concurrent_add_vector/0},
-        {"multiple writers stress test", fun test_multiple_writers/0}
+        {"multiple writers stress test", fun test_multiple_writers/0},
+        {"search with include options", fun test_search_include_options/0}
       ]
      }
     }.
@@ -442,3 +443,43 @@ test_multiple_writers() ->
     %% Clean assertion - just verify we got results from multiple writers
     WriterIds = lists:usort([maps:get(writer, maps:get(metadata, D)) || D <- Results]),
     ?assert(length(WriterIds) >= 1).
+
+test_search_include_options() ->
+    %% Add test documents
+    ok = barrel_vectordb:add_vector(test_store, <<"inc1">>, <<"text one">>,
+                                    #{type => a}, [1.0, 0.0, 0.0]),
+    ok = barrel_vectordb:add_vector(test_store, <<"inc2">>, <<"text two">>,
+                                    #{type => b}, [0.9, 0.1, 0.0]),
+
+    %% Default search includes text and metadata
+    {ok, Results1} = barrel_vectordb:search_vector(test_store, [1.0, 0.0, 0.0], #{k => 2}),
+    [R1 | _] = Results1,
+    ?assert(maps:is_key(text, R1)),
+    ?assert(maps:is_key(metadata, R1)),
+    ?assert(maps:is_key(key, R1)),
+    ?assert(maps:is_key(score, R1)),
+
+    %% Search without text
+    {ok, Results2} = barrel_vectordb:search_vector(test_store, [1.0, 0.0, 0.0],
+                                                   #{k => 2, include_text => false}),
+    [R2 | _] = Results2,
+    ?assertNot(maps:is_key(text, R2)),
+    ?assert(maps:is_key(metadata, R2)),
+    ?assert(maps:is_key(key, R2)),
+
+    %% Search without metadata
+    {ok, Results3} = barrel_vectordb:search_vector(test_store, [1.0, 0.0, 0.0],
+                                                   #{k => 2, include_metadata => false}),
+    [R3 | _] = Results3,
+    ?assert(maps:is_key(text, R3)),
+    ?assertNot(maps:is_key(metadata, R3)),
+
+    %% Search without both (minimal result)
+    {ok, Results4} = barrel_vectordb:search_vector(test_store, [1.0, 0.0, 0.0],
+                                                   #{k => 2, include_text => false,
+                                                     include_metadata => false}),
+    [R4 | _] = Results4,
+    ?assertNot(maps:is_key(text, R4)),
+    ?assertNot(maps:is_key(metadata, R4)),
+    ?assert(maps:is_key(key, R4)),
+    ?assert(maps:is_key(score, R4)).

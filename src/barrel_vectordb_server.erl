@@ -725,6 +725,11 @@ peek_loop(Db, Iter, {ok, Key, VectorBin}, CfM, CfT, Limit, Acc) ->
     end.
 
 %% Search for similar documents
+%% Options:
+%%   - k: number of results (default 5)
+%%   - filter: function to filter by metadata
+%%   - include_text: include text in results (default true)
+%%   - include_metadata: include metadata in results (default true)
 do_search(QueryVector, Opts, #state{db = Db, hnsw_index = Index,
                                      cf_metadata = CfM, cf_text = CfT}) ->
     K = maps:get(k, Opts, 5),
@@ -737,46 +742,76 @@ do_search(QueryVector, Opts, #state{db = Db, hnsw_index = Index,
             %% Extract IDs and distances
             {Ids, Distances} = lists:unzip(HnswResults),
 
-            %% Batch lookup metadata and text using multi_get
-            MetaResults = rocksdb:multi_get(Db, CfM, Ids, []),
-            TextResults = rocksdb:multi_get(Db, CfT, Ids, []),
-
+            %% Check what data to include
+            IncludeText = maps:get(include_text, Opts, true),
+            IncludeMeta = maps:get(include_metadata, Opts, true),
             Filter = maps:get(filter, Opts, fun(_) -> true end),
 
+            %% Only fetch what's needed (skip lookups if not needed and no filter)
+            NeedMeta = IncludeMeta orelse Filter =/= fun(_) -> true end,
+
+            MetaResults = case NeedMeta of
+                true -> rocksdb:multi_get(Db, CfM, Ids, []);
+                false -> [not_needed || _ <- Ids]
+            end,
+            TextResults = case IncludeText of
+                true -> rocksdb:multi_get(Db, CfT, Ids, []);
+                false -> [not_needed || _ <- Ids]
+            end,
+
             %% Combine results
-            Results = combine_search_results(Ids, Distances, MetaResults, TextResults, Filter),
+            Results = combine_search_results(Ids, Distances, MetaResults, TextResults,
+                                             Filter, IncludeText, IncludeMeta),
             {ok, Results}
     end.
 
 %% Combine HNSW results with fetched metadata/text
-combine_search_results(Ids, Distances, MetaResults, TextResults, Filter) ->
-    combine_search_results(Ids, Distances, MetaResults, TextResults, Filter, []).
+combine_search_results(Ids, Distances, MetaResults, TextResults, Filter, IncludeText, IncludeMeta) ->
+    combine_search_results(Ids, Distances, MetaResults, TextResults,
+                           Filter, IncludeText, IncludeMeta, []).
 
-combine_search_results([], [], [], [], _Filter, Acc) ->
+combine_search_results([], [], [], [], _Filter, _IncludeText, _IncludeMeta, Acc) ->
     lists:reverse(Acc);
 combine_search_results([Id | Ids], [Distance | Distances],
                        [MetaRes | MetaResults], [TextRes | TextResults],
-                       Filter, Acc) ->
-    case {MetaRes, TextRes} of
-        {{ok, MetadataBin}, {ok, Text}} ->
-            Metadata = binary_to_term(MetadataBin),
-            case Filter(Metadata) of
-                true ->
-                    Result = #{
-                        key => Id,
-                        text => Text,
-                        metadata => Metadata,
-                        score => 1.0 - Distance
-                    },
-                    combine_search_results(Ids, Distances, MetaResults, TextResults,
-                                           Filter, [Result | Acc]);
-                false ->
-                    combine_search_results(Ids, Distances, MetaResults, TextResults,
-                                           Filter, Acc)
-            end;
-        _ ->
-            %% Skip entries with missing data
-            combine_search_results(Ids, Distances, MetaResults, TextResults, Filter, Acc)
+                       Filter, IncludeText, IncludeMeta, Acc) ->
+    %% Parse metadata if available
+    Metadata = case MetaRes of
+        {ok, MetadataBin} -> binary_to_term(MetadataBin);
+        not_needed -> #{};
+        _ -> undefined
+    end,
+
+    %% Parse text if available
+    Text = case TextRes of
+        {ok, TextBin} -> TextBin;
+        not_needed -> undefined;
+        _ -> undefined
+    end,
+
+    %% Check filter (skip if metadata couldn't be fetched for filtering)
+    PassesFilter = case Metadata of
+        undefined -> false;
+        _ -> Filter(Metadata)
+    end,
+
+    case PassesFilter of
+        true ->
+            %% Build result map with only requested fields
+            Result0 = #{key => Id, score => 1.0 - Distance},
+            Result1 = case IncludeText of
+                true when Text =/= undefined -> Result0#{text => Text};
+                _ -> Result0
+            end,
+            Result2 = case IncludeMeta of
+                true when Metadata =/= undefined -> Result1#{metadata => Metadata};
+                _ -> Result1
+            end,
+            combine_search_results(Ids, Distances, MetaResults, TextResults,
+                                   Filter, IncludeText, IncludeMeta, [Result2 | Acc]);
+        false ->
+            combine_search_results(Ids, Distances, MetaResults, TextResults,
+                                   Filter, IncludeText, IncludeMeta, Acc)
     end.
 
 %%====================================================================
