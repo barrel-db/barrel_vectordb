@@ -63,15 +63,23 @@
 %%   - dimension: Vector dimension
 %%   - hnsw: HNSW index configuration
 %%   - batch: gen_batch_server options (max_batch_size, min_batch_size)
+%%
+%% Default batch settings optimized for vector DB workloads:
+%%   - min_batch_size: 4 (responsive for single inserts, batches concurrent ones)
+%%   - max_batch_size: 256 (reasonable upper bound for memory/latency)
 -spec start_link(atom(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Name, Config) ->
     BatchOpts = maps:get(batch, Config, #{}),
+    %% Apply sensible defaults for vector DB workload
+    DefaultBatch = #{min_batch_size => 4, max_batch_size => 256},
+    MergedBatch = maps:merge(DefaultBatch, BatchOpts),
     GBOpts = maps:fold(fun
         (max_batch_size, V, Acc) -> [{max_batch_size, V} | Acc];
         (min_batch_size, V, Acc) -> [{min_batch_size, V} | Acc];
         (_, _, Acc) -> Acc
-    end, [], BatchOpts),
-    gen_batch_server:start_link({local, Name}, ?MODULE, {Name, Config}, [{gen_batch_server, GBOpts}]).
+    end, [], MergedBatch),
+    gen_batch_server:start_link({local, Name}, ?MODULE, {Name, Config},
+                                [{gen_batch_server, GBOpts}]).
 
 %% @doc Stop a store.
 -spec stop(atom() | pid()) -> ok.

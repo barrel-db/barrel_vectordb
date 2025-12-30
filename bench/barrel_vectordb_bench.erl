@@ -38,7 +38,8 @@
     bench_index_build_1k/1,
     bench_index_build_10k/1,
     bench_get_single/1,
-    bench_delete_single/1
+    bench_delete_single/1,
+    bench_concurrent_writers/1
 ]).
 
 -define(DEFAULT_OPTS, #{
@@ -117,7 +118,8 @@ run_all(Opts) ->
                 search_filtered,
                 get_single,
                 delete_single,
-                index_build_1k
+                index_build_1k,
+                concurrent_writers
             ]
     end,
     Results = lists:map(fun(Name) ->
@@ -262,6 +264,38 @@ bench_index_build_10k(#{dimension := Dim}) ->
         cleanup_bench_store(Store, TestDir)
     end.
 
+%% Concurrent writers benchmark - measures throughput under concurrent load
+%% This tests how well gen_batch_server batches concurrent writes
+bench_concurrent_writers(#{dimension := Dim}) ->
+    NumWriters = 10,
+    DocsPerWriter = 100,
+    TotalDocs = NumWriters * DocsPerWriter,
+
+    {Store, TestDir} = setup_bench_store(#{dimension => Dim}),
+    try
+        Self = self(),
+
+        %% Spawn writers
+        _Pids = [spawn_link(fun() ->
+            lists:foreach(fun(N) ->
+                Id = iolist_to_binary([<<"cw_">>, integer_to_binary(W),
+                                       <<"_">>, integer_to_binary(N)]),
+                Vec = random_vector(Dim),
+                ok = barrel_vectordb:add_vector(Store, Id, <<"concurrent text">>, #{}, Vec)
+            end, lists:seq(1, DocsPerWriter)),
+            Self ! {done, W}
+        end) || W <- lists:seq(1, NumWriters)],
+
+        %% Wait for all writers to complete
+        lists:foreach(fun(_) ->
+            receive {done, _} -> ok end
+        end, lists:seq(1, NumWriters)),
+
+        TotalDocs
+    after
+        cleanup_bench_store(Store, TestDir)
+    end.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
@@ -310,7 +344,8 @@ get_bench_fun(search_filtered) -> fun bench_search_filtered/1;
 get_bench_fun(get_single) -> fun bench_get_single/1;
 get_bench_fun(delete_single) -> fun bench_delete_single/1;
 get_bench_fun(index_build_1k) -> fun bench_index_build_1k/1;
-get_bench_fun(index_build_10k) -> fun bench_index_build_10k/1.
+get_bench_fun(index_build_10k) -> fun bench_index_build_10k/1;
+get_bench_fun(concurrent_writers) -> fun bench_concurrent_writers/1.
 
 run_iterations(BenchFun, Store, Iterations, Opts) ->
     Dim = maps:get(dimension, Opts),
