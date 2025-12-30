@@ -33,7 +33,8 @@ api_test_() ->
         {"peek returns documents", fun test_peek/0},
         {"count returns correct number", fun test_count/0},
         {"stats returns store info", fun test_stats/0},
-        {"persistence reload", fun test_persistence_reload/0}
+        {"persistence reload", fun test_persistence_reload/0},
+        {"concurrent add_vector batching", fun test_concurrent_add_vector/0}
       ]
      }
     }.
@@ -350,3 +351,45 @@ test_persistence_reload() ->
     %% Cleanup
     ok = barrel_vectordb:stop(persist_test_store),
     os:cmd("rm -rf " ++ PersistDir).
+
+test_concurrent_add_vector() ->
+    %% Spawn multiple processes adding vectors concurrently
+    %% gen_batch_server should batch these into fewer atomic writes
+    Self = self(),
+    NumProcs = 20,
+
+    Pids = [spawn(fun() ->
+        Id = list_to_binary("concurrent_" ++ integer_to_list(N)),
+        Vec = [float(N) / float(NumProcs), 0.0, 0.0],
+        Result = barrel_vectordb:add_vector(test_store, Id, <<"concurrent text">>, #{n => N}, Vec),
+        Self ! {done, N, Result}
+    end) || N <- lists:seq(1, NumProcs)],
+
+    %% Wait for all processes to complete
+    Results = [receive {done, N, R} -> {N, R} end || _ <- Pids],
+
+    %% All should succeed
+    lists:foreach(fun({N, Result}) ->
+        ?assertEqual(ok, Result, io_lib:format("Process ~p failed", [N]))
+    end, Results),
+
+    %% Verify all documents were inserted
+    ?assertEqual(NumProcs, barrel_vectordb:count(test_store)),
+
+    %% Verify each document can be retrieved
+    lists:foreach(fun(N) ->
+        Id = list_to_binary("concurrent_" ++ integer_to_list(N)),
+        {ok, Doc} = barrel_vectordb:get(test_store, Id),
+        ?assertEqual(Id, maps:get(key, Doc)),
+        ?assertEqual(#{n => N}, maps:get(metadata, Doc))
+    end, lists:seq(1, NumProcs)),
+
+    %% Verify search works on concurrently inserted documents
+    {ok, Results2} = barrel_vectordb:search_vector(test_store, [1.0, 0.0, 0.0], #{k => 5}),
+    ?assertEqual(5, length(Results2)),
+
+    %% All results should be from the concurrent_ documents
+    lists:foreach(fun(Doc) ->
+        Key = maps:get(key, Doc),
+        ?assertMatch(<<"concurrent_", _/binary>>, Key)
+    end, Results2).

@@ -1,13 +1,17 @@
 %%%-------------------------------------------------------------------
-%%% @doc Per-store gen_server managing RocksDB, HNSW index, and embeddings
+%%% @doc Per-store gen_batch_server managing RocksDB, HNSW index, and embeddings
 %%%
-%%% Each store runs as a separate gen_server registered under its name.
+%%% Each store runs as a separate gen_batch_server registered under its name.
 %%% Handles all document operations, search, and embedding coordination.
+%%%
+%%% Uses gen_batch_server to automatically batch concurrent write operations
+%%% into single atomic RocksDB WriteBatch operations, improving throughput
+%%% under concurrent load.
 %%%
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_vectordb_server).
--behaviour(gen_server).
+-behaviour(gen_batch_server).
 
 -include("barrel_vectordb.hrl").
 
@@ -33,8 +37,8 @@
     embedder_info/1
 ]).
 
-%% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+%% gen_batch_server callbacks
+-export([init/1, handle_batch/2, terminate/2]).
 
 -record(state, {
     name :: atom(),
@@ -56,97 +60,97 @@
 %% @doc Start a named store.
 -spec start_link(atom(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Name, Config) ->
-    gen_server:start_link({local, Name}, ?MODULE, {Name, Config}, []).
+    gen_batch_server:start_link({local, Name}, ?MODULE, {Name, Config}, []).
 
 %% @doc Stop a store.
 -spec stop(atom() | pid()) -> ok.
 stop(Store) ->
-    gen_server:stop(Store).
+    gen_batch_server:stop(Store).
 
 %% @doc Add document with auto-embedding.
 -spec add(atom() | pid(), binary(), binary(), map()) -> ok | {error, term()}.
 add(Store, Id, Text, Metadata) ->
-    gen_server:call(Store, {add, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {add, Id, Text, Metadata}, infinity).
 
 %% @doc Add document with explicit vector.
 -spec add_vector(atom() | pid(), binary(), binary(), map(), [float()]) -> ok | {error, term()}.
 add_vector(Store, Id, Text, Metadata, Vector) ->
-    gen_server:call(Store, {add_vector, Id, Text, Metadata, Vector}, infinity).
+    gen_batch_server:call(Store, {add_vector, Id, Text, Metadata, Vector}, infinity).
 
 %% @doc Add multiple documents.
 -spec add_batch(atom() | pid(), [{binary(), binary(), map()}]) ->
     {ok, #{inserted := non_neg_integer()}} | {error, term()}.
 add_batch(Store, Docs) ->
-    gen_server:call(Store, {add_batch, Docs}, infinity).
+    gen_batch_server:call(Store, {add_batch, Docs}, infinity).
 
 %% @doc Add multiple documents with pre-computed vectors (bulk insert).
 -spec add_vector_batch(atom() | pid(), [{binary(), binary(), map(), [float()]}]) ->
     {ok, #{inserted := non_neg_integer()}} | {error, term()}.
 add_vector_batch(Store, Docs) ->
-    gen_server:call(Store, {add_vector_batch, Docs}, infinity).
+    gen_batch_server:call(Store, {add_vector_batch, Docs}, infinity).
 
 %% @doc Get document by ID.
 -spec get(atom() | pid(), binary()) -> {ok, map()} | not_found | {error, term()}.
 get(Store, Id) ->
-    gen_server:call(Store, {get, Id}).
+    gen_batch_server:call(Store, {get, Id}).
 
 %% @doc Update document metadata (re-embeds the text).
 -spec update(atom() | pid(), binary(), binary(), map()) -> ok | not_found | {error, term()}.
 update(Store, Id, Text, Metadata) ->
-    gen_server:call(Store, {update, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {update, Id, Text, Metadata}, infinity).
 
 %% @doc Insert or update document.
 -spec upsert(atom() | pid(), binary(), binary(), map()) -> ok | {error, term()}.
 upsert(Store, Id, Text, Metadata) ->
-    gen_server:call(Store, {upsert, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {upsert, Id, Text, Metadata}, infinity).
 
 %% @doc Delete document.
 -spec delete(atom() | pid(), binary()) -> ok | {error, term()}.
 delete(Store, Id) ->
-    gen_server:call(Store, {delete, Id}).
+    gen_batch_server:call(Store, {delete, Id}).
 
 %% @doc Peek at documents (sample without search).
 -spec peek(atom() | pid(), pos_integer()) -> {ok, [map()]}.
 peek(Store, Limit) ->
-    gen_server:call(Store, {peek, Limit}).
+    gen_batch_server:call(Store, {peek, Limit}).
 
 %% @doc Search with text query.
 -spec search(atom() | pid(), binary(), map()) -> {ok, [map()]} | {error, term()}.
 search(Store, Query, Opts) ->
-    gen_server:call(Store, {search, Query, Opts}, infinity).
+    gen_batch_server:call(Store, {search, Query, Opts}, infinity).
 
 %% @doc Search with vector query.
 -spec search_vector(atom() | pid(), [float()], map()) -> {ok, [map()]} | {error, term()}.
 search_vector(Store, Vector, Opts) ->
-    gen_server:call(Store, {search_vector, Vector, Opts}, infinity).
+    gen_batch_server:call(Store, {search_vector, Vector, Opts}, infinity).
 
 %% @doc Embed single text.
 -spec embed(atom() | pid(), binary()) -> {ok, [float()]} | {error, term()}.
 embed(Store, Text) ->
-    gen_server:call(Store, {embed, Text}, infinity).
+    gen_batch_server:call(Store, {embed, Text}, infinity).
 
 %% @doc Embed multiple texts.
 -spec embed_batch(atom() | pid(), [binary()]) -> {ok, [[float()]]} | {error, term()}.
 embed_batch(Store, Texts) ->
-    gen_server:call(Store, {embed_batch, Texts}, infinity).
+    gen_batch_server:call(Store, {embed_batch, Texts}, infinity).
 
 %% @doc Get store statistics.
 -spec stats(atom() | pid()) -> {ok, map()}.
 stats(Store) ->
-    gen_server:call(Store, stats).
+    gen_batch_server:call(Store, stats).
 
 %% @doc Get document count.
 -spec count(atom() | pid()) -> non_neg_integer().
 count(Store) ->
-    gen_server:call(Store, count).
+    gen_batch_server:call(Store, count).
 
 %% @doc Get embedder information.
 -spec embedder_info(atom() | pid()) -> {ok, map()}.
 embedder_info(Store) ->
-    gen_server:call(Store, embedder_info).
+    gen_batch_server:call(Store, embedder_info).
 
 %%====================================================================
-%% gen_server callbacks
+%% gen_batch_server callbacks
 %%====================================================================
 
 init({Name, Config}) ->
@@ -185,178 +189,298 @@ init({Name, Config}) ->
             {stop, {embed_init_failed, EmbedError}}
     end.
 
-handle_call({add, Id, Text, Metadata}, _From, State) ->
-    case do_embed(Text, State) of
-        {ok, Vector} ->
-            case do_add(Id, Text, Metadata, Vector, State) of
-                {ok, NewState} ->
-                    {reply, ok, NewState};
-                {error, _} = Error ->
-                    {reply, Error, State}
-            end;
-        {error, _} = Error ->
-            {reply, Error, State}
-    end;
+%% @doc Handle a batch of operations.
+%% Partitions operations into reads (processed immediately) and writes (batched atomically).
+handle_batch(Ops, State) ->
+    %% Separate reads from writes
+    {Reads, Writes} = partition_ops(Ops),
 
-handle_call({add_vector, Id, Text, Metadata, Vector}, _From, #state{dimension = Dim} = State) ->
-    case length(Vector) of
-        Dim ->
-            case do_add(Id, Text, Metadata, Vector, State) of
-                {ok, NewState} ->
-                    {reply, ok, NewState};
-                {error, _} = Error ->
-                    {reply, Error, State}
-            end;
-        Other ->
-            {reply, {error, {dimension_mismatch, Dim, Other}}, State}
-    end;
+    %% Process reads immediately (they don't modify state)
+    {ReadActions, State1} = process_reads(Reads, State),
 
-handle_call({add_batch, Docs}, _From, State) ->
-    Result = do_add_batch(Docs, State),
-    case Result of
-        {ok, Stats, NewState} ->
-            {reply, {ok, Stats}, NewState};
-        {error, _} = Error ->
-            {reply, Error, State}
-    end;
+    %% Process writes atomically in a single batch
+    {WriteActions, State2} = process_writes_atomic(Writes, State1),
 
-handle_call({add_vector_batch, Docs}, _From, State) ->
-    case do_add_vector_batch(Docs, State) of
-        {ok, Stats, NewState} ->
-            {reply, {ok, Stats}, NewState};
-        {error, _} = Error ->
-            {reply, Error, State}
-    end;
+    {ok, ReadActions ++ WriteActions, State2}.
 
-handle_call({get, Id}, _From, State) ->
+%% Partition operations into reads and writes
+partition_ops(Ops) ->
+    lists:partition(fun(Op) ->
+        case Op of
+            {_, _, {add, _, _, _}} -> false;
+            {_, _, {add_vector, _, _, _, _}} -> false;
+            {_, _, {add_batch, _}} -> false;
+            {_, _, {add_vector_batch, _}} -> false;
+            _ -> true  % reads: get, search, peek, stats, count, delete, update, upsert
+        end
+    end, Ops).
+
+%% Process read operations (and delete/update/upsert which need immediate state access)
+process_reads(Reads, State) ->
+    lists:foldl(fun(Op, {AccActions, AccState}) ->
+        {Action, NewState} = process_single_op(Op, AccState),
+        {[Action | AccActions], NewState}
+    end, {[], State}, Reads).
+
+%% Process a single operation (for reads and non-batched operations)
+process_single_op({call, From, {get, Id}}, State) ->
     Result = do_get(Id, State),
-    {reply, Result, State};
+    {{reply, From, Result}, State};
 
-handle_call({delete, Id}, _From, State) ->
+process_single_op({call, From, {delete, Id}}, State) ->
     case do_delete(Id, State) of
         {ok, NewState} ->
-            {reply, ok, NewState};
+            {{reply, From, ok}, NewState};
         {error, _} = Error ->
-            {reply, Error, State}
+            {{reply, From, Error}, State}
     end;
 
-handle_call({update, Id, Text, Metadata}, _From, State) ->
+process_single_op({call, From, {update, Id, Text, Metadata}}, State) ->
     case do_get(Id, State) of
         {ok, _Existing} ->
-            %% Document exists, delete and re-add with new text/metadata
             case do_delete(Id, State) of
                 {ok, State1} ->
                     case do_embed(Text, State1) of
                         {ok, Vector} ->
                             case do_add(Id, Text, Metadata, Vector, State1) of
                                 {ok, NewState} ->
-                                    {reply, ok, NewState};
+                                    {{reply, From, ok}, NewState};
                                 {error, _} = Error ->
-                                    {reply, Error, State}
+                                    {{reply, From, Error}, State}
                             end;
                         {error, _} = Error ->
-                            {reply, Error, State}
+                            {{reply, From, Error}, State}
                     end;
                 {error, _} = Error ->
-                    {reply, Error, State}
+                    {{reply, From, Error}, State}
             end;
         not_found ->
-            {reply, not_found, State};
+            {{reply, From, not_found}, State};
         {error, _} = Error ->
-            {reply, Error, State}
+            {{reply, From, Error}, State}
     end;
 
-handle_call({upsert, Id, Text, Metadata}, _From, State) ->
+process_single_op({call, From, {upsert, Id, Text, Metadata}}, State) ->
     case do_get(Id, State) of
         {ok, _Existing} ->
-            %% Exists: delete and re-add
             case do_delete(Id, State) of
                 {ok, State1} ->
                     case do_embed(Text, State1) of
                         {ok, Vector} ->
                             case do_add(Id, Text, Metadata, Vector, State1) of
                                 {ok, NewState} ->
-                                    {reply, ok, NewState};
+                                    {{reply, From, ok}, NewState};
                                 {error, _} = Error ->
-                                    {reply, Error, State}
+                                    {{reply, From, Error}, State}
                             end;
                         {error, _} = Error ->
-                            {reply, Error, State}
+                            {{reply, From, Error}, State}
                     end;
                 {error, _} = Error ->
-                    {reply, Error, State}
+                    {{reply, From, Error}, State}
             end;
         not_found ->
-            %% Not found: just add
             case do_embed(Text, State) of
                 {ok, Vector} ->
                     case do_add(Id, Text, Metadata, Vector, State) of
                         {ok, NewState} ->
-                            {reply, ok, NewState};
+                            {{reply, From, ok}, NewState};
                         {error, _} = Error ->
-                            {reply, Error, State}
+                            {{reply, From, Error}, State}
                     end;
                 {error, _} = Error ->
-                    {reply, Error, State}
+                    {{reply, From, Error}, State}
             end;
         {error, _} = Error ->
-            {reply, Error, State}
+            {{reply, From, Error}, State}
     end;
 
-handle_call({peek, Limit}, _From, State) ->
+process_single_op({call, From, {peek, Limit}}, State) ->
     Result = do_peek(Limit, State),
-    {reply, Result, State};
+    {{reply, From, Result}, State};
 
-handle_call({search, Query, Opts}, _From, State) ->
+process_single_op({call, From, {search, Query, Opts}}, State) ->
     case do_embed(Query, State) of
         {ok, Vector} ->
             Result = do_search(Vector, Opts, State),
-            {reply, Result, State};
+            {{reply, From, Result}, State};
         {error, _} = Error ->
-            {reply, Error, State}
+            {{reply, From, Error}, State}
     end;
 
-handle_call({search_vector, Vector, Opts}, _From, #state{dimension = Dim} = State) ->
+process_single_op({call, From, {search_vector, Vector, Opts}}, #state{dimension = Dim} = State) ->
     case length(Vector) of
         Dim ->
             Result = do_search(Vector, Opts, State),
-            {reply, Result, State};
+            {{reply, From, Result}, State};
         Other ->
-            {reply, {error, {dimension_mismatch, Dim, Other}}, State}
+            {{reply, From, {error, {dimension_mismatch, Dim, Other}}}, State}
     end;
 
-handle_call({embed, Text}, _From, State) ->
+process_single_op({call, From, {embed, Text}}, State) ->
     Result = do_embed(Text, State),
-    {reply, Result, State};
+    {{reply, From, Result}, State};
 
-handle_call({embed_batch, Texts}, _From, State) ->
+process_single_op({call, From, {embed_batch, Texts}}, State) ->
     Result = do_embed_batch(Texts, State),
-    {reply, Result, State};
+    {{reply, From, Result}, State};
 
-handle_call(stats, _From, #state{hnsw_index = Index, dimension = Dim, config = Config} = State) ->
+process_single_op({call, From, stats}, #state{hnsw_index = Index, dimension = Dim, config = Config} = State) ->
     Stats = #{
         dimension => Dim,
         count => barrel_vectordb_hnsw:size(Index),
         hnsw => barrel_vectordb_hnsw:info(Index),
         config => Config
     },
-    {reply, {ok, Stats}, State};
+    {{reply, From, {ok, Stats}}, State};
 
-handle_call(count, _From, #state{hnsw_index = Index} = State) ->
-    {reply, barrel_vectordb_hnsw:size(Index), State};
+process_single_op({call, From, count}, #state{hnsw_index = Index} = State) ->
+    {{reply, From, barrel_vectordb_hnsw:size(Index)}, State};
 
-handle_call(embedder_info, _From, #state{embed_state = EmbedState} = State) ->
+process_single_op({call, From, embedder_info}, #state{embed_state = EmbedState} = State) ->
     Info = barrel_vectordb_embed:info(EmbedState),
-    {reply, {ok, Info}, State};
+    {{reply, From, {ok, Info}}, State};
 
-handle_call(_Request, _From, State) ->
-    {reply, {error, unknown_request}, State}.
+process_single_op({call, From, _Unknown}, State) ->
+    {{reply, From, {error, unknown_request}}, State}.
 
-handle_cast(_Msg, State) ->
-    {noreply, State}.
+%% Process write operations atomically in a single RocksDB batch
+process_writes_atomic([], State) ->
+    {[], State};
+process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
+                                      cf_text = CfT, cf_hnsw = CfH,
+                                      hnsw_index = Index, dimension = Dim} = State) ->
+    {ok, Batch} = rocksdb:batch(),
 
-handle_info(_Info, State) ->
-    {noreply, State}.
+    %% First, prepare all embeddings if needed (this is done before batch to avoid
+    %% partial writes on embedding failures)
+    case prepare_writes(Writes, State) of
+        {ok, PreparedWrites} ->
+            %% Now apply all writes to the batch
+            {NewIndex, Replies} = lists:foldl(fun({From, WriteOp, PreparedData}, {AccIndex, AccReplies}) ->
+                case apply_write_to_batch(WriteOp, PreparedData, Batch, CfV, CfM, CfT, CfH, AccIndex, Dim) of
+                    {ok, UpdatedIndex, Reply} ->
+                        {UpdatedIndex, [{reply, From, Reply} | AccReplies]};
+                    {error, Reason} ->
+                        {AccIndex, [{reply, From, {error, Reason}} | AccReplies]}
+                end
+            end, {Index, []}, PreparedWrites),
+
+            %% Commit the batch atomically
+            case rocksdb:write_batch(Db, Batch, []) of
+                ok ->
+                    {Replies, State#state{hnsw_index = NewIndex}};
+                {error, Reason} ->
+                    %% All writes fail on batch commit error
+                    ErrorReplies = [{reply, From, {error, {db_error, Reason}}}
+                                   || {From, _, _} <- PreparedWrites],
+                    {ErrorReplies, State}
+            end;
+        {error, From, Reason, SuccessfulPreps} ->
+            %% Embedding failed for one operation, fail that one and process others
+            ErrorReply = {reply, From, {error, Reason}},
+            case SuccessfulPreps of
+                [] ->
+                    {[ErrorReply], State};
+                _ ->
+                    %% Process successful preps
+                    {OkReplies, NewState} = process_writes_atomic(
+                        [{call, F, Op} || {F, Op, _} <- SuccessfulPreps],
+                        State),
+                    {[ErrorReply | OkReplies], NewState}
+            end
+    end.
+
+%% Prepare writes by computing embeddings where needed
+prepare_writes(Writes, State) ->
+    prepare_writes(Writes, State, []).
+
+prepare_writes([], _State, Acc) ->
+    {ok, lists:reverse(Acc)};
+prepare_writes([{call, From, {add, Id, Text, Metadata}} | Rest], State, Acc) ->
+    case do_embed(Text, State) of
+        {ok, Vector} ->
+            prepare_writes(Rest, State, [{From, {add_vector, Id, Text, Metadata, Vector}, prepared} | Acc]);
+        {error, Reason} ->
+            {error, From, Reason, lists:reverse(Acc)}
+    end;
+prepare_writes([{call, From, {add_vector, Id, Text, Metadata, Vector}} | Rest], State, Acc) ->
+    prepare_writes(Rest, State, [{From, {add_vector, Id, Text, Metadata, Vector}, prepared} | Acc]);
+prepare_writes([{call, From, {add_batch, Docs}} | Rest], State, Acc) ->
+    case prepare_batch_embeddings(Docs, State) of
+        {ok, PreparedDocs} ->
+            prepare_writes(Rest, State, [{From, {add_vector_batch, PreparedDocs}, prepared} | Acc]);
+        {error, Reason} ->
+            {error, From, Reason, lists:reverse(Acc)}
+    end;
+prepare_writes([{call, From, {add_vector_batch, Docs}} | Rest], State, Acc) ->
+    prepare_writes(Rest, State, [{From, {add_vector_batch, Docs}, prepared} | Acc]).
+
+%% Prepare embeddings for batch add
+prepare_batch_embeddings(Docs, State) ->
+    Texts = [Text || {_Id, Text, _Meta} <- Docs],
+    case do_embed_batch(Texts, State) of
+        {ok, Vectors} ->
+            PreparedDocs = lists:zipwith(fun({Id, Text, Meta}, Vector) ->
+                {Id, Text, Meta, Vector}
+            end, Docs, Vectors),
+            {ok, PreparedDocs};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Apply a single write operation to the batch
+apply_write_to_batch({add_vector, Id, Text, Metadata, Vector}, _PreparedData,
+                      Batch, CfV, CfM, CfT, CfH, Index, Dim) ->
+    case length(Vector) of
+        Dim ->
+            VectorBin = encode_vector(Vector),
+            MetadataBin = term_to_binary(Metadata),
+            ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
+            ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
+            ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+            NewIndex = barrel_vectordb_hnsw:insert(Index, Id, Vector),
+            case barrel_vectordb_hnsw:get_node(NewIndex, Id) of
+                {ok, Node} ->
+                    NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
+                    ok = rocksdb:batch_put(Batch, CfH, Id, NodeBin);
+                not_found ->
+                    ok
+            end,
+            {ok, NewIndex, ok};
+        Other ->
+            {error, {dimension_mismatch, Dim, Other}}
+    end;
+
+apply_write_to_batch({add_vector_batch, Docs}, _PreparedData,
+                      Batch, CfV, CfM, CfT, CfH, Index, Dim) ->
+    try
+        {NewIndex, Count} = lists:foldl(fun({Id, Text, Meta, Vector}, {AccIndex, AccCount}) ->
+            case length(Vector) of
+                Dim ->
+                    VectorBin = encode_vector(Vector),
+                    MetadataBin = term_to_binary(Meta),
+                    ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
+                    ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
+                    ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+                    UpdatedIndex = barrel_vectordb_hnsw:insert(AccIndex, Id, Vector),
+                    case barrel_vectordb_hnsw:get_node(UpdatedIndex, Id) of
+                        {ok, Node} ->
+                            NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
+                            ok = rocksdb:batch_put(Batch, CfH, Id, NodeBin);
+                        not_found ->
+                            ok
+                    end,
+                    {UpdatedIndex, AccCount + 1};
+                Other ->
+                    throw({dimension_mismatch, Dim, Other})
+            end
+        end, {Index, 0}, Docs),
+        {ok, NewIndex, {ok, #{inserted => Count}}}
+    catch
+        throw:{dimension_mismatch, Expected, Got} ->
+            {error, {dimension_mismatch, Expected, Got}}
+    end.
 
 terminate(_Reason, #state{db = Db, hnsw_index = Index, cf_hnsw = CfHnsw}) ->
     %% Persist HNSW index metadata before closing
@@ -506,66 +630,6 @@ do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
             {ok, State#state{hnsw_index = NewIndex}};
         {error, Reason} ->
             {error, {db_error, Reason}}
-    end.
-
-%% Add multiple documents
-do_add_batch(Docs, State) ->
-    do_add_batch(Docs, 0, State).
-
-do_add_batch([], Count, State) ->
-    {ok, #{inserted => Count}, State};
-do_add_batch([{Id, Text, Metadata} | Rest], Count, State) ->
-    case do_embed(Text, State) of
-        {ok, Vector} ->
-            case do_add(Id, Text, Metadata, Vector, State) of
-                {ok, NewState} ->
-                    do_add_batch(Rest, Count + 1, NewState);
-                {error, _} = Error ->
-                    Error
-            end;
-        {error, _} = Error ->
-            Error
-    end.
-
-%% Add multiple documents with pre-computed vectors (bulk insert)
-%% All documents are written in a single atomic RocksDB batch
-do_add_vector_batch(Docs, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
-                                  cf_text = CfT, cf_hnsw = CfH,
-                                  hnsw_index = Index, dimension = Dim} = State) ->
-    {ok, Batch} = rocksdb:batch(),
-    try
-        {NewIndex, Count} = lists:foldl(fun({Id, Text, Meta, Vector}, {AccIndex, AccCount}) ->
-            case length(Vector) of
-                Dim ->
-                    VectorBin = encode_vector(Vector),
-                    MetadataBin = term_to_binary(Meta),
-                    ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
-                    ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
-                    ok = rocksdb:batch_put(Batch, CfT, Id, Text),
-                    %% Update HNSW index in memory
-                    UpdatedIndex = barrel_vectordb_hnsw:insert(AccIndex, Id, Vector),
-                    %% Add HNSW node to batch
-                    case barrel_vectordb_hnsw:get_node(UpdatedIndex, Id) of
-                        {ok, Node} ->
-                            NodeBin = barrel_vectordb_hnsw:serialize_node(Node),
-                            ok = rocksdb:batch_put(Batch, CfH, Id, NodeBin);
-                        not_found ->
-                            ok
-                    end,
-                    {UpdatedIndex, AccCount + 1};
-                Other ->
-                    throw({error, {dimension_mismatch, Dim, Other}})
-            end
-        end, {Index, 0}, Docs),
-        case rocksdb:write_batch(Db, Batch, []) of
-            ok ->
-                {ok, #{inserted => Count}, State#state{hnsw_index = NewIndex}};
-            {error, Reason} ->
-                {error, {db_error, Reason}}
-        end
-    catch
-        throw:{error, _} = Error ->
-            Error
     end.
 
 %% Get a document
