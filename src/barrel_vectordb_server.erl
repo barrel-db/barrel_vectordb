@@ -836,8 +836,9 @@ combine_search_results([Id | Ids], [Distance | Distances],
 %% Internal Functions - Encoding
 %%====================================================================
 
+%% Use 32-bit floats for 50% storage reduction (standard for similarity search)
 encode_vector(Vector) when is_list(Vector) ->
-    << <<F:64/float-little>> || F <- Vector >>.
+    << <<F:32/float-little>> || F <- Vector >>.
 
 decode_vector(Binary) ->
-    [F || <<F:64/float-little>> <= Binary].
+    [F || <<F:32/float-little>> <= Binary].

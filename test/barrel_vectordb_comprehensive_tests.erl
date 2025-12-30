@@ -131,6 +131,17 @@ normalize(Vec) ->
         false -> [X / Norm || X <- Vec]
     end.
 
+%% Check if two vectors are approximately equal (for float32 storage)
+vectors_approx_equal(V1, V2) ->
+    vectors_approx_equal(V1, V2, 1.0e-5).
+
+vectors_approx_equal([], [], _Eps) ->
+    true;
+vectors_approx_equal([A | As], [B | Bs], Eps) ->
+    abs(A - B) < Eps andalso vectors_approx_equal(As, Bs, Eps);
+vectors_approx_equal(_, _, _) ->
+    false.
+
 %%====================================================================
 %% Basic CRUD Tests
 %%====================================================================
@@ -489,8 +500,10 @@ test_invariant_data_integrity() ->
         ?assertEqual(Id, maps:get(key, Doc)),
         ?assertEqual(ExpText, maps:get(text, Doc)),
         ?assertEqual(ExpMeta, maps:get(metadata, Doc)),
-        %% Vectors stored with 64-bit precision - exact comparison
-        ?assertEqual(text_to_vector(ExpText, 8), maps:get(vector, Doc))
+        %% Vectors stored with 32-bit precision - use approximate comparison
+        ExpVec = text_to_vector(ExpText, 8),
+        ActualVec = maps:get(vector, Doc),
+        ?assert(vectors_approx_equal(ExpVec, ActualVec))
     end, TestData).
 
 test_invariant_score_ordering() ->
