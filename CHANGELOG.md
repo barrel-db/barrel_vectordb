@@ -7,18 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-01-01
+
 ### Added
 
 - **Search options**: `include_text` and `include_metadata` options to skip unnecessary RocksDB lookups
+- **Search option**: `ef_search` option to control search width at query time
 - **Batch vector API**: `add_vector_batch/2` for efficient bulk vector insertion
+- **Checkpoint API**: `checkpoint/1` for manual HNSW index persistence
 - **gen_batch_server integration**: Automatic write batching for improved throughput
 - **Benchmark framework**: Performance benchmark suite in `bench/` directory
 - **Multi-writer tests**: Concurrent writer stress tests
+- **Improved documentation**: Comprehensive README with all API functions and options
 
 ### Changed
 
 - **HNSW search optimization**: Replaced `lists:sort/1` with `gb_trees` for O(log N) candidate management instead of O(N log N)
 - **Batch RocksDB lookups**: Search now uses `rocksdb:multi_get/4` instead of sequential `rocksdb:get/3` calls
+- **Vector storage**: Use float32 for vector storage (50% size reduction)
+- **HNSW persistence**: Deferred HNSW persistence for faster inserts
 - **Dependencies**: Updated `rocksdb` from 2.0.0 to 2.2.0 for `multi_get` support
 
 ### Fixed
@@ -42,7 +49,7 @@ Key optimizations:
 3. Skip text/metadata lookups with `include_text => false`
 4. O(log N) HNSW candidate management with `gb_trees`
 
-## [1.0.0] - 2024-12-XX
+## [1.0.0] - 2025-12-01
 
 ### Added
 
