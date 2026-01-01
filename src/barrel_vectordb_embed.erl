@@ -187,6 +187,7 @@ provider_module(local) -> barrel_vectordb_embed_local;
 provider_module(fastembed) -> barrel_vectordb_embed_fastembed;
 provider_module(splade) -> barrel_vectordb_embed_splade;
 provider_module(colbert) -> barrel_vectordb_embed_colbert;
+provider_module(clip) -> barrel_vectordb_embed_clip;
 provider_module(ollama) -> barrel_vectordb_embed_ollama;
 provider_module(openai) -> barrel_vectordb_embed_openai;
 provider_module(Module) when is_atom(Module) -> Module.
