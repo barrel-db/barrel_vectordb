@@ -185,6 +185,7 @@ normalize_providers(Providers) when is_list(Providers) ->
 %% Map provider name to module
 provider_module(local) -> barrel_vectordb_embed_local;
 provider_module(fastembed) -> barrel_vectordb_embed_fastembed;
+provider_module(splade) -> barrel_vectordb_embed_splade;
 provider_module(ollama) -> barrel_vectordb_embed_ollama;
 provider_module(openai) -> barrel_vectordb_embed_openai;
 provider_module(Module) when is_atom(Module) -> Module.
