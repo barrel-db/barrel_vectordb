@@ -19,8 +19,10 @@
 %%% '''
 %%%
 %%% == Supported Models ==
-%%% Any model from sentence-transformers or HuggingFace:
+%%% Any model from sentence-transformers or HuggingFace.
+%%% See `barrel_vectordb_models:list(text)' for the full list of known models.
 %%%
+%%% Common models:
 %%% - `"BAAI/bge-base-en-v1.5"' - Default, 768 dimensions, good quality/speed balance
 %%% - `"BAAI/bge-small-en-v1.5"' - 384 dimensions, faster, slightly lower quality
 %%% - `"BAAI/bge-large-en-v1.5"' - 1024 dimensions, best quality, slower
@@ -29,6 +31,7 @@
 %%% - `"nomic-ai/nomic-embed-text-v1.5"' - 768 dims, long context (8192 tokens)
 %%%
 %%% Note: The dimension is auto-detected from the model on initialization.
+%%% Unknown models (not in registry) will log a warning but still work.
 %%%
 %%% == Protocol ==
 %%% Communication via stdin/stdout using JSON lines:
@@ -80,6 +83,9 @@ init(Config) ->
     Python = maps:get(python, Config, ?DEFAULT_PYTHON),
     Model = maps:get(model, Config, ?DEFAULT_MODEL),
     Timeout = maps:get(timeout, Config, ?DEFAULT_TIMEOUT),
+
+    %% Validate model against registry (warning only, doesn't block)
+    validate_model(Model),
 
     %% Find the Python script
     ScriptPath = find_embed_script(),
@@ -198,3 +204,22 @@ port_command_sync(Port, Request, Timeout) ->
     after Timeout ->
         {error, timeout}
     end.
+
+%% @private
+%% Validate model against registry (warning only)
+validate_model(Model) ->
+    ModelBin = to_binary(Model),
+    case barrel_vectordb_models:is_known(ModelBin) of
+        true ->
+            ok;
+        false ->
+            error_logger:warning_msg(
+                "Model ~s is not in the registry. "
+                "It may still work if available in sentence-transformers.~n",
+                [ModelBin]
+            )
+    end.
+
+%% @private
+to_binary(S) when is_binary(S) -> S;
+to_binary(S) when is_list(S) -> list_to_binary(S).

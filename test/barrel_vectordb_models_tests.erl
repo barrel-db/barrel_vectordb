@@ -42,7 +42,18 @@ models_test_() ->
             {"default text model", fun test_default_text/0},
             {"dimensions for known model", fun test_dimensions_known/0},
             {"dimensions for model without dims", fun test_dimensions_no_dims/0},
-            {"reload refreshes cache", fun test_reload/0}
+            {"reload refreshes cache", fun test_reload/0},
+            %% Provider integration tests
+            {"embedder_config for known model", fun test_embedder_config/0},
+            {"embedder_config with options", fun test_embedder_config_with_options/0},
+            {"embedder_config for unknown model", fun test_embedder_config_unknown/0},
+            {"embedder_config accepts string", fun test_embedder_config_string/0},
+            {"is_known returns true for known model", fun test_is_known_true/0},
+            {"is_known returns false for unknown model", fun test_is_known_false/0},
+            {"model_type for text model", fun test_model_type_text/0},
+            {"model_type for sparse model", fun test_model_type_sparse/0},
+            {"model_type for image model", fun test_model_type_image/0},
+            {"model_type for unknown model", fun test_model_type_unknown/0}
         ]
     }.
 
@@ -150,3 +161,58 @@ test_reload() ->
     %% Should still work
     {ok, Models} = barrel_vectordb_models:list(text),
     ?assert(length(Models) > 0).
+
+%%====================================================================
+%% Provider Integration Tests
+%%====================================================================
+
+test_embedder_config() ->
+    {ok, Config} = barrel_vectordb_models:embedder_config(<<"BAAI/bge-small-en-v1.5">>),
+    ?assertMatch({local, _}, Config),
+    {local, Opts} = Config,
+    ?assertEqual(<<"BAAI/bge-small-en-v1.5">>, maps:get(model, Opts)),
+    ?assertEqual(384, maps:get(dimensions, Opts)).
+
+test_embedder_config_with_options() ->
+    {ok, Config} = barrel_vectordb_models:embedder_config(
+        <<"BAAI/bge-base-en-v1.5">>,
+        #{python => <<"/usr/bin/python3">>, timeout => 60000}
+    ),
+    {local, Opts} = Config,
+    ?assertEqual(<<"BAAI/bge-base-en-v1.5">>, maps:get(model, Opts)),
+    ?assertEqual(768, maps:get(dimensions, Opts)),
+    ?assertEqual(<<"/usr/bin/python3">>, maps:get(python, Opts)),
+    ?assertEqual(60000, maps:get(timeout, Opts)).
+
+test_embedder_config_unknown() ->
+    Result = barrel_vectordb_models:embedder_config(<<"unknown/model">>),
+    ?assertEqual({error, model_not_found}, Result).
+
+test_embedder_config_string() ->
+    {ok, Config} = barrel_vectordb_models:embedder_config("BAAI/bge-small-en-v1.5"),
+    {local, Opts} = Config,
+    ?assertEqual(<<"BAAI/bge-small-en-v1.5">>, maps:get(model, Opts)).
+
+test_is_known_true() ->
+    ?assertEqual(true, barrel_vectordb_models:is_known(<<"BAAI/bge-base-en-v1.5">>)),
+    ?assertEqual(true, barrel_vectordb_models:is_known("BAAI/bge-base-en-v1.5")).
+
+test_is_known_false() ->
+    ?assertEqual(false, barrel_vectordb_models:is_known(<<"unknown/model">>)),
+    ?assertEqual(false, barrel_vectordb_models:is_known("unknown/model")).
+
+test_model_type_text() ->
+    {ok, Type} = barrel_vectordb_models:model_type(<<"BAAI/bge-base-en-v1.5">>),
+    ?assertEqual(text, Type).
+
+test_model_type_sparse() ->
+    {ok, Type} = barrel_vectordb_models:model_type(<<"bm25">>),
+    ?assertEqual(sparse, Type).
+
+test_model_type_image() ->
+    {ok, Type} = barrel_vectordb_models:model_type(<<"Qdrant/clip-ViT-B-32-vision">>),
+    ?assertEqual(image, Type).
+
+test_model_type_unknown() ->
+    Result = barrel_vectordb_models:model_type(<<"unknown/model">>),
+    ?assertEqual({error, model_not_found}, Result).

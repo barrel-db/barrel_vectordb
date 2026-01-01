@@ -38,7 +38,12 @@
     default/1,
     dimensions/1,
     types/0,
-    reload/0
+    reload/0,
+    %% Provider integration
+    embedder_config/1,
+    embedder_config/2,
+    is_known/1,
+    model_type/1
 ]).
 
 %% Types
@@ -156,6 +161,60 @@ reload() ->
             Error
     end.
 
+%% @doc Get embedder configuration for a model.
+%% Returns a ready-to-use embedder config tuple for barrel_vectordb:start_link/1.
+%%
+%% Example:
+%% ```
+%% {ok, Config} = barrel_vectordb_models:embedder_config(<<"BAAI/bge-small-en-v1.5">>).
+%% %% => {local, #{model => <<"BAAI/bge-small-en-v1.5">>, dimensions => 384}}
+%% '''
+-spec embedder_config(binary() | string()) -> {ok, {atom(), map()}} | {error, term()}.
+embedder_config(Name) ->
+    embedder_config(Name, #{}).
+
+%% @doc Get embedder configuration with additional options.
+%% Options are merged with the base config from the model registry.
+%%
+%% Example:
+%% ```
+%% {ok, Config} = barrel_vectordb_models:embedder_config(
+%%     <<"BAAI/bge-small-en-v1.5">>,
+%%     #{python => "/usr/bin/python3", timeout => 60000}
+%% ).
+%% '''
+-spec embedder_config(binary() | string(), map()) -> {ok, {atom(), map()}} | {error, term()}.
+embedder_config(Name, Options) when is_list(Name) ->
+    embedder_config(list_to_binary(Name), Options);
+embedder_config(Name, Options) when is_binary(Name), is_map(Options) ->
+    case info(Name) of
+        {ok, ModelInfo} ->
+            Config = build_embedder_config(Name, ModelInfo, Options),
+            {ok, Config};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Check if a model is known in the registry.
+-spec is_known(binary() | string()) -> boolean().
+is_known(Name) ->
+    case info(Name) of
+        {ok, _} -> true;
+        {error, _} -> false
+    end.
+
+%% @doc Get the type of a model (text, sparse, image, etc).
+-spec model_type(binary() | string()) -> {ok, model_type()} | {error, term()}.
+model_type(Name) when is_list(Name) ->
+    model_type(list_to_binary(Name));
+model_type(Name) when is_binary(Name) ->
+    case ensure_loaded() of
+        {ok, #{<<"models">> := Models}} ->
+            find_model_type(Name, Models);
+        {error, _} = Error ->
+            Error
+    end.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
@@ -250,3 +309,41 @@ find_default([#{<<"default">> := true} = Model | _]) ->
     {ok, Model};
 find_default([_ | Rest]) ->
     find_default(Rest).
+
+%% @private
+%% Build embedder config based on model type
+build_embedder_config(Name, ModelInfo, Options) ->
+    %% Get dimensions if available
+    BaseConfig = case maps:get(<<"dimensions">>, ModelInfo, undefined) of
+        undefined -> #{model => Name};
+        Dims -> #{model => Name, dimensions => Dims}
+    end,
+    %% Merge with user options (user options take precedence)
+    MergedConfig = maps:merge(BaseConfig, Options),
+    %% Return as local provider config (default for HuggingFace models)
+    {local, MergedConfig}.
+
+%% @private
+find_model_type(Name, Models) ->
+    find_model_type(Name, maps:to_list(Models), undefined).
+
+find_model_type(_Name, [], undefined) ->
+    {error, model_not_found};
+find_model_type(_Name, [], {ok, _} = Found) ->
+    Found;
+find_model_type(Name, [{TypeBin, ModelList} | Rest], _Acc) ->
+    case has_model(Name, ModelList) of
+        true ->
+            Type = binary_to_existing_atom(TypeBin, utf8),
+            {ok, Type};
+        false ->
+            find_model_type(Name, Rest, undefined)
+    end.
+
+%% @private
+has_model(_Name, []) ->
+    false;
+has_model(Name, [#{<<"name">> := Name} | _]) ->
+    true;
+has_model(Name, [_ | Rest]) ->
+    has_model(Name, Rest).
