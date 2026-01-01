@@ -362,7 +362,7 @@ rebar3 as bench compile && rebar3 as bench eunit --module=barrel_vectordb_bench
 - **Embeddings**: Pluggable providers with fallback
 - **Batching**: gen_batch_server for automatic write coalescing
 
-See [doc/design.md](doc/design.md) for detailed architecture documentation.
+See the API documentation for detailed architecture information.
 
 ## License
 

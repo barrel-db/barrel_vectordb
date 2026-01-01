@@ -28,36 +28,31 @@
 
 %% Behaviour callbacks
 
-%% @doc Generate embedding for a single text.
-%% @param Text The text to embed
-%% @param Config Provider-specific configuration
-%% @returns `{ok, Vector}' on success, `{error, Reason}' on failure
+%% Generate embedding for a single text.
+%% Returns `{ok, Vector}' on success, `{error, Reason}' on failure.
 -callback embed(Text :: binary(), Config :: map()) ->
     {ok, Vector :: [float()]} | {error, term()}.
 
-%% @doc Generate embeddings for multiple texts.
-%% @param Texts List of texts to embed
-%% @param Config Provider-specific configuration
-%% @returns `{ok, Vectors}' on success, `{error, Reason}' on failure
+%% Generate embeddings for multiple texts.
+%% Returns `{ok, Vectors}' on success, `{error, Reason}' on failure.
 -callback embed_batch(Texts :: [binary()], Config :: map()) ->
     {ok, Vectors :: [[float()]]} | {error, term()}.
 
-%% @doc Get the dimension of vectors produced by this provider.
-%% @param Config Provider-specific configuration
-%% @returns The dimension (e.g., 768 for many models)
+%% Get the dimension of vectors produced by this provider.
+%% Returns the dimension (e.g., 768 for many models).
 -callback dimension(Config :: map()) -> pos_integer().
 
-%% @doc Get the provider name.
-%% @returns Atom identifying this provider
+%% Get the provider name.
+%% Returns atom identifying this provider.
 -callback name() -> atom().
 
 %% Optional callbacks
 
-%% @doc Initialize the provider with configuration.
+%% Initialize the provider with configuration.
 %% Called once when the provider is first used.
 -callback init(Config :: map()) -> {ok, NewConfig :: map()} | {error, term()}.
 
-%% @doc Check if the provider is currently available.
+%% Check if the provider is currently available.
 %% Used to skip unavailable providers in fallback chains.
 -callback available(Config :: map()) -> boolean().
 

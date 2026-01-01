@@ -39,7 +39,7 @@
 %%%    vector. This provides 8x memory reduction compared to float64
 %%%    with minimal recall loss (~1-2% for typical embeddings).
 %%%
-%%%    Storage format: <<Scale:32/float-little, Components/binary>>
+%%%    Storage format: `<<Scale:32/float-little, Components/binary>>'
 %%%    where each component is a signed 8-bit integer.
 %%%
 %%% 3. Norm caching. The L2 norm of each vector is computed once at
@@ -71,8 +71,8 @@
 %%%    compared to re-inserting all vectors.
 %%%
 %%%    Serialization format (version 2):
-%%%    <<Version:8, Size:32, MaxLayer:8, Dim:16, EntryPoint/binary,
-%%%      Config/binary, Nodes/binary>>
+%%%    `<<Version:8, Size:32, MaxLayer:8, Dim:16, EntryPoint/binary,
+%%%      Config/binary, Nodes/binary>>'
 %%%
 %%% 7. True deletion. Nodes are actually removed from the graph, not
 %%%    just marked as deleted. The deleted node is removed from all
@@ -304,8 +304,8 @@ get_node(#hnsw_index{nodes = Nodes}, Id) ->
 %% Quantization Functions
 %%====================================================================
 
-%% @doc Quantize a float vector to 8-bit signed integers
-%% Format: <<Scale:32/float-little, Components/binary>>
+%% @doc Quantize a float vector to 8-bit signed integers.
+%% Format: `<<Scale:32/float-little, Components/binary>>'
 -spec quantize([float()]) -> binary().
 quantize(Vector) ->
     MaxAbs = lists:max([abs(V) || V <- Vector]),

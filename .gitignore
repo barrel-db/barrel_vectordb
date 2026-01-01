@@ -37,3 +37,6 @@ priv/vbarrel_db/
 
 # Crash dumps
 erl_crash.dump
+
+# Generated documentation
+doc/
