@@ -146,23 +146,32 @@ rerank(Query, Documents, State) ->
 -spec rerank(binary(), [binary()], map(), rerank_state()) ->
     {ok, [rerank_result()]} | {error, term()}.
 rerank(Query, Documents, Options, #{port := Port, timeout := Timeout}) ->
-    Request = #{
-        action => rerank,
-        query => Query,
-        documents => Documents
-    },
-    Request1 = case maps:get(top_k, Options, undefined) of
-        undefined -> Request;
-        TopK -> Request#{top_k => TopK}
-    end,
-    case port_command_sync(Port, Request1, Timeout) of
-        {ok, #{<<"ok">> := true, <<"results">> := Results}} ->
-            Parsed = [{maps:get(<<"index">>, R), maps:get(<<"score">>, R)} || R <- Results],
-            {ok, Parsed};
-        {ok, #{<<"ok">> := false, <<"error">> := Err}} ->
-            {error, {python_error, Err}};
-        {error, Reason} ->
-            {error, Reason}
+    case barrel_vectordb_python_queue:acquire(Timeout) of
+        ok ->
+            try
+                Request = #{
+                    action => rerank,
+                    query => Query,
+                    documents => Documents
+                },
+                Request1 = case maps:get(top_k, Options, undefined) of
+                    undefined -> Request;
+                    TopK -> Request#{top_k => TopK}
+                end,
+                case port_command_sync(Port, Request1, Timeout) of
+                    {ok, #{<<"ok">> := true, <<"results">> := Results}} ->
+                        Parsed = [{maps:get(<<"index">>, R), maps:get(<<"score">>, R)} || R <- Results],
+                        {ok, Parsed};
+                    {ok, #{<<"ok">> := false, <<"error">> := Err}} ->
+                        {error, {python_error, Err}};
+                    {error, Reason} ->
+                        {error, Reason}
+                end
+            after
+                barrel_vectordb_python_queue:release()
+            end;
+        {error, timeout} ->
+            {error, queue_timeout}
     end;
 rerank(_Query, _Documents, _Options, _State) ->
     {error, not_initialized}.

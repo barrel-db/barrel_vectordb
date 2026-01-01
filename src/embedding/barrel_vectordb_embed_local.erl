@@ -144,14 +144,23 @@ embed(Text, Config) ->
 %% @doc Generate embeddings for multiple texts.
 -spec embed_batch([binary()], map()) -> {ok, [[float()]]} | {error, term()}.
 embed_batch(Texts, #{port := Port, timeout := Timeout}) ->
-    Request = #{action => embed, texts => Texts},
-    case port_command_sync(Port, Request, Timeout) of
-        {ok, #{<<"ok">> := true, <<"embeddings">> := Embeddings}} ->
-            {ok, Embeddings};
-        {ok, #{<<"ok">> := false, <<"error">> := Err}} ->
-            {error, {python_error, Err}};
-        {error, Reason} ->
-            {error, Reason}
+    case barrel_vectordb_python_queue:acquire(Timeout) of
+        ok ->
+            try
+                Request = #{action => embed, texts => Texts},
+                case port_command_sync(Port, Request, Timeout) of
+                    {ok, #{<<"ok">> := true, <<"embeddings">> := Embeddings}} ->
+                        {ok, Embeddings};
+                    {ok, #{<<"ok">> := false, <<"error">> := Err}} ->
+                        {error, {python_error, Err}};
+                    {error, Reason} ->
+                        {error, Reason}
+                end
+            after
+                barrel_vectordb_python_queue:release()
+            end;
+        {error, timeout} ->
+            {error, queue_timeout}
     end;
 embed_batch(_Texts, _Config) ->
     {error, port_not_initialized}.
