@@ -266,6 +266,32 @@ export OPENAI_API_KEY=sk-...
 | `text-embedding-3-large` | 3072 | Higher quality |
 | `text-embedding-ada-002` | 1536 | Legacy model |
 
+### FastEmbed
+
+Lightweight ONNX-based embeddings. Faster than sentence-transformers for many models.
+
+```erlang
+embedder => {fastembed, #{
+    python => "python3",                    %% Python executable (default)
+    model => "BAAI/bge-small-en-v1.5",      %% Model name (default, 384 dims)
+    timeout => 120000                       %% Timeout in ms (default)
+}}
+```
+
+**Setup:**
+
+```bash
+pip install fastembed
+```
+
+**Supported Models:**
+
+| Model | Dimensions | Notes |
+|-------|------------|-------|
+| `BAAI/bge-small-en-v1.5` | 384 | Default, fast |
+| `BAAI/bge-base-en-v1.5` | 768 | Good balance |
+| `sentence-transformers/all-MiniLM-L6-v2` | 384 | General purpose |
+
 ### Provider Chain
 
 Try providers in order until one succeeds.
@@ -277,6 +303,192 @@ embedder => [
     {local, #{}}  %% Fallback to CPU
 ]
 ```
+
+## Advanced Embedding Types
+
+### SPLADE (Sparse Embeddings)
+
+Neural sparse embeddings with term expansion. Produces sparse vectors for hybrid search.
+
+```erlang
+%% Initialize SPLADE provider
+{ok, State} = barrel_vectordb_embed:init(#{
+    embedder => {splade, #{
+        model => "prithivida/Splade_PP_en_v1"
+    }}
+}).
+
+%% Get sparse vectors directly
+{ok, SparseVec} = barrel_vectordb_embed_splade:embed_sparse(<<"query text">>, Config).
+%% => #{indices => [1, 42, 156], values => [0.5, 0.3, 0.8]}
+```
+
+**Setup:**
+
+```bash
+pip install transformers torch
+```
+
+### ColBERT (Late Interaction)
+
+Multi-vector embeddings for fine-grained token-level matching.
+
+```erlang
+%% Initialize ColBERT provider
+{ok, State} = barrel_vectordb_embed:init(#{
+    embedder => {colbert, #{
+        model => "colbert-ir/colbertv2.0"
+    }}
+}).
+
+%% Get multi-vector embeddings
+{ok, MultiVec} = barrel_vectordb_embed_colbert:embed_multi(<<"query text">>, Config).
+%% => [[0.1, 0.2, ...], [0.3, 0.4, ...], ...]  %% One vector per token
+
+%% MaxSim scoring between query and document
+Score = barrel_vectordb_embed_colbert:maxsim_score(QueryVecs, DocVecs).
+```
+
+**Setup:**
+
+```bash
+pip install transformers torch
+```
+
+### CLIP (Image Embeddings)
+
+Cross-modal embeddings for image-text search. Images and text share the same vector space.
+
+```erlang
+%% Initialize CLIP provider
+{ok, State} = barrel_vectordb_embed:init(#{
+    embedder => {clip, #{
+        model => "openai/clip-vit-base-patch32"
+    }}
+}).
+
+%% Embed text (for cross-modal search)
+{ok, TextVec} = barrel_vectordb_embed_clip:embed(<<"a photo of a cat">>, Config).
+
+%% Embed image (base64 encoded)
+{ok, ImageVec} = barrel_vectordb_embed_clip:embed_image(Base64Image, Config).
+
+%% TextVec and ImageVec are in the same space - compare with cosine similarity!
+```
+
+**Setup:**
+
+```bash
+pip install transformers torch pillow
+```
+
+**Supported Models:**
+
+| Model | Dimensions | Notes |
+|-------|------------|-------|
+| `openai/clip-vit-base-patch32` | 512 | Default, fast |
+| `openai/clip-vit-base-patch16` | 512 | Higher quality |
+| `openai/clip-vit-large-patch14` | 768 | Best quality |
+
+## Reranking
+
+Cross-encoder reranking for improved search relevance. Use after initial vector search.
+
+```erlang
+%% Initialize reranker
+{ok, Reranker} = barrel_vectordb_rerank:init(#{
+    model => "cross-encoder/ms-marco-MiniLM-L-6-v2"
+}).
+
+%% Two-stage retrieval
+%% Stage 1: Fast vector search (top 100)
+{ok, Candidates} = barrel_vectordb:search(Store, Query, #{k => 100}).
+
+%% Stage 2: Rerank candidates
+Docs = [maps:get(text, C) || C <- Candidates],
+{ok, Ranked} = barrel_vectordb_rerank:rerank(Query, Docs, Reranker).
+%% => [{0, 0.95}, {2, 0.82}, {1, 0.45}, ...]  %% {Index, Score}
+
+%% Get top 10 after reranking
+Top10 = [lists:nth(Idx + 1, Candidates) || {Idx, _} <- lists:sublist(Ranked, 10)].
+
+%% Cleanup
+ok = barrel_vectordb_rerank:stop(Reranker).
+```
+
+**Setup:**
+
+```bash
+pip install transformers torch
+```
+
+**Supported Models:**
+
+| Model | Notes |
+|-------|-------|
+| `cross-encoder/ms-marco-MiniLM-L-6-v2` | Default, fast |
+| `cross-encoder/ms-marco-MiniLM-L-12-v2` | Better quality |
+| `BAAI/bge-reranker-base` | Good quality |
+| `BAAI/bge-reranker-large` | Best quality |
+
+## BM25 Sparse Retrieval
+
+Pure Erlang BM25 implementation for lexical search. In-memory index.
+
+```erlang
+%% Create index
+Index = barrel_vectordb_bm25:new().
+
+%% Add documents
+Index1 = barrel_vectordb_bm25:add(Index, <<"doc1">>, <<"The quick brown fox">>).
+Index2 = barrel_vectordb_bm25:add(Index1, <<"doc2">>, <<"The lazy dog">>).
+
+%% Search
+{ok, Results} = barrel_vectordb_bm25:search(Index2, <<"quick fox">>, 10).
+%% => [{<<"doc1">>, 2.45}, ...]
+
+%% Get sparse vector for a document
+{ok, SparseVec} = barrel_vectordb_bm25:get_vector(Index2, <<"doc1">>).
+%% => #{indices => [hash1, hash2, ...], values => [1.2, 0.8, ...]}
+
+%% Index stats
+Stats = barrel_vectordb_bm25:stats(Index2).
+%% => #{doc_count => 2, avg_doc_len => 3.5, ...}
+```
+
+**Note:** BM25 index is in-memory and not persisted. Rebuild from documents on startup.
+
+## Model Registry
+
+Query available models programmatically.
+
+```erlang
+%% List all model types
+barrel_vectordb_models:types().
+%% => [text, sparse, late_interaction, image, rerank]
+
+%% List models by type
+{ok, Models} = barrel_vectordb_models:list(text).
+%% => [#{name => <<"BAAI/bge-base-en-v1.5">>, dimensions => 768, ...}, ...]
+
+%% Get model info
+{ok, Info} = barrel_vectordb_models:info(<<"BAAI/bge-base-en-v1.5">>).
+%% => #{name => ..., dimensions => 768, max_tokens => 512, ...}
+
+%% Get default model for a type
+{ok, Default} = barrel_vectordb_models:default(text).
+%% => #{name => <<"BAAI/bge-base-en-v1.5">>, ...}
+
+%% Check if model is known
+barrel_vectordb_models:is_known(<<"BAAI/bge-base-en-v1.5">>).
+%% => true
+
+%% Get embedder config for a model
+{ok, Config} = barrel_vectordb_models:embedder_config(<<"BAAI/bge-base-en-v1.5">>).
+%% => {local, #{model => <<"BAAI/bge-base-en-v1.5">>, dimension => 768}}
+```
+
+See `priv/models.json` for the complete model catalog.
 
 ## Search Options
 
