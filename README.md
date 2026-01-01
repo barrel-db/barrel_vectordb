@@ -89,6 +89,12 @@ ok = barrel_vectordb:add_vector(Store, Id, Text, Metadata, Vector).
     include_text => false,      %% Skip text lookup
     include_metadata => false   %% Skip metadata lookup
 }).
+
+%% Search with custom ef_search (higher = better recall, slower)
+{ok, Results} = barrel_vectordb:search_vector(Store, Vector, #{
+    k => 10,
+    ef_search => 200   %% Default is max(k, 50)
+}).
 ```
 
 ### Document Operations
@@ -111,6 +117,9 @@ ok = barrel_vectordb:delete(Store, <<"doc1">>).
 
 %% Count
 N = barrel_vectordb:count(Store).
+
+%% Checkpoint HNSW index (speeds up restart)
+ok = barrel_vectordb:checkpoint(Store).
 ```
 
 ## Configuration
@@ -269,13 +278,23 @@ embedder => [
 ]
 ```
 
+## Search Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `k` | 5 | Number of results to return |
+| `filter` | - | Function `fun(Metadata) -> boolean()` to filter results |
+| `include_text` | true | Include text in results |
+| `include_metadata` | true | Include metadata in results |
+| `ef_search` | max(k, 50) | Search width (higher = better recall, slower) |
+
 ## HNSW Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `m` | 16 | Max connections per node |
 | `ef_construction` | 200 | Build-time search width |
-| `ef_search` | 50 | Query-time search width |
+| `ef_search` | 50 | Default query-time search width |
 | `distance_fn` | cosine | `cosine` or `euclidean` |
 
 ## Testing

@@ -139,12 +139,16 @@
 -type search_opts() :: #{
     k => pos_integer(),
     filter => fun((metadata()) -> boolean()),
-    include_vectors => boolean()
+    include_text => boolean(),
+    include_metadata => boolean(),
+    ef_search => pos_integer()
 }.
 %% Options for search operations.
 %% - `k': Number of results to return (default: 5)
 %% - `filter': Function to filter results by metadata
-%% - `include_vectors': Whether to include vectors in results
+%% - `include_text': Include text in results (default: true)
+%% - `include_metadata': Include metadata in results (default: true)
+%% - `ef_search': Search width, higher = better recall (default: max(k, 50))
 
 -type search_result() :: #{
     key := id(),
