@@ -1,5 +1,5 @@
 %%%-------------------------------------------------------------------
-%%% @doc Per-store gen_batch_server managing RocksDB, HNSW index, and embeddings
+%%% @doc Per-store gen_batch_server managing RocksDB, vector index, and embeddings
 %%%
 %%% Each store runs as a separate gen_batch_server registered under its name.
 %%% Handles all document operations, search, and embedding coordination.
@@ -7,6 +7,10 @@
 %%% Uses gen_batch_server to automatically batch concurrent write operations
 %%% into single atomic RocksDB WriteBatch operations, improving throughput
 %%% under concurrent load.
+%%%
+%%% Supports pluggable vector index backends:
+%%% - hnsw: Pure Erlang HNSW implementation (default)
+%%% - faiss: Facebook FAISS via NIF binding (optional, requires barrel_faiss)
 %%%
 %%% @end
 %%%-------------------------------------------------------------------
@@ -48,7 +52,8 @@
     cf_metadata :: rocksdb:cf_handle(),
     cf_text :: rocksdb:cf_handle(),
     cf_hnsw :: rocksdb:cf_handle(),
-    hnsw_index :: hnsw_index(),
+    index :: term(),                      %% Vector index (HNSW or FAISS state)
+    index_module :: module(),             %% Index backend module
     dimension :: pos_integer(),
     embed_state :: map(),
     config :: map()
@@ -183,7 +188,16 @@ init({Name, Config}) ->
 
     DbPath = maps:get(db_path, Config, "priv/barrel_vectordb_data"),
     Dimension = maps:get(dimension, Config, ?DEFAULT_DIMENSION),
-    HnswConfig = maps:get(hnsw, Config, #{}),
+
+    %% Select index backend (default: hnsw)
+    Backend = maps:get(backend, Config, hnsw),
+    IndexModule = barrel_vectordb_index:backend_module(Backend),
+
+    %% Get backend-specific configuration
+    IndexConfig = case Backend of
+        hnsw -> maps:get(hnsw, Config, #{});
+        faiss -> maps:get(faiss, Config, #{})
+    end,
 
     %% Initialize embedder
     EmbedConfig = Config#{dimensions => Dimension},
@@ -191,22 +205,26 @@ init({Name, Config}) ->
         {ok, EmbedState} ->
             case init_rocksdb(DbPath) of
                 {ok, Db, CfHandles} ->
-                    %% Load or create HNSW index
-                    HnswIndex = load_or_create_index(Db, CfHandles, Dimension, HnswConfig),
-
-                    State = #state{
-                        name = Name,
-                        db = Db,
-                        cf_vectors = maps:get(vectors, CfHandles),
-                        cf_metadata = maps:get(metadata, CfHandles),
-                        cf_text = maps:get(text, CfHandles),
-                        cf_hnsw = maps:get(hnsw, CfHandles),
-                        hnsw_index = HnswIndex,
-                        dimension = Dimension,
-                        embed_state = EmbedState,
-                        config = Config
-                    },
-                    {ok, State};
+                    %% Load or create vector index
+                    case load_or_create_index(Db, CfHandles, Dimension, IndexConfig, IndexModule) of
+                        {ok, Index} ->
+                            State = #state{
+                                name = Name,
+                                db = Db,
+                                cf_vectors = maps:get(vectors, CfHandles),
+                                cf_metadata = maps:get(metadata, CfHandles),
+                                cf_text = maps:get(text, CfHandles),
+                                cf_hnsw = maps:get(hnsw, CfHandles),
+                                index = Index,
+                                index_module = IndexModule,
+                                dimension = Dimension,
+                                embed_state = EmbedState,
+                                config = Config
+                            },
+                            {ok, State};
+                        {error, IndexError} ->
+                            {stop, {index_init_failed, IndexError}}
+                    end;
                 {error, Reason} ->
                     {stop, {db_open_failed, Reason}}
             end;
@@ -350,25 +368,26 @@ process_single_op({call, From, {embed_batch, Texts}}, State) ->
     Result = do_embed_batch(Texts, State),
     {{reply, From, Result}, State};
 
-process_single_op({call, From, stats}, #state{hnsw_index = Index, dimension = Dim, config = Config} = State) ->
+process_single_op({call, From, stats}, #state{index = Index, index_module = Mod,
+                                                dimension = Dim, config = Config} = State) ->
     Stats = #{
         dimension => Dim,
-        count => barrel_vectordb_hnsw:size(Index),
-        hnsw => barrel_vectordb_hnsw:info(Index),
+        count => Mod:size(Index),
+        index => Mod:info(Index),
         config => Config
     },
     {{reply, From, {ok, Stats}}, State};
 
-process_single_op({call, From, count}, #state{hnsw_index = Index} = State) ->
-    {{reply, From, barrel_vectordb_hnsw:size(Index)}, State};
+process_single_op({call, From, count}, #state{index = Index, index_module = Mod} = State) ->
+    {{reply, From, Mod:size(Index)}, State};
 
 process_single_op({call, From, embedder_info}, #state{embed_state = EmbedState} = State) ->
     Info = barrel_vectordb_embed:info(EmbedState),
     {{reply, From, {ok, Info}}, State};
 
 process_single_op({call, From, checkpoint}, #state{db = Db, cf_hnsw = CfHnsw,
-                                                    hnsw_index = Index} = State) ->
-    _ = persist_hnsw_meta(Db, CfHnsw, Index),
+                                                    index = Index, index_module = Mod} = State) ->
+    _ = persist_index_meta(Db, CfHnsw, Index, Mod),
     {{reply, From, ok}, State};
 
 process_single_op({call, From, _Unknown}, State) ->
@@ -379,7 +398,7 @@ process_writes_atomic([], State) ->
     {[], State};
 process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
                                       cf_text = CfT, cf_hnsw = CfH,
-                                      hnsw_index = Index, dimension = Dim} = State) ->
+                                      index = Index, index_module = Mod, dimension = Dim} = State) ->
     {ok, Batch} = rocksdb:batch(),
 
     %% First, prepare all embeddings if needed (this is done before batch to avoid
@@ -388,7 +407,7 @@ process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = Cf
         {ok, PreparedWrites} ->
             %% Now apply all writes to the batch
             {NewIndex, Replies} = lists:foldl(fun({From, WriteOp, PreparedData}, {AccIndex, AccReplies}) ->
-                case apply_write_to_batch(WriteOp, PreparedData, Batch, CfV, CfM, CfT, CfH, AccIndex, Dim) of
+                case apply_write_to_batch(WriteOp, PreparedData, Batch, CfV, CfM, CfT, CfH, AccIndex, Mod, Dim) of
                     {ok, UpdatedIndex, Reply} ->
                         {UpdatedIndex, [{reply, From, Reply} | AccReplies]};
                     {error, Reason} ->
@@ -399,7 +418,7 @@ process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = Cf
             %% Commit the batch atomically
             case rocksdb:write_batch(Db, Batch, []) of
                 ok ->
-                    {Replies, State#state{hnsw_index = NewIndex}};
+                    {Replies, State#state{index = NewIndex}};
                 {error, Reason} ->
                     %% All writes fail on batch commit error
                     ErrorReplies = [{reply, From, {error, {db_error, Reason}}}
@@ -461,7 +480,7 @@ prepare_batch_embeddings(Docs, State) ->
 
 %% Apply a single write operation to the batch
 apply_write_to_batch({add_vector, Id, Text, Metadata, Vector}, _PreparedData,
-                      Batch, CfV, CfM, CfT, _CfH, Index, Dim) ->
+                      Batch, CfV, CfM, CfT, _CfH, Index, Mod, Dim) ->
     case length(Vector) of
         Dim ->
             VectorBin = encode_vector(Vector),
@@ -469,15 +488,17 @@ apply_write_to_batch({add_vector, Id, Text, Metadata, Vector}, _PreparedData,
             ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
             ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
             ok = rocksdb:batch_put(Batch, CfT, Id, Text),
-            %% HNSW index updated in-memory only (rebuilt from vectors on startup)
-            NewIndex = barrel_vectordb_hnsw:insert(Index, Id, Vector),
-            {ok, NewIndex, ok};
+            %% Index updated in-memory only (rebuilt from vectors on startup)
+            case Mod:insert(Index, Id, Vector) of
+                {ok, NewIndex} -> {ok, NewIndex, ok};
+                {error, Reason} -> {error, Reason}
+            end;
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end;
 
 apply_write_to_batch({add_vector_batch, Docs}, _PreparedData,
-                      Batch, CfV, CfM, CfT, _CfH, Index, Dim) ->
+                      Batch, CfV, CfM, CfT, _CfH, Index, Mod, Dim) ->
     try
         {NewIndex, Count} = lists:foldl(fun({Id, Text, Meta, Vector}, {AccIndex, AccCount}) ->
             case length(Vector) of
@@ -487,9 +508,11 @@ apply_write_to_batch({add_vector_batch, Docs}, _PreparedData,
                     ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
                     ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
                     ok = rocksdb:batch_put(Batch, CfT, Id, Text),
-                    %% HNSW index updated in-memory only (rebuilt from vectors on startup)
-                    UpdatedIndex = barrel_vectordb_hnsw:insert(AccIndex, Id, Vector),
-                    {UpdatedIndex, AccCount + 1};
+                    %% Index updated in-memory only (rebuilt from vectors on startup)
+                    case Mod:insert(AccIndex, Id, Vector) of
+                        {ok, UpdatedIndex} -> {UpdatedIndex, AccCount + 1};
+                        {error, Reason} -> throw({insert_error, Reason})
+                    end;
                 Other ->
                     throw({dimension_mismatch, Dim, Other})
             end
@@ -497,14 +520,25 @@ apply_write_to_batch({add_vector_batch, Docs}, _PreparedData,
         {ok, NewIndex, {ok, #{inserted => Count}}}
     catch
         throw:{dimension_mismatch, Expected, Got} ->
-            {error, {dimension_mismatch, Expected, Got}}
+            {error, {dimension_mismatch, Expected, Got}};
+        throw:{insert_error, Reason} ->
+            {error, Reason}
     end.
 
-terminate(_Reason, #state{db = Db, hnsw_index = Index, cf_hnsw = CfHnsw}) ->
-    %% Persist HNSW index metadata before closing
-    _ = persist_hnsw_meta(Db, CfHnsw, Index),
+terminate(_Reason, #state{db = Db, index = Index, index_module = Mod, cf_hnsw = CfHnsw}) ->
+    %% Persist index metadata before closing
+    _ = persist_index_meta(Db, CfHnsw, Index, Mod),
+    %% Close index if backend supports it (e.g., FAISS releases NIF resources)
+    _ = maybe_close_index(Mod, Index),
     _ = rocksdb:close(Db),
     ok.
+
+%% Close index if the backend module supports close/1
+maybe_close_index(Mod, Index) ->
+    case erlang:function_exported(Mod, close, 1) of
+        true -> Mod:close(Index);
+        false -> ok
+    end.
 
 %%====================================================================
 %% Internal Functions - Database
@@ -538,19 +572,19 @@ init_rocksdb(DbPath) ->
     end.
 
 %% Load existing index or create new one
-load_or_create_index(Db, CfHandles, Dimension, HnswConfig) ->
+load_or_create_index(Db, CfHandles, Dimension, IndexConfig, IndexModule) ->
     CfHnsw = maps:get(hnsw, CfHandles),
     CfVectors = maps:get(vectors, CfHandles),
 
-    case load_hnsw_meta(Db, CfHnsw) of
+    case load_index_meta(Db, CfHnsw) of
         {ok, _IndexMeta} ->
-            rebuild_from_vectors(Db, CfVectors, CfHnsw, Dimension, HnswConfig);
+            rebuild_from_vectors(Db, CfVectors, Dimension, IndexConfig, IndexModule);
         not_found ->
-            barrel_vectordb_hnsw:new(HnswConfig#{dimension => Dimension})
+            IndexModule:new(IndexConfig#{dimension => Dimension})
     end.
 
-%% Load HNSW metadata from storage
-load_hnsw_meta(Db, CfHnsw) ->
+%% Load index metadata from storage
+load_index_meta(Db, CfHnsw) ->
     case rocksdb:get(Db, CfHnsw, ?HNSW_META_KEY, []) of
         {ok, Binary} ->
             try
@@ -565,38 +599,48 @@ load_hnsw_meta(Db, CfHnsw) ->
             not_found
     end.
 
-%% Persist HNSW metadata
-persist_hnsw_meta(Db, CfHnsw, Index) ->
+%% Persist index metadata
+persist_index_meta(Db, CfHnsw, Index, Mod) ->
+    %% Use the index module's info function to get metadata
+    Info = Mod:info(Index),
     Meta = #{
-        entry_point => Index#hnsw_index.entry_point,
-        max_layer => Index#hnsw_index.max_layer,
-        size => Index#hnsw_index.size,
-        dimension => Index#hnsw_index.dimension
+        size => maps:get(size, Info, Mod:size(Index)),
+        dimension => maps:get(dimension, Info, undefined),
+        backend => maps:get(backend, Info, hnsw)
     },
     Binary = term_to_binary(Meta),
     rocksdb:put(Db, CfHnsw, ?HNSW_META_KEY, Binary, []).
 
-%% Rebuild index from stored vectors (HNSW is in-memory only)
-rebuild_from_vectors(Db, CfVectors, _CfHnsw, Dimension, HnswConfig) ->
-    Index = barrel_vectordb_hnsw:new(HnswConfig#{dimension => Dimension}),
-
-    case rocksdb:iterator(Db, CfVectors, []) of
-        {ok, Iter} ->
-            try
-                rebuild_loop(Iter, rocksdb:iterator_move(Iter, first), Index)
-            after
-                rocksdb:iterator_close(Iter)
+%% Rebuild index from stored vectors (index is in-memory only, rebuilt from RocksDB)
+rebuild_from_vectors(Db, CfVectors, Dimension, IndexConfig, IndexModule) ->
+    case IndexModule:new(IndexConfig#{dimension => Dimension}) of
+        {ok, Index} ->
+            case rocksdb:iterator(Db, CfVectors, []) of
+                {ok, Iter} ->
+                    try
+                        rebuild_loop(Iter, rocksdb:iterator_move(Iter, first), Index, IndexModule)
+                    after
+                        rocksdb:iterator_close(Iter)
+                    end;
+                {error, _} ->
+                    {ok, Index}
             end;
-        {error, _} ->
-            Index
+        {error, _} = Error ->
+            Error
     end.
 
-rebuild_loop(_Iter, {error, _}, Index) ->
-    Index;
-rebuild_loop(Iter, {ok, Key, VectorBin}, Index) ->
+rebuild_loop(_Iter, {error, _}, Index, _Mod) ->
+    {ok, Index};
+rebuild_loop(Iter, {ok, Key, VectorBin}, Index, Mod) ->
     Vector = decode_vector(VectorBin),
-    NewIndex = barrel_vectordb_hnsw:insert(Index, Key, Vector),
-    rebuild_loop(Iter, rocksdb:iterator_move(Iter, next), NewIndex).
+    case Mod:insert(Index, Key, Vector) of
+        {ok, NewIndex} ->
+            rebuild_loop(Iter, rocksdb:iterator_move(Iter, next), NewIndex, Mod);
+        {error, Reason} ->
+            error_logger:warning_msg("Failed to insert vector ~p during rebuild: ~p~n",
+                                     [Key, Reason]),
+            rebuild_loop(Iter, rocksdb:iterator_move(Iter, next), Index, Mod)
+    end.
 
 %%====================================================================
 %% Internal Functions - Operations
@@ -613,7 +657,7 @@ do_embed_batch(Texts, #state{embed_state = EmbedState}) ->
 %% Add a document
 do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
                                           cf_metadata = CfM, cf_text = CfT,
-                                          hnsw_index = Index} = State) ->
+                                          index = Index, index_module = Mod} = State) ->
     VectorBin = encode_vector(Vector),
     MetadataBin = term_to_binary(Metadata),
 
@@ -622,14 +666,17 @@ do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
     ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
     ok = rocksdb:batch_put(Batch, CfT, Id, Text),
 
-    %% HNSW index updated in-memory only (rebuilt from vectors on startup)
-    NewIndex = barrel_vectordb_hnsw:insert(Index, Id, Vector),
-
-    case rocksdb:write_batch(Db, Batch, []) of
-        ok ->
-            {ok, State#state{hnsw_index = NewIndex}};
+    %% Index updated in-memory only (rebuilt from vectors on startup)
+    case Mod:insert(Index, Id, Vector) of
+        {ok, NewIndex} ->
+            case rocksdb:write_batch(Db, Batch, []) of
+                ok ->
+                    {ok, State#state{index = NewIndex}};
+                {error, Reason} ->
+                    {error, {db_error, Reason}}
+            end;
         {error, Reason} ->
-            {error, {db_error, Reason}}
+            {error, Reason}
     end.
 
 %% Get a document
@@ -655,7 +702,7 @@ do_get(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM, cf_text = CfT}) 
 
 %% Delete a document
 do_delete(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
-                     cf_text = CfT, cf_hnsw = CfH, hnsw_index = Index} = State) ->
+                     cf_text = CfT, cf_hnsw = CfH, index = Index, index_module = Mod} = State) ->
     {ok, Batch} = rocksdb:batch(),
     ok = rocksdb:batch_delete(Batch, CfV, Id),
     ok = rocksdb:batch_delete(Batch, CfM, Id),
@@ -664,8 +711,10 @@ do_delete(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
 
     case rocksdb:write_batch(Db, Batch, []) of
         ok ->
-            NewIndex = barrel_vectordb_hnsw:delete(Index, Id),
-            {ok, State#state{hnsw_index = NewIndex}};
+            case Mod:delete(Index, Id) of
+                {ok, NewIndex} -> {ok, State#state{index = NewIndex}};
+                {error, Reason} -> {error, Reason}
+            end;
         {error, Reason} ->
             {error, {db_error, Reason}}
     end.
@@ -729,17 +778,17 @@ combine_peek_results([{Key, VectorBin} | KVs], [MetaResult | Ms], [TextResult | 
 %%   - filter: function to filter by metadata
 %%   - include_text: include text in results (default true)
 %%   - include_metadata: include metadata in results (default true)
-do_search(QueryVector, Opts, #state{db = Db, hnsw_index = Index,
+do_search(QueryVector, Opts, #state{db = Db, index = Index, index_module = Mod,
                                      cf_metadata = CfM, cf_text = CfT}) ->
     K = maps:get(k, Opts, 5),
-    HnswResults = barrel_vectordb_hnsw:search(Index, QueryVector, K, Opts),
+    IndexResults = Mod:search(Index, QueryVector, K, Opts),
 
-    case HnswResults of
+    case IndexResults of
         [] ->
             {ok, []};
         _ ->
             %% Extract IDs and distances
-            {Ids, Distances} = lists:unzip(HnswResults),
+            {Ids, Distances} = lists:unzip(IndexResults),
 
             %% Check what data to include
             IncludeText = maps:get(include_text, Opts, true),
