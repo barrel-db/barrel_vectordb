@@ -15,7 +15,6 @@ default:
 cache:
   key: ${CI_COMMIT_REF_SLUG}
   paths:
-    - _build/
     - ~/.cache/rebar3/
 
 compile:
@@ -52,7 +51,6 @@ dialyzer:
   cache:
     key: dialyzer-${CI_COMMIT_REF_SLUG}
     paths:
-      - _build/
       - ~/.cache/rebar3/
 
 cover:
