@@ -55,7 +55,7 @@
 init() ->
     case ets:whereis(?TABLE) of
         undefined ->
-            ets:new(?TABLE, [named_table, public, {write_concurrency, true}]),
+            _ = ets:new(?TABLE, [named_table, public, {write_concurrency, true}]),
             ets:insert(?TABLE, {?COUNTER_KEY, 0}),
             ok;
         _Tid ->
@@ -74,7 +74,7 @@ acquire(Timeout) ->
 %% @doc Release a slot after Python execution completes.
 -spec release() -> ok.
 release() ->
-    ets:update_counter(?TABLE, ?COUNTER_KEY, {2, -1, 0, 0}),
+    _ = ets:update_counter(?TABLE, ?COUNTER_KEY, {2, -1, 0, 0}),
     ok.
 
 %% @doc Get the maximum concurrent Python executions allowed.
@@ -110,7 +110,7 @@ acquire_loop(Max, Timeout, StartTime) ->
             ok;
         true ->
             %% Over limit - decrement back and wait
-            ets:update_counter(?TABLE, ?COUNTER_KEY, {2, -1}),
+            _ = ets:update_counter(?TABLE, ?COUNTER_KEY, {2, -1}),
             Elapsed = erlang:monotonic_time(millisecond) - StartTime,
             case Timeout =/= infinity andalso Elapsed >= Timeout of
                 true ->

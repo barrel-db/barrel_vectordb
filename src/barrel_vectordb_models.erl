@@ -48,15 +48,9 @@
 
 %% Types
 -type model_type() :: text | sparse | late_interaction | image | rerank.
+%% Model info maps use binary keys as returned by JSON decoder
 -type model_info() :: #{
-    name := binary(),
-    dimensions => pos_integer(),
-    max_tokens => pos_integer(),
-    vocab_size => pos_integer(),
-    description := binary(),
-    source := binary(),
-    type => binary(),
-    default => boolean()
+    binary() => term()
 }.
 
 -export_type([model_type/0, model_info/0]).
@@ -284,8 +278,6 @@ find_model(Name, Models) ->
 
 find_model(_Name, [], undefined) ->
     {error, model_not_found};
-find_model(_Name, [], {ok, _} = Found) ->
-    Found;
 find_model(Name, [{_Type, ModelList} | Rest], Acc) ->
     case find_in_list(Name, ModelList) of
         {ok, _} = Found ->
@@ -329,8 +321,6 @@ find_model_type(Name, Models) ->
 
 find_model_type(_Name, [], undefined) ->
     {error, model_not_found};
-find_model_type(_Name, [], {ok, _} = Found) ->
-    Found;
 find_model_type(Name, [{TypeBin, ModelList} | Rest], _Acc) ->
     case has_model(Name, ModelList) of
         true ->
