@@ -11,7 +11,8 @@
         inets,
         rocksdb,
         hackney,
-        jsx
+        jsx,
+        gen_batch_server
     ]},
     {env, [
         {default_dimensions, 768},
