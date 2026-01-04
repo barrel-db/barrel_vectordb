@@ -299,7 +299,7 @@ test_stats() ->
     {ok, Stats} = barrel_vectordb:stats(test_store),
     ?assertEqual(3, maps:get(dimension, Stats)),
     ?assertEqual(1, maps:get(count, Stats)),
-    ?assert(maps:is_key(hnsw, Stats)),
+    ?assert(maps:is_key(index, Stats)),
     ?assert(maps:is_key(config, Stats)).
 
 test_checkpoint() ->
