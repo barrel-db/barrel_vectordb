@@ -129,6 +129,7 @@ barrel_vectordb:start_link(#{
     name => my_store,              %% Store name (required)
     path => "/var/data/vectors",   %% RocksDB path
     dimensions => 768,             %% Vector dimensions (default: 768)
+    backend => hnsw,               %% Index backend: hnsw (default) or faiss
     embedder => EmbedderConfig,    %% Embedding provider (optional)
     hnsw => #{                     %% HNSW index parameters
         m => 16,
@@ -140,6 +141,78 @@ barrel_vectordb:start_link(#{
     }
 }).
 ```
+
+## Index Backends
+
+barrel_vectordb supports two vector index backends:
+
+### HNSW (Default)
+
+Pure Erlang HNSW implementation. No external dependencies.
+
+```erlang
+{ok, _} = barrel_vectordb:start_link(#{
+    name => my_store,
+    path => "/tmp/vectors",
+    backend => hnsw  %% default, can be omitted
+}).
+```
+
+### FAISS
+
+High-performance FAISS backend via [barrel_faiss](https://gitlab.enki.io/barrel-db/barrel_faiss) NIF.
+Typically 2-6x faster than pure Erlang HNSW for insert and search operations.
+
+**Installation:**
+
+Add to your `rebar.config`:
+
+```erlang
+{profiles, [
+    {faiss, [
+        {deps, [
+            {barrel_faiss, {git, "https://gitlab.enki.io/barrel-db/barrel_faiss.git", {branch, "main"}}}
+        ]}
+    ]}
+]}.
+```
+
+Requires FAISS library installed on your system. See [barrel_faiss README](https://gitlab.enki.io/barrel-db/barrel_faiss) for installation instructions.
+
+**Usage:**
+
+```erlang
+{ok, _} = barrel_vectordb:start_link(#{
+    name => my_store,
+    path => "/tmp/vectors",
+    backend => faiss,
+    faiss => #{
+        index_type => <<"HNSW32">>,  %% default
+        distance_fn => cosine        %% cosine (default) or euclidean
+    }
+}).
+```
+
+**Backend Comparison:**
+
+| Feature | HNSW | FAISS |
+|---------|------|-------|
+| Dependencies | None | barrel_faiss NIF |
+| Insert speed | Baseline | 1.6-3x faster |
+| Search speed | Baseline | 2x faster |
+| Index build | Baseline | 6x faster |
+| Delete speed | Fast (native) | Slower (soft delete) |
+| Memory | Higher | Lower |
+
+**When to use FAISS:**
+- Large indexes (>100K vectors)
+- High insert throughput requirements
+- Search latency is critical
+
+**When to use HNSW:**
+- Simpler deployment (no NIF)
+- Frequent deletions
+- Smaller indexes
 
 ## Embedding Providers
 
@@ -564,6 +637,28 @@ Run the benchmark suite:
 
 ```bash
 rebar3 as bench compile && rebar3 as bench eunit --module=barrel_vectordb_bench
+```
+
+### Backend Comparison Benchmarks
+
+Compare HNSW vs FAISS performance:
+
+```bash
+# Quick comparison
+./scripts/run_backend_bench.sh --quick
+
+# Default comparison
+./scripts/run_backend_bench.sh
+
+# Full benchmark suite
+./scripts/run_backend_bench.sh --full
+```
+
+Or programmatically:
+
+```erlang
+rebar3 as bench_faiss shell
+barrel_vectordb_backend_bench:run_all().
 ```
 
 ## Architecture

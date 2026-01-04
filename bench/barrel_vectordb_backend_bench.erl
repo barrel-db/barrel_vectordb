@@ -398,4 +398,4 @@ print_summary(Results) ->
 format_ops(Ops) when Ops >= 1000 ->
     io_lib:format("~.1fK", [Ops / 1000]);
 format_ops(Ops) ->
-    io_lib:format("~.0f", [Ops]).
+    io_lib:format("~B", [round(Ops)]).

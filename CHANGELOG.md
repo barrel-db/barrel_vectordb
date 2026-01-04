@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-01-04
+
+### Added
+
+- **FAISS backend**: Optional high-performance vector indexing via [barrel_faiss](https://gitlab.enki.io/barrel-db/barrel_faiss)
+- **Pluggable backend architecture**: New `barrel_vectordb_index` behaviour for index backends
+- **Backend selection**: Choose backend at store initialization with `#{backend => hnsw | faiss}`
+- **FAISS features**:
+  - HNSW32 index type (fast approximate search)
+  - Soft delete with compact/rebuild support
+  - Cosine and Euclidean distance functions
+  - Full serialization/deserialization support
+- **Backend benchmarks**: New `barrel_vectordb_backend_bench` module for comparing backends
+- **Benchmark script**: `scripts/run_backend_bench.sh` for easy performance testing
+
+### Performance
+
+FAISS vs HNSW benchmark results (64 dimensions, 500 vectors):
+
+| Operation | HNSW | FAISS | Winner |
+|-----------|------|-------|--------|
+| insert_single | 14.5K ops/s | 23.8K ops/s | FAISS 1.6x |
+| insert_batch_100 | 3.6K ops/s | 11.0K ops/s | FAISS 3.1x |
+| search_k10 | 2.2K ops/s | 5.0K ops/s | FAISS 2.2x |
+| index_build_1k | 729 ops/s | 4.7K ops/s | FAISS 6.5x |
+| delete_single | 34.7K ops/s | 19.4K ops/s | HNSW 1.8x |
+
+### Changed
+
+- **State record**: `hnsw_index` renamed to `index` in server state
+- **Stats output**: Index info now under `index` key instead of `hnsw`
+
 ## [1.1.0] - 2026-01-01
 
 ### Added

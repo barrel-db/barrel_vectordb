@@ -1,6 +1,6 @@
 {application, barrel_vectordb, [
-    {description, "Erlang vector database with HNSW and RocksDB for semantic search"},
-    {vsn, "1.1.0"},
+    {description, "Erlang vector database with pluggable backends (HNSW, FAISS) and RocksDB for semantic search"},
+    {vsn, "1.2.0"},
     {registered, [barrel_vectordb_sup]},
     {mod, {barrel_vectordb_app, []}},
     {applications, [
