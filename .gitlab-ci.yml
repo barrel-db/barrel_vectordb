@@ -13,9 +13,9 @@ default:
     - rebar3 --version
 
 cache:
-  key: ${CI_COMMIT_REF_SLUG}
+  key: ${CI_COMMIT_REF_SLUG}-v2
   paths:
-    - ~/.cache/rebar3/
+    - ${HOME}/.cache/rebar3/
 
 compile:
   stage: build
@@ -49,9 +49,9 @@ dialyzer:
     - rebar3 dialyzer
   allow_failure: true
   cache:
-    key: dialyzer-${CI_COMMIT_REF_SLUG}
+    key: dialyzer-${CI_COMMIT_REF_SLUG}-v2
     paths:
-      - ~/.cache/rebar3/
+      - ${HOME}/.cache/rebar3/
 
 cover:
   stage: test
