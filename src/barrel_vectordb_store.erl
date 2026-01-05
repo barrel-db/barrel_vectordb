@@ -115,7 +115,9 @@ init(Config) ->
     Dimension = maps:get(dimension, Config, ?DEFAULT_DIMENSION),
     HnswConfig = maps:get(hnsw, Config, #{}),
 
-    case barrel_vectordb_embed:init(Config) of
+    %% Ensure dimensions is in config for embed init
+    EmbedConfig = Config#{dimensions => Dimension},
+    case barrel_vectordb_embed:init(EmbedConfig) of
         {ok, EmbedState} ->
             case init_rocksdb(DbPath) of
                 {ok, Db, CfHandles} ->

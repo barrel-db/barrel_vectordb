@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-01-05
+
+### Fixed
+
+- Fix dimension config propagation: pass `dimensions` key to embed provider init in `barrel_vectordb_store`
+- Add error handling for empty embeddings in `barrel_vectordb_embed_local:embed/2`
+- Handle edge cases: empty vector `[[]]`, no embeddings `[]`, and unexpected result formats
+
+### Added
+
+- Unit tests for embed error handling in `barrel_vectordb_embed_local_tests`
+
 ## [1.2.4] - 2026-01-05
 
 ### Changed

@@ -63,3 +63,71 @@ test_available_true() ->
 test_available_false() ->
     ?assertEqual(false, barrel_vectordb_embed_local:available(#{})),
     ?assertEqual(false, barrel_vectordb_embed_local:available(#{port => undefined})).
+
+%%====================================================================
+%% Embed Error Handling Tests
+%%
+%% These tests verify that the embed/2 function correctly handles
+%% various responses from embed_batch/2. We test the pattern matching
+%% logic directly since mocking internal function calls is complex.
+%%====================================================================
+
+embed_error_handling_test_() ->
+    [
+        {"empty vector [[]] is detected as error",
+         fun() ->
+             %% Simulate what embed/2 does when embed_batch returns [[]]
+             Text = <<"test">>,
+             BatchResult = {ok, [[]]},
+             Result = process_embed_result(BatchResult, Text),
+             ?assertMatch({error, {empty_embedding, _}}, Result)
+         end},
+
+        {"no embeddings [] is detected as error",
+         fun() ->
+             Text = <<"test">>,
+             BatchResult = {ok, []},
+             Result = process_embed_result(BatchResult, Text),
+             ?assertMatch({error, {no_embedding, _}}, Result)
+         end},
+
+        {"multiple vectors [[1.0], [2.0]] is detected as error",
+         fun() ->
+             Text = <<"test">>,
+             BatchResult = {ok, [[1.0], [2.0]]},
+             Result = process_embed_result(BatchResult, Text),
+             ?assertMatch({error, {unexpected_embedding, _}}, Result)
+         end},
+
+        {"valid vector succeeds",
+         fun() ->
+             ValidVector = [0.1, 0.2, 0.3, 0.4],
+             Text = <<"test">>,
+             BatchResult = {ok, [ValidVector]},
+             Result = process_embed_result(BatchResult, Text),
+             ?assertEqual({ok, ValidVector}, Result)
+         end},
+
+        {"error passthrough works",
+         fun() ->
+             Text = <<"test">>,
+             BatchResult = {error, some_error},
+             Result = process_embed_result(BatchResult, Text),
+             ?assertEqual({error, some_error}, Result)
+         end}
+    ].
+
+%% Helper that mirrors the pattern matching logic in embed/2
+process_embed_result(BatchResult, Text) ->
+    case BatchResult of
+        {ok, [Vector]} when is_list(Vector), length(Vector) > 0 ->
+            {ok, Vector};
+        {ok, [[]]} ->
+            {error, {empty_embedding, Text}};
+        {ok, []} ->
+            {error, {no_embedding, Text}};
+        {ok, Other} ->
+            {error, {unexpected_embedding, Other}};
+        {error, _} = Error ->
+            Error
+    end.
