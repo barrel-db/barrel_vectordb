@@ -11,16 +11,20 @@
         inets,
         rocksdb,
         hackney,
-        jsx,
-        gen_batch_server
+        jsx
     ]},
+    %% Cluster deps - loaded on demand, not auto-started
+    {included_applications, [ra, cowboy]},
     {env, [
         {default_dimensions, 768},
         {default_embedder, {local, #{}}},
         {hnsw_m, 16},
         {hnsw_ef_construction, 200},
         {hnsw_ef_search, 50},
-        {embed_cache_size, 10000}
+        {embed_cache_size, 10000},
+        %% Clustering (disabled by default)
+        {enable_cluster, false},
+        {cluster_options, #{}}
     ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
