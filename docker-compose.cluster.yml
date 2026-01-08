@@ -1,0 +1,116 @@
+x-vectordb-common: &vectordb-common
+  build: .
+  image: barrel-vectordb:latest
+  networks:
+    - vectordb-net
+  restart: unless-stopped
+
+services:
+  # Seed node (first to start, creates cluster)
+  node1:
+    <<: *vectordb-common
+    container_name: vectordb-node1
+    hostname: node1
+    environment:
+      RELEASE_COOKIE: barrel_vectordb_test_cluster
+      BARREL_NODE_NAME: barrel_vectordb@node1
+      BARREL_ENABLE_CLUSTER: "true"
+      BARREL_SEED_NODES: ""
+      BARREL_HTTP_PORT: "8080"
+    ports:
+      - "8081:8080"
+    volumes:
+      - node1-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/vectordb/cluster/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # Node 2 - joins via seed node1
+  node2:
+    <<: *vectordb-common
+    container_name: vectordb-node2
+    hostname: node2
+    environment:
+      RELEASE_COOKIE: barrel_vectordb_test_cluster
+      BARREL_NODE_NAME: barrel_vectordb@node2
+      BARREL_ENABLE_CLUSTER: "true"
+      BARREL_SEED_NODES: "'barrel_vectordb@node1'"
+      BARREL_HTTP_PORT: "8080"
+    ports:
+      - "8082:8080"
+    volumes:
+      - node2-data:/app/data
+    depends_on:
+      node1:
+        condition: service_healthy
+
+  # Node 3 - joins to form initial quorum (3 nodes)
+  node3:
+    <<: *vectordb-common
+    container_name: vectordb-node3
+    hostname: node3
+    environment:
+      RELEASE_COOKIE: barrel_vectordb_test_cluster
+      BARREL_NODE_NAME: barrel_vectordb@node3
+      BARREL_ENABLE_CLUSTER: "true"
+      BARREL_SEED_NODES: "'barrel_vectordb@node1'"
+      BARREL_HTTP_PORT: "8080"
+    ports:
+      - "8083:8080"
+    volumes:
+      - node3-data:/app/data
+    depends_on:
+      node1:
+        condition: service_healthy
+
+  # Node 4 - joins after quorum formed
+  node4:
+    <<: *vectordb-common
+    container_name: vectordb-node4
+    hostname: node4
+    environment:
+      RELEASE_COOKIE: barrel_vectordb_test_cluster
+      BARREL_NODE_NAME: barrel_vectordb@node4
+      BARREL_ENABLE_CLUSTER: "true"
+      BARREL_SEED_NODES: "'barrel_vectordb@node1'"
+      BARREL_HTTP_PORT: "8080"
+    ports:
+      - "8084:8080"
+    volumes:
+      - node4-data:/app/data
+    depends_on:
+      node2:
+        condition: service_started
+
+  # Node 5 - joins after quorum formed
+  node5:
+    <<: *vectordb-common
+    container_name: vectordb-node5
+    hostname: node5
+    environment:
+      RELEASE_COOKIE: barrel_vectordb_test_cluster
+      BARREL_NODE_NAME: barrel_vectordb@node5
+      BARREL_ENABLE_CLUSTER: "true"
+      BARREL_SEED_NODES: "'barrel_vectordb@node1'"
+      BARREL_HTTP_PORT: "8080"
+    ports:
+      - "8085:8080"
+    volumes:
+      - node5-data:/app/data
+    depends_on:
+      node3:
+        condition: service_started
+
+networks:
+  vectordb-net:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
