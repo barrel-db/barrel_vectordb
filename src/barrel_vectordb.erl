@@ -82,6 +82,36 @@
     stop/1
 ]).
 
+%% API - Cluster
+-export([
+    start_cluster/0,
+    start_cluster/1,
+    cluster_join/1,
+    cluster_leave/0,
+    cluster_status/0,
+    cluster_nodes/0,
+    is_clustered/0
+]).
+
+%% API - Cluster Collections
+-export([
+    create_collection/2,
+    delete_collection/1,
+    get_collection/1,
+    list_collections/0
+]).
+
+%% API - Cluster Document Operations (routed to shards)
+-export([
+    cluster_add/4,
+    cluster_add/5,
+    cluster_add_vector/5,
+    cluster_get/2,
+    cluster_delete/2,
+    cluster_search/3,
+    cluster_search_vector/3
+]).
+
 %% API - Document Operations
 -export([
     add/4,
@@ -588,8 +618,272 @@ checkpoint(Store) ->
     barrel_vectordb_server:checkpoint(Store).
 
 %%====================================================================
+%% Cluster API
+%%====================================================================
+
+%% @doc Start a new cluster (this node becomes leader).
+%%
+%% Initializes clustering on this node. Other nodes can then join
+%% using `cluster_join/1'.
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_vectordb:start_cluster().
+%% '''
+%%
+%% @returns `{ok, ServerId}' on success, `{error, Reason}' on failure
+-spec start_cluster() -> {ok, term()} | {error, term()}.
+start_cluster() ->
+    barrel_vectordb_mesh:start_cluster().
+
+%% @doc Start a new cluster with configuration.
+%%
+%% @param Config Cluster configuration options
+%% @returns `{ok, ServerId}' on success, `{error, Reason}' on failure
+-spec start_cluster(map()) -> {ok, term()} | {error, term()}.
+start_cluster(Config) ->
+    barrel_vectordb_mesh:start_cluster(Config).
+
+%% @doc Join an existing cluster via seed node(s).
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_vectordb:cluster_join('barrel@paris.enki.io').
+%% ok = barrel_vectordb:cluster_join(['barrel@paris.enki.io', 'barrel@lille.enki.io']).
+%% '''
+%%
+%% @param SeedNodes Seed node atom or list of seed node atoms
+%% @returns `ok' on success, `{error, Reason}' on failure
+-spec cluster_join(atom() | [atom()]) -> ok | {error, term()}.
+cluster_join(SeedNodes) ->
+    barrel_vectordb_mesh:cluster_join(SeedNodes).
+
+%% @doc Leave the cluster gracefully.
+%%
+%% Removes this node from the cluster. Shards will be rebalanced
+%% to remaining nodes.
+%%
+%% @returns `ok' on success, `{error, Reason}' on failure
+-spec cluster_leave() -> ok | {error, term()}.
+cluster_leave() ->
+    barrel_vectordb_mesh:cluster_leave().
+
+%% @doc Get cluster status.
+%%
+%% Returns information about the cluster including node list,
+%% leader, and this node's status.
+%%
+%% == Example ==
+%% ```
+%% Status = barrel_vectordb:cluster_status(),
+%% #{state := State, nodes := Nodes, leader := Leader} = Status.
+%% '''
+%%
+%% @returns Cluster status map
+-spec cluster_status() -> map().
+cluster_status() ->
+    barrel_vectordb_mesh:cluster_status().
+
+%% @doc Get list of healthy cluster nodes.
+%%
+%% Returns nodes that are currently reachable (via aten).
+%%
+%% @returns List of healthy nodes
+-spec cluster_nodes() -> [node()].
+cluster_nodes() ->
+    barrel_vectordb_mesh:healthy_nodes().
+
+%% @doc Check if this node is part of a cluster.
+%%
+%% @returns `true' if clustered, `false' if standalone
+-spec is_clustered() -> boolean().
+is_clustered() ->
+    barrel_vectordb_mesh:is_clustered().
+
+%%====================================================================
+%% Cluster Collection API
+%%====================================================================
+
+%% @doc Create a collection in the cluster.
+%%
+%% Creates a sharded collection distributed across cluster nodes.
+%% Only available when clustered.
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_vectordb:create_collection(<<"memories">>, #{
+%%     dimensions => 768,
+%%     num_shards => 4,
+%%     replication_factor => 2
+%% }).
+%% '''
+%%
+%% @param Name Collection name (binary)
+%% @param Opts Collection options (dimensions, num_shards, replication_factor)
+%% @returns `ok' on success, `{error, Reason}' on failure
+-spec create_collection(binary(), map()) -> ok | {error, term()}.
+create_collection(Name, Opts) when is_binary(Name) ->
+    case is_clustered() of
+        true ->
+            barrel_vectordb_cluster_client:create_collection(Name, Opts);
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc Delete a collection from the cluster.
+%%
+%% @param Name Collection name
+%% @returns `ok' on success, `{error, Reason}' on failure
+-spec delete_collection(binary()) -> ok | {error, term()}.
+delete_collection(Name) when is_binary(Name) ->
+    case is_clustered() of
+        true ->
+            barrel_vectordb_cluster_client:delete_collection(Name);
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc Get collection metadata.
+%%
+%% @param Name Collection name
+%% @returns `{ok, Metadata}' or `{error, Reason}'
+-spec get_collection(binary()) -> {ok, map()} | {error, term()}.
+get_collection(Name) when is_binary(Name) ->
+    case is_clustered() of
+        true ->
+            case barrel_vectordb_cluster_client:get_collections() of
+                {ok, Collections} ->
+                    case maps:get(Name, Collections, undefined) of
+                        undefined -> {error, not_found};
+                        Meta -> {ok, Meta}
+                    end;
+                {error, _} = Error ->
+                    Error
+            end;
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc List all collections in the cluster.
+%%
+%% @returns `{ok, CollectionMap}' or `{error, Reason}'
+-spec list_collections() -> {ok, map()} | {error, term()}.
+list_collections() ->
+    case is_clustered() of
+        true ->
+            barrel_vectordb_cluster_client:get_collections();
+        false ->
+            {error, not_clustered}
+    end.
+
+%%====================================================================
+%% Cluster Document Operations (explicit cluster mode)
+%%====================================================================
+
+%% @doc Add a document to a cluster collection.
+%%
+%% Routes to appropriate shard based on document ID.
+%% Only available when clustered.
+%%
+%% @param Collection Collection name
+%% @param Id Document identifier
+%% @param Text Text to embed and store
+%% @param Metadata Document metadata
+%% @returns `ok' on success, `{error, Reason}' on failure
+-spec cluster_add(binary(), id(), text(), metadata()) -> ok | {error, term()}.
+cluster_add(Collection, Id, Text, Metadata) when is_binary(Collection), is_binary(Id) ->
+    case is_clustered() of
+        true ->
+            EmbedderInfo = get_collection_embedder(Collection),
+            barrel_vectordb_shard_router:route_add(Collection, Id, Text, Metadata, EmbedderInfo);
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc Add a document with explicit vector to a cluster collection.
+-spec cluster_add(binary(), id(), text(), metadata(), vector()) -> ok | {error, term()}.
+cluster_add(Collection, Id, Text, Metadata, Vector) when is_binary(Collection), is_binary(Id) ->
+    cluster_add_vector(Collection, Id, Text, Metadata, Vector).
+
+%% @doc Add a document with vector to a cluster collection.
+-spec cluster_add_vector(binary(), id(), text(), metadata(), vector()) -> ok | {error, term()}.
+cluster_add_vector(Collection, Id, Text, Metadata, Vector) when is_binary(Collection), is_binary(Id) ->
+    case is_clustered() of
+        true ->
+            EmbedderInfo = get_collection_embedder(Collection),
+            barrel_vectordb_shard_router:route_add_vector(Collection, Id, Text, Metadata, Vector, EmbedderInfo);
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc Get a document from a cluster collection.
+-spec cluster_get(binary(), id()) -> {ok, map()} | not_found | {error, term()}.
+cluster_get(Collection, Id) when is_binary(Collection), is_binary(Id) ->
+    case is_clustered() of
+        true ->
+            barrel_vectordb_shard_router:route_get(Collection, Id, #{});
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc Delete a document from a cluster collection.
+-spec cluster_delete(binary(), id()) -> ok | {error, term()}.
+cluster_delete(Collection, Id) when is_binary(Collection), is_binary(Id) ->
+    case is_clustered() of
+        true ->
+            barrel_vectordb_shard_router:route_delete(Collection, Id, #{});
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc Search a cluster collection with text query.
+%%
+%% Scatter-gather across all shards.
+-spec cluster_search(binary(), text(), search_opts()) -> {ok, [search_result()]} | {error, term()}.
+cluster_search(Collection, Query, Opts) when is_binary(Collection), is_binary(Query) ->
+    case is_clustered() of
+        true ->
+            EmbedderInfo = get_collection_embedder(Collection),
+            OptsWithCollection = Opts#{collection => Collection},
+            barrel_vectordb_shard_router:route_search(Collection, Query, OptsWithCollection, EmbedderInfo);
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc Search a cluster collection with vector query.
+%%
+%% Scatter-gather across all shards.
+-spec cluster_search_vector(binary(), vector(), search_opts()) -> {ok, [search_result()]} | {error, term()}.
+cluster_search_vector(Collection, Vector, Opts) when is_binary(Collection), is_list(Vector) ->
+    case is_clustered() of
+        true ->
+            OptsWithCollection = Opts#{collection => Collection},
+            barrel_vectordb_shard_router:route_search_vector(Collection, Vector, OptsWithCollection, #{});
+        false ->
+            {error, not_clustered}
+    end.
+
+%%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% @private
+%% Get embedder info for a collection (from cluster metadata)
+get_collection_embedder(Collection) ->
+    case barrel_vectordb_cluster_client:get_collections() of
+        {ok, Collections} ->
+            case maps:get(Collection, Collections, undefined) of
+                undefined ->
+                    #{};
+                Meta ->
+                    case element(4, Meta) of  %% embedder field in collection metadata
+                        undefined -> #{};
+                        EmbedderConfig -> #{embedder => EmbedderConfig}
+                    end
+            end;
+        _ ->
+            #{}
+    end.
 
 %% @private
 %% Generate default database path for a store name
