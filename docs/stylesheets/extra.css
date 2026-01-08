@@ -1,0 +1,203 @@
+/* Barrel VectorDB - Dark Modern Teal Theme
+   From Charte Graphique Barrel 2017
+   Primary/Tonique: #C65E59 (coral - 10% usage)
+   Secondary: #75B6B2 (light teal), #006B77 (dark teal)
+   Text: #222929 (dark), #F3F3F2 (light)
+   Font: Roboto
+*/
+
+:root {
+  /* Primary - Light Teal */
+  --md-primary-fg-color: #75B6B2;
+  --md-primary-fg-color--light: #8EC5C2;
+  --md-primary-fg-color--dark: #006B77;
+
+  /* Accent - Coral (tonique) */
+  --md-accent-fg-color: #C65E59;
+  --md-accent-fg-color--transparent: rgba(198, 94, 89, 0.1);
+
+  /* Text */
+  --md-default-fg-color: #222929;
+}
+
+/* Dark mode - Deep Teal background */
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #75B6B2;
+  --md-primary-fg-color--light: #8EC5C2;
+  --md-primary-fg-color--dark: #006B77;
+  --md-accent-fg-color: #C65E59;
+
+  /* Deep teal dark background */
+  --md-default-bg-color: #004D55;
+  --md-default-bg-color--light: #005560;
+  --md-default-bg-color--lighter: #006B77;
+  --md-default-bg-color--lightest: #007A88;
+
+  --md-default-fg-color: #F3F3F2;
+  --md-default-fg-color--light: rgba(243, 243, 242, 0.7);
+}
+
+/* Header - Dark teal */
+.md-header {
+  background-color: #006B77;
+}
+
+[data-md-color-scheme="slate"] .md-header {
+  background-color: #004D55;
+  border-bottom: 2px solid var(--md-accent-fg-color);
+}
+
+/* Navigation tabs */
+.md-tabs {
+  background-color: #007A88;
+}
+
+[data-md-color-scheme="slate"] .md-tabs {
+  background-color: #005560;
+}
+
+/* Cards grid styling */
+.md-typeset .grid.cards > ul > li {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  padding: 1rem;
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+}
+
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--md-accent-fg-color);
+  box-shadow: 0 4px 16px rgba(198, 94, 89, 0.2);
+  transform: translateY(-2px);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .grid.cards > ul > li {
+  background-color: var(--md-default-bg-color--light);
+  border-color: var(--md-default-bg-color--lightest);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--md-accent-fg-color);
+  box-shadow: 0 4px 16px rgba(198, 94, 89, 0.3);
+}
+
+/* Links - Dark teal with coral hover */
+.md-typeset a {
+  color: #006B77;
+}
+
+.md-typeset a:hover {
+  color: var(--md-accent-fg-color);
+}
+
+[data-md-color-scheme="slate"] .md-typeset a {
+  color: var(--md-primary-fg-color);
+}
+
+[data-md-color-scheme="slate"] .md-typeset a:hover {
+  color: var(--md-accent-fg-color);
+}
+
+/* Code blocks */
+.md-typeset code {
+  background-color: rgba(117, 182, 178, 0.1);
+  border-radius: 4px;
+}
+
+[data-md-color-scheme="slate"] .md-typeset code {
+  background-color: rgba(117, 182, 178, 0.15);
+}
+
+/* Tables */
+.md-typeset table:not([class]) th {
+  background-color: #006B77;
+  color: #F3F3F2;
+}
+
+[data-md-color-scheme="slate"] .md-typeset table:not([class]) th {
+  background-color: var(--md-default-bg-color--lighter);
+}
+
+/* Admonitions */
+.md-typeset .admonition,
+.md-typeset details {
+  border-left-color: var(--md-primary-fg-color);
+}
+
+/* Hero section styling */
+.md-typeset h1 {
+  color: var(--md-primary-fg-color);
+  font-weight: 700;
+}
+
+.md-typeset h2 {
+  color: #006B77;
+  border-bottom: 2px solid var(--md-accent-fg-color);
+  padding-bottom: 0.3em;
+}
+
+[data-md-color-scheme="slate"] .md-typeset h2 {
+  color: #F3F3F2;
+}
+
+/* Footer - Dark teal */
+.md-footer {
+  background-color: #006B77;
+}
+
+[data-md-color-scheme="slate"] .md-footer {
+  background-color: #003840;
+}
+
+/* Sidebar */
+[data-md-color-scheme="slate"] .md-sidebar {
+  background-color: var(--md-default-bg-color);
+}
+
+/* Navigation items */
+.md-nav__link--active {
+  color: var(--md-accent-fg-color) !important;
+  font-weight: 600;
+}
+
+/* Button-like links in cards */
+.md-typeset .grid.cards a[href] {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-weight: 500;
+  color: var(--md-primary-fg-color);
+}
+
+.md-typeset .grid.cards a[href]:hover {
+  color: var(--md-accent-fg-color);
+}
+
+/* Search */
+.md-search__form {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+[data-md-color-scheme="slate"] .md-search__form {
+  background-color: rgba(0, 0, 0, 0.2);
+}
+
+/* Feature highlights with definition lists */
+.md-typeset dl dt {
+  font-weight: 600;
+  color: var(--md-primary-fg-color);
+}
+
+/* Strong text */
+.md-typeset strong {
+  color: inherit;
+}
+
+/* Blockquotes */
+.md-typeset blockquote {
+  border-left-color: var(--md-primary-fg-color);
+  background-color: rgba(117, 182, 178, 0.05);
+}
+
+[data-md-color-scheme="slate"] .md-typeset blockquote {
+  background-color: rgba(117, 182, 178, 0.1);
+}
