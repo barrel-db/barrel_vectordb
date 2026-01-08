@@ -27,7 +27,7 @@ init(_Config) ->
         period => 60
     },
 
-    Children = [
+    BaseChildren = [
         %% Health monitoring (aten-based failure detection)
         #{
             id => barrel_vectordb_health,
@@ -75,4 +75,25 @@ init(_Config) ->
         }
     ],
 
+    %% Add HTTP server if configured
+    Children = maybe_add_http_child(BaseChildren),
+
     {ok, {SupFlags, Children}}.
+
+%% @private Add HTTP server child spec if http config is present
+maybe_add_http_child(Children) ->
+    ClusterOpts = application:get_env(barrel_vectordb, cluster_options, #{}),
+    case maps:is_key(http, ClusterOpts) of
+        true ->
+            HttpChild = #{
+                id => barrel_vectordb_http,
+                start => {barrel_vectordb_http, start_link, []},
+                restart => permanent,
+                shutdown => 5000,
+                type => worker,
+                modules => [barrel_vectordb_http]
+            },
+            Children ++ [HttpChild];
+        false ->
+            Children
+    end.

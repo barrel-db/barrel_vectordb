@@ -129,30 +129,71 @@ do_discover(#state{mode = dns, dns_config = DnsConfig}) ->
     discover_from_dns(DnsConfig).
 
 discover_from_seeds([]) ->
-    {ok, []};
-discover_from_seeds(Seeds) ->
+    %% No seeds configured - bootstrap as first node
     case barrel_vectordb_mesh:is_clustered() of
         true ->
+            {ok, []};
+        false ->
+            logger:info("No seed nodes configured, bootstrapping new cluster"),
+            logger:info("Node: ~p", [node()]),
+            Result = barrel_vectordb_ra:start(),
+            logger:info("Ra start result: ~p", [Result]),
+            case Result of
+                {ok, ServerId} ->
+                    logger:info("Cluster bootstrapped successfully with ServerId: ~p", [ServerId]),
+                    %% Register ourselves in the cluster state machine
+                    register_self_in_cluster(),
+                    {ok, bootstrap};
+                {error, Reason} ->
+                    logger:error("Failed to bootstrap cluster: ~p", [Reason]),
+                    {error, Reason}
+            end
+    end;
+discover_from_seeds(Seeds) ->
+    logger:info("discover_from_seeds called with Seeds: ~p", [Seeds]),
+    case barrel_vectordb_mesh:is_clustered() of
+        true ->
+            logger:info("Already in cluster, registering seed nodes"),
             %% Already in cluster, just register nodes for health monitoring
             lists:foreach(fun(Node) ->
                 barrel_vectordb_health:register_node(Node)
             end, Seeds),
             {ok, Seeds};
         false ->
+            logger:info("Not in cluster, trying seeds"),
             %% Try each seed until one works
             try_seeds(Seeds)
     end.
 
 try_seeds([]) ->
+    logger:warning("No seeds available to join"),
     {error, no_seeds_available};
 try_seeds([SeedNode | Rest]) ->
+    logger:info("Trying to join seed node: ~p", [SeedNode]),
     case barrel_vectordb_ra:join(SeedNode) of
-        {ok, _} ->
-            %% Successfully joined, register seed for health monitoring
+        {ok, ServerId} ->
+            logger:info("Successfully joined cluster via ~p, ServerId: ~p", [SeedNode, ServerId]),
+            %% Register ourselves in the cluster state machine
+            register_self_in_cluster(),
+            %% Register seed for health monitoring
             barrel_vectordb_health:register_node(SeedNode),
             {ok, SeedNode};
-        {error, _Reason} ->
+        {error, Reason} ->
+            logger:warning("Failed to join ~p: ~p, trying next", [SeedNode, Reason]),
             try_seeds(Rest)
+    end.
+
+%% @private Register this node in the cluster state machine
+register_self_in_cluster() ->
+    NodeId = barrel_vectordb_mesh:node_id(),
+    NodeInfo = barrel_vectordb_mesh:local_node(),
+    case barrel_vectordb_cluster_client:join_node(NodeId, NodeInfo) of
+        ok ->
+            logger:info("Registered node ~p in cluster", [NodeId]);
+        {ok, _, _} ->
+            logger:info("Registered node ~p in cluster", [NodeId]);
+        {error, Reason} ->
+            logger:warning("Failed to register node in cluster: ~p", [Reason])
     end.
 
 discover_from_dns(#{domain := Domain} = Config) ->

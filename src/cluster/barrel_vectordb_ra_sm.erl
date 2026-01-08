@@ -57,7 +57,9 @@ apply(_Meta, {join_cluster, NodeId, NodeInfo}, State) ->
         true ->
             {State, {error, already_member}, []};
         false ->
-            Nodes = maps:put(NodeId, NodeInfo#node_info{status = active}, State#cluster_state.nodes),
+            %% Convert map to record if needed
+            NodeInfoRec = to_node_info(NodeInfo),
+            Nodes = maps:put(NodeId, NodeInfoRec#node_info{status = active}, State#cluster_state.nodes),
             NewState = State#cluster_state{nodes = Nodes},
             Effects = [{mod_call, barrel_vectordb_cluster_events, node_joined, [NodeId, NodeInfo]}],
             {NewState, ok, Effects}
@@ -213,3 +215,16 @@ state_enter(_, _State) ->
 %% Tick callback for periodic operations
 tick(_TimeMs, _State) ->
     [].
+
+%% Internal helpers
+
+%% @private Convert map to node_info record (or pass through records)
+to_node_info(#node_info{} = Record) ->
+    Record;
+to_node_info(Map) when is_map(Map) ->
+    #node_info{
+        node = maps:get(node, Map),
+        address = maps:get(address, Map),
+        status = maps:get(status, Map, active),
+        last_seen = maps:get(last_seen, Map, erlang:system_time(second))
+    }.

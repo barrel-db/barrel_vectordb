@@ -31,6 +31,9 @@ cat > "${RELEASE_DIR}sys.config" << EOF
             }
         }}
     ]},
+    {ra, [
+        {data_dir, "${BARREL_DATA_PATH:-/app/data}/ra"}
+    ]},
     {kernel, [
         {logger_level, info},
         {logger, [
@@ -52,8 +55,14 @@ cat > "${RELEASE_DIR}sys.config" << EOF
 EOF
 
 # Generate vm.args
+# Use -sname for short names (Docker hostnames) or -name for FQDNs
+if [[ "$NODE_NAME" == *"."* ]]; then
+    NAME_FLAG="-name"
+else
+    NAME_FLAG="-sname"
+fi
 cat > "${RELEASE_DIR}vm.args" << EOF
--name ${NODE_NAME}
+${NAME_FLAG} ${NODE_NAME}
 -setcookie ${RELEASE_COOKIE:-barrel_vectordb_cluster}
 +K true
 +A 64

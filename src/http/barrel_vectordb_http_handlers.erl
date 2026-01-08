@@ -21,6 +21,10 @@ init(Req0, State) ->
 
 handle(list_collections, <<"GET">>, true, Req0, State) ->
     case barrel_vectordb:list_collections() of
+        {ok, Collections} when is_map(Collections) ->
+            %% Convert collection records to JSON-serializable maps
+            JsonCollections = maps:map(fun(_, Meta) -> format_collection_meta(Meta) end, Collections),
+            json_response(200, JsonCollections, Req0, State);
         {ok, Collections} ->
             json_response(200, Collections, Req0, State);
         {error, Reason} ->
@@ -33,7 +37,8 @@ handle(collection, <<"GET">>, IsClustered, Req0, State) ->
     Collection = cowboy_req:binding(collection, Req0),
     case maybe_get_collection(IsClustered, Collection) of
         {ok, Meta} ->
-            json_response(200, Meta, Req0, State);
+            JsonMeta = format_collection_meta(Meta),
+            json_response(200, JsonMeta, Req0, State);
         {error, not_found} ->
             json_error(404, <<"not_found">>, <<"Collection not found">>, Req0, State);
         {error, Reason} ->
@@ -46,6 +51,9 @@ handle(collection, <<"PUT">>, IsClustered, Req0, State) ->
         {ok, Body, Req1} ->
             case maybe_create_collection(IsClustered, Collection, Body) of
                 ok ->
+                    json_response(201, #{status => <<"created">>}, Req1, State);
+                {ok, _Meta} ->
+                    %% Clustered mode returns {ok, Meta}
                     json_response(201, #{status => <<"created">>}, Req1, State);
                 {error, already_exists} ->
                     json_error(409, <<"already_exists">>, <<"Collection already exists">>, Req1, State);
@@ -149,12 +157,22 @@ handle(search, <<"POST">>, IsClustered, Req0, State) ->
 
 handle(cluster_status, <<"GET">>, _IsClustered, Req0, State) ->
     Status = barrel_vectordb:cluster_status(),
-    json_response(200, Status, Req0, State);
+    JsonStatus = format_cluster_status(Status),
+    json_response(200, JsonStatus, Req0, State);
 
 handle(cluster_nodes, <<"GET">>, _IsClustered, Req0, State) ->
-    Nodes = barrel_vectordb:cluster_nodes(),
-    NodeList = [atom_to_binary(N, utf8) || N <- Nodes],
-    json_response(200, #{nodes => NodeList}, Req0, State);
+    %% Get nodes from Ra state machine (authoritative source)
+    case barrel_vectordb_cluster_client:get_nodes() of
+        {ok, Nodes} when is_map(Nodes) ->
+            %% Nodes is a map of NodeId => NodeInfo
+            NodeList = [format_node_id(NodeId) || NodeId <- maps:keys(Nodes)],
+            json_response(200, #{nodes => NodeList}, Req0, State);
+        _ ->
+            %% Fallback to healthy nodes if not clustered or error
+            Nodes = barrel_vectordb:cluster_nodes(),
+            NodeList = [atom_to_binary(N, utf8) || N <- Nodes],
+            json_response(200, #{nodes => NodeList}, Req0, State)
+    end;
 
 %% Method not allowed
 
@@ -280,3 +298,77 @@ format_error(Reason) when is_binary(Reason) ->
     Reason;
 format_error(Reason) ->
     iolist_to_binary(io_lib:format("~p", [Reason])).
+
+%% @private Convert cluster status to JSON-serializable format
+format_cluster_status(Status) when is_map(Status) ->
+    maps:fold(fun format_cluster_status_field/3, #{}, Status).
+
+format_cluster_status_field(state, Val, Acc) when is_atom(Val) ->
+    Acc#{<<"state">> => atom_to_binary(Val, utf8)};
+format_cluster_status_field(node, Val, Acc) when is_atom(Val) ->
+    Acc#{<<"node">> => atom_to_binary(Val, utf8)};
+format_cluster_status_field(node_id, {Name, Node}, Acc) ->
+    %% Ra server ID is {ClusterName, Node}
+    Acc#{<<"node_id">> => #{
+        <<"cluster">> => atom_to_binary(Name, utf8),
+        <<"node">> => atom_to_binary(Node, utf8)
+    }};
+format_cluster_status_field(nodes, Val, Acc) when is_list(Val) ->
+    Acc#{<<"nodes">> => [format_node(N) || N <- Val]};
+format_cluster_status_field(healthy_nodes, Val, Acc) when is_list(Val) ->
+    Acc#{<<"healthy_nodes">> => [format_node(N) || N <- Val]};
+format_cluster_status_field(leader, undefined, Acc) ->
+    Acc#{<<"leader">> => null};
+format_cluster_status_field(leader, {Name, Node}, Acc) when is_atom(Name), is_atom(Node) ->
+    %% Ra server ID tuple
+    Acc#{<<"leader">> => #{
+        <<"cluster">> => atom_to_binary(Name, utf8),
+        <<"node">> => atom_to_binary(Node, utf8)
+    }};
+format_cluster_status_field(leader, Val, Acc) when is_atom(Val) ->
+    Acc#{<<"leader">> => atom_to_binary(Val, utf8)};
+format_cluster_status_field(is_leader, Val, Acc) when is_boolean(Val) ->
+    Acc#{<<"is_leader">> => Val};
+format_cluster_status_field(Key, Val, Acc) when is_atom(Key) ->
+    %% Fallback for any other fields
+    Acc#{atom_to_binary(Key, utf8) => format_json_value(Val)}.
+
+format_node(Node) when is_atom(Node) ->
+    atom_to_binary(Node, utf8);
+format_node({Name, Node}) when is_atom(Name), is_atom(Node) ->
+    #{<<"cluster">> => atom_to_binary(Name, utf8), <<"node">> => atom_to_binary(Node, utf8)}.
+
+%% @private Format NodeId (Ra server ID) to binary for JSON
+format_node_id({_ClusterName, Node}) when is_atom(Node) ->
+    atom_to_binary(Node, utf8);
+format_node_id(Node) when is_atom(Node) ->
+    atom_to_binary(Node, utf8).
+
+%% @private Convert collection_meta record to JSON-serializable map
+format_collection_meta(Meta) when is_tuple(Meta), element(1, Meta) =:= collection_meta ->
+    %% collection_meta record: {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status}
+    #{
+        <<"name">> => element(2, Meta),
+        <<"dimension">> => element(3, Meta),
+        <<"num_shards">> => element(4, Meta),
+        <<"replication_factor">> => element(5, Meta),
+        <<"created_at">> => element(6, Meta),
+        <<"status">> => atom_to_binary(element(7, Meta), utf8)
+    };
+format_collection_meta(Meta) when is_map(Meta) ->
+    %% Already a map, just ensure atoms are converted
+    maps:fold(
+        fun(K, V, Acc) when is_atom(K) ->
+            Acc#{atom_to_binary(K, utf8) => format_json_value(V)};
+           (K, V, Acc) ->
+            Acc#{K => format_json_value(V)}
+        end, #{}, Meta).
+
+format_json_value(Val) when is_atom(Val) -> atom_to_binary(Val, utf8);
+format_json_value(Val) when is_binary(Val) -> Val;
+format_json_value(Val) when is_integer(Val) -> Val;
+format_json_value(Val) when is_float(Val) -> Val;
+format_json_value(Val) when is_boolean(Val) -> Val;
+format_json_value(Val) when is_list(Val) -> [format_json_value(V) || V <- Val];
+format_json_value(Val) when is_map(Val) -> maps:map(fun(_, V) -> format_json_value(V) end, Val);
+format_json_value(Val) -> iolist_to_binary(io_lib:format("~p", [Val])).

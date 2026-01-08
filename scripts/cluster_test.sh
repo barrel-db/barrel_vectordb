@@ -2,7 +2,7 @@
 set -e
 
 # Configuration
-BASE_URL="http://localhost"
+BASE_URL="http://127.0.0.1"
 PORTS=(8081 8082 8083 8084 8085)
 COLLECTION="test_collection"
 DIMENSIONS=384
