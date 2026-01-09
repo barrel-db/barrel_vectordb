@@ -530,6 +530,12 @@ test_leader_failover() {
 test_node_addition() {
     log_section "Test: Dynamic Node Addition"
 
+    # Clean up node6 from any previous runs
+    log_info "Cleaning up node6..."
+    docker-compose -f docker-compose.cluster.yml --profile dynamic stop node6 >/dev/null 2>&1 || true
+    docker-compose -f docker-compose.cluster.yml --profile dynamic rm -f node6 >/dev/null 2>&1 || true
+    docker volume rm barrel_vectordb_node6-data >/dev/null 2>&1 || true
+
     # Check initial node count
     local initial_nodes
     initial_nodes=$(api_call GET "$BASE_URL:8081/vectordb/cluster/nodes")
@@ -538,30 +544,29 @@ test_node_addition() {
 
     log_info "Initial cluster has $initial_count nodes"
 
-    # Start node6
+    # Start node6 fresh
     log_info "Starting node6..."
     docker-compose -f docker-compose.cluster.yml --profile dynamic up -d node6 >/dev/null 2>&1
 
-    # Wait for node6 to be healthy
+    # Wait for node6 to fully join cluster (check its own cluster status)
     local waited=0
-    local max_wait=90
+    local max_wait=120
+    local node6_state=""
     while [ $waited -lt $max_wait ]; do
-        if curl -sf "http://127.0.0.1:8086/vectordb/cluster/status" >/dev/null 2>&1; then
-            log_pass "Node6 is up on port 8086"
+        node6_state=$(curl -sf "http://127.0.0.1:8086/vectordb/cluster/status" 2>/dev/null | jq -r '.state // "unknown"' 2>/dev/null)
+        if [ "$node6_state" = "member" ]; then
+            log_pass "Node6 joined cluster (state: member) after ${waited}s"
             break
         fi
         sleep 3
         waited=$((waited + 3))
     done
 
-    if [ $waited -ge $max_wait ]; then
-        log_fail "Timeout waiting for node6 to start"
+    if [ "$node6_state" != "member" ]; then
+        log_fail "Timeout waiting for node6 to join cluster (state: $node6_state)"
         docker-compose -f docker-compose.cluster.yml --profile dynamic stop node6 >/dev/null 2>&1
         return
     fi
-
-    # Wait for node6 to join cluster
-    sleep 10
 
     # Check new node count
     local new_nodes
@@ -643,29 +648,37 @@ test_node_addition() {
 test_graceful_leave() {
     log_section "Test: Graceful Node Leave"
 
-    # First start node6 and ensure it joins
+    # Clean up node6 from any previous runs
+    log_info "Cleaning up node6..."
+    docker-compose -f docker-compose.cluster.yml --profile dynamic stop node6 >/dev/null 2>&1 || true
+    docker-compose -f docker-compose.cluster.yml --profile dynamic rm -f node6 >/dev/null 2>&1 || true
+    docker volume rm barrel_vectordb_node6-data >/dev/null 2>&1 || true
+
+    # Start node6 fresh
     log_info "Starting node6..."
     docker-compose -f docker-compose.cluster.yml --profile dynamic up -d node6 >/dev/null 2>&1
 
-    # Wait for node6 to be healthy
+    # Wait for node6 to fully join cluster (check its own cluster status)
     local waited=0
-    local max_wait=90
+    local max_wait=120
+    local node6_state=""
     while [ $waited -lt $max_wait ]; do
-        if curl -sf "http://127.0.0.1:8086/vectordb/cluster/status" >/dev/null 2>&1; then
+        node6_state=$(curl -sf "http://127.0.0.1:8086/vectordb/cluster/status" 2>/dev/null | jq -r '.state // "unknown"' 2>/dev/null)
+        if [ "$node6_state" = "member" ]; then
+            log_info "Node6 joined cluster (state: member) after ${waited}s"
             break
         fi
         sleep 3
         waited=$((waited + 3))
     done
 
-    if [ $waited -ge $max_wait ]; then
-        log_fail "Timeout waiting for node6 to start"
+    if [ "$node6_state" != "member" ]; then
+        log_fail "Timeout waiting for node6 to join cluster (state: $node6_state)"
+        docker-compose -f docker-compose.cluster.yml --profile dynamic stop node6 >/dev/null 2>&1
         return
     fi
 
-    sleep 10
-
-    # Check node6 is in cluster
+    # Check node6 is in cluster from node1's perspective
     local nodes_before
     nodes_before=$(api_call GET "$BASE_URL:8081/vectordb/cluster/nodes")
     local count_before
