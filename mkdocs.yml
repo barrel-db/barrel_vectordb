@@ -61,6 +61,7 @@ nav:
     - Embedding Models: embeddings.md
   - Guides:
     - Clustering: clustering.md
+    - Docker Deployment: deployment.md
   - Erlang API: api/erlang.md
   - HTTP API: api/http.md
   - Development:
