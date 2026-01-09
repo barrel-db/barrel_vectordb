@@ -269,6 +269,263 @@ test_leader() {
     log_info "Node1 is leader: $is_leader"
 }
 
+# Test: Data consistency (write to one node, read from another)
+test_consistency() {
+    log_section "Test: Data Consistency"
+
+    # Create a fresh collection for this test
+    local test_col="consistency_test"
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+    sleep 1
+
+    api_call PUT "$BASE_URL:8081/vectordb/collections/$test_col" \
+        "{\"dimensions\": $DIMENSIONS, \"num_shards\": 1, \"replication_factor\": 2}" >/dev/null
+    sleep 2
+
+    # Write to node1
+    local vector
+    vector=$(random_vector $DIMENSIONS)
+    local write_result
+    write_result=$(api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/docs" \
+        "{\"id\": \"consistency-doc\", \"text\": \"Consistency test document\", \"metadata\": {\"test\": \"consistency\"}, \"vector\": $vector}")
+
+    if ! echo "$write_result" | grep -q '"status"'; then
+        log_fail "Failed to write document on node1"
+    fi
+
+    sleep 2  # Allow replication
+
+    # Read from node2, node3, node4, node5
+    local read_success=0
+    for port in 8082 8083 8084 8085; do
+        local result
+        result=$(api_call POST "$BASE_URL:$port/vectordb/collections/$test_col/search" \
+            "{\"vector\": $vector, \"k\": 1}")
+
+        if echo "$result" | grep -q 'consistency-doc'; then
+            read_success=$((read_success + 1))
+        fi
+    done
+
+    # Cleanup
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+
+    if [ $read_success -ge 1 ]; then
+        log_pass "Data consistent: read from $read_success/4 other nodes"
+    else
+        log_fail "Data inconsistency: could not read from any other node"
+    fi
+}
+
+# Test: Replication verification
+test_replication() {
+    log_section "Test: Replication Verification"
+
+    # Create collection with RF=3
+    local test_col="replication_test"
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+    sleep 1
+
+    local result
+    result=$(api_call PUT "$BASE_URL:8082/vectordb/collections/$test_col" \
+        "{\"dimensions\": $DIMENSIONS, \"num_shards\": 2, \"replication_factor\": 3}")
+
+    if ! echo "$result" | grep -q '"status"'; then
+        log_fail "Failed to create replicated collection"
+    fi
+
+    sleep 3  # Allow shard creation
+
+    # Check shard placement via cluster status
+    local shards
+    shards=$(api_call GET "$BASE_URL:8081/vectordb/cluster/shards/$test_col")
+
+    if [ -z "$shards" ]; then
+        log_info "Could not get shard info (endpoint may not exist)"
+    else
+        echo "$shards" | jq -r '.' 2>/dev/null || echo "$shards"
+    fi
+
+    # Add a document and verify it's accessible from multiple nodes
+    local vector
+    vector=$(random_vector $DIMENSIONS)
+    api_call POST "$BASE_URL:8083/vectordb/collections/$test_col/docs" \
+        "{\"id\": \"replicated-doc\", \"text\": \"Replicated document\", \"metadata\": {}, \"vector\": $vector}" >/dev/null
+
+    sleep 2
+
+    # Count how many nodes can find the document
+    local accessible=0
+    for port in "${PORTS[@]}"; do
+        local search_result
+        search_result=$(api_call POST "$BASE_URL:$port/vectordb/collections/$test_col/search" \
+            "{\"vector\": $vector, \"k\": 1}")
+
+        if echo "$search_result" | grep -q 'replicated-doc'; then
+            accessible=$((accessible + 1))
+        fi
+    done
+
+    # Cleanup
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+
+    if [ $accessible -eq 5 ]; then
+        log_pass "Document accessible from all 5 nodes (replication working)"
+    elif [ $accessible -ge 3 ]; then
+        log_pass "Document accessible from $accessible/5 nodes"
+    else
+        log_fail "Document only accessible from $accessible/5 nodes"
+    fi
+}
+
+# Test: Concurrent writes
+test_concurrent() {
+    log_section "Test: Concurrent Writes"
+
+    # Create collection
+    local test_col="concurrent_test"
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+    sleep 1
+
+    api_call PUT "$BASE_URL:8081/vectordb/collections/$test_col" \
+        "{\"dimensions\": $DIMENSIONS, \"num_shards\": 3, \"replication_factor\": 2}" >/dev/null
+    sleep 2
+
+    # Launch concurrent writes from different nodes
+    local pids=()
+    local results_dir="/tmp/concurrent_test_$$"
+    mkdir -p "$results_dir"
+
+    for i in {1..5}; do
+        (
+            local success=0
+            for j in {1..5}; do
+                local port=${PORTS[$((i-1))]}
+                local vector
+                vector=$(random_vector $DIMENSIONS)
+                local result
+                result=$(api_call POST "$BASE_URL:$port/vectordb/collections/$test_col/docs" \
+                    "{\"id\": \"concurrent-$i-$j\", \"text\": \"Concurrent doc $i-$j\", \"metadata\": {\"writer\": $i}, \"vector\": $vector}")
+
+                if echo "$result" | grep -q '"status"'; then
+                    success=$((success + 1))
+                fi
+            done
+            echo "$success" > "$results_dir/node$i"
+        ) &
+        pids+=($!)
+    done
+
+    # Wait for all writers
+    for pid in "${pids[@]}"; do
+        wait "$pid"
+    done
+
+    # Count total successes
+    local total=0
+    for i in {1..5}; do
+        if [ -f "$results_dir/node$i" ]; then
+            local count
+            count=$(cat "$results_dir/node$i")
+            total=$((total + count))
+        fi
+    done
+
+    rm -rf "$results_dir"
+
+    # Verify document count
+    sleep 2
+    local vector
+    vector=$(random_vector $DIMENSIONS)
+    local search_result
+    search_result=$(api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/search" \
+        "{\"vector\": $vector, \"k\": 30}")
+
+    local found
+    found=$(echo "$search_result" | jq '.results | length' 2>/dev/null || echo "0")
+
+    # Cleanup
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+
+    if [ "$total" -ge 20 ]; then
+        log_pass "Concurrent writes: $total/25 succeeded, $found found in search"
+    else
+        log_fail "Concurrent writes: only $total/25 succeeded"
+    fi
+}
+
+# Test: Shard leader failover
+test_leader_failover() {
+    log_section "Test: Shard Leader Failover"
+
+    # Create collection with known placement
+    local test_col="failover_test"
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+    sleep 1
+
+    api_call PUT "$BASE_URL:8081/vectordb/collections/$test_col" \
+        "{\"dimensions\": $DIMENSIONS, \"num_shards\": 1, \"replication_factor\": 3}" >/dev/null
+    sleep 3
+
+    # Add a document
+    local vector
+    vector=$(random_vector $DIMENSIONS)
+    api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/docs" \
+        "{\"id\": \"failover-doc\", \"text\": \"Failover test document\", \"metadata\": {}, \"vector\": $vector}" >/dev/null
+    sleep 2
+
+    # Verify document exists (try all nodes)
+    local pre_success=0
+    for port in "${PORTS[@]}"; do
+        local pre_result
+        pre_result=$(api_call POST "$BASE_URL:$port/vectordb/collections/$test_col/search" \
+            "{\"vector\": $vector, \"k\": 1}")
+
+        if echo "$pre_result" | grep -q 'failover-doc'; then
+            pre_success=$((pre_success + 1))
+        fi
+    done
+
+    if [ $pre_success -eq 0 ]; then
+        log_fail "Document not found on any node before failover"
+        api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+        return
+    fi
+
+    log_info "Document verified on $pre_success/5 nodes before failover"
+
+    # Stop node2 (likely has shard replicas)
+    log_info "Stopping node2..."
+    docker stop vectordb-node2 >/dev/null 2>&1
+    sleep 10
+
+    # Try to read from remaining nodes
+    local post_success=0
+    for port in 8081 8083 8084 8085; do
+        local result
+        result=$(api_call POST "$BASE_URL:$port/vectordb/collections/$test_col/search" \
+            "{\"vector\": $vector, \"k\": 1}")
+
+        if echo "$result" | grep -q 'failover-doc'; then
+            post_success=$((post_success + 1))
+        fi
+    done
+
+    # Restart node2
+    log_info "Restarting node2..."
+    docker start vectordb-node2 >/dev/null 2>&1
+    sleep 15
+
+    # Cleanup
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+
+    if [ $post_success -ge 1 ]; then
+        log_pass "Shard failover: data accessible from $post_success/4 nodes after leader loss"
+    else
+        log_fail "Shard failover failed: data not accessible"
+    fi
+}
+
 # Cleanup
 cleanup() {
     log_section "Cleanup"
@@ -278,9 +535,9 @@ cleanup() {
 
 # Usage
 usage() {
-    echo "Usage: $0 {status|nodes|collection|documents|search|failure|leader|all|cleanup}"
+    echo "Usage: $0 {status|nodes|collection|documents|search|failure|leader|consistency|replication|concurrent|failover|all|advanced|cleanup}"
     echo ""
-    echo "Tests:"
+    echo "Basic Tests:"
     echo "  status     - Check all nodes respond"
     echo "  nodes      - Check node discovery"
     echo "  collection - Create/verify collection"
@@ -288,7 +545,16 @@ usage() {
     echo "  search     - Test scatter-gather search"
     echo "  failure    - Test node failure/recovery"
     echo "  leader     - Show leader info"
-    echo "  all        - Run all tests"
+    echo ""
+    echo "Advanced Tests:"
+    echo "  consistency  - Write to one node, read from others"
+    echo "  replication  - Verify replication factor works"
+    echo "  concurrent   - Stress test with parallel writes"
+    echo "  failover     - Test shard leader failover"
+    echo ""
+    echo "Test Suites:"
+    echo "  all        - Run basic tests"
+    echo "  advanced   - Run advanced tests only"
     echo "  cleanup    - Delete test collection"
     exit 1
 }
@@ -300,13 +566,17 @@ main() {
     echo "======================================"
 
     case "${1:-all}" in
-        status)     test_cluster_status ;;
-        nodes)      test_cluster_nodes ;;
-        collection) test_create_collection ;;
-        documents)  test_add_documents ;;
-        search)     test_search ;;
-        failure)    test_node_failure ;;
-        leader)     test_leader ;;
+        status)      test_cluster_status ;;
+        nodes)       test_cluster_nodes ;;
+        collection)  test_create_collection ;;
+        documents)   test_add_documents ;;
+        search)      test_search ;;
+        failure)     test_node_failure ;;
+        leader)      test_leader ;;
+        consistency) test_consistency ;;
+        replication) test_replication ;;
+        concurrent)  test_concurrent ;;
+        failover)    test_leader_failover ;;
         all)
             wait_for_cluster
             test_cluster_status
@@ -317,6 +587,13 @@ main() {
             test_leader
             test_node_failure
             cleanup
+            ;;
+        advanced)
+            wait_for_cluster
+            test_consistency
+            test_replication
+            test_concurrent
+            test_leader_failover
             ;;
         cleanup)    cleanup ;;
         *)          usage ;;
