@@ -135,10 +135,10 @@ embed_batch(Texts, Config) ->
     ApiKey = maps:get(api_key, Config),
 
     ApiUrl = <<Url/binary, "/embeddings">>,
-    Body = jsx:encode(#{
+    Body = iolist_to_binary(json:encode(#{
         <<"model">> => Model,
         <<"input">> => Texts
-    }),
+    })),
     Headers = [
         {<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
         {<<"Content-Type">>, <<"application/json">>}
@@ -166,7 +166,7 @@ embed_batch(Texts, Config) ->
 %% @private
 parse_embeddings_response(Body) ->
     try
-        Response = jsx:decode(Body, [return_maps]),
+        Response = json:decode(Body),
         case maps:find(<<"data">>, Response) of
             {ok, Data} when is_list(Data) ->
                 %% Sort by index to ensure correct order

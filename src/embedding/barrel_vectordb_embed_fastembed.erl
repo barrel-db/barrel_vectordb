@@ -180,14 +180,14 @@ find_embed_script() ->
 %% Send command to port and wait for response
 port_command_sync(Port, Request, Timeout) ->
     %% Encode and send
-    Json = jsx:encode(Request),
+    Json = iolist_to_binary(json:encode(Request)),
     true = port_command(Port, [Json, "\n"]),
 
     %% Wait for response
     receive
         {Port, {data, {eol, Line}}} ->
             try
-                Response = jsx:decode(Line, [return_maps]),
+                Response = json:decode(Line),
                 {ok, Response}
             catch
                 _:Reason ->

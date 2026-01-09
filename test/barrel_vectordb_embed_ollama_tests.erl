@@ -107,13 +107,13 @@ test_embed() ->
     MockVector = [0.1, 0.2, 0.3],
     meck:expect(hackney, request, fun(post, Url, _Headers, Body, _Opts) ->
         ?assertEqual(<<"http://localhost:11434/api/embeddings">>, Url),
-        Decoded = jsx:decode(Body, [return_maps]),
+        Decoded = json:decode(Body),
         ?assertEqual(<<"nomic-embed-text">>, maps:get(<<"model">>, Decoded)),
         ?assertEqual(<<"hello world">>, maps:get(<<"prompt">>, Decoded)),
         {ok, 200, [], make_ref()}
     end),
     meck:expect(hackney, body, fun(_) ->
-        {ok, jsx:encode(#{<<"embedding">> => MockVector})}
+        {ok, iolist_to_binary(json:encode(#{<<"embedding">> => MockVector}))}
     end),
 
     {ok, Config} = barrel_vectordb_embed_ollama:init(#{}),
@@ -123,12 +123,12 @@ test_embed() ->
 test_embed_custom_model() ->
     MockVector = lists:duplicate(1024, 0.5),
     meck:expect(hackney, request, fun(post, _Url, _Headers, Body, _Opts) ->
-        Decoded = jsx:decode(Body, [return_maps]),
+        Decoded = json:decode(Body),
         ?assertEqual(<<"mxbai-embed-large">>, maps:get(<<"model">>, Decoded)),
         {ok, 200, [], make_ref()}
     end),
     meck:expect(hackney, body, fun(_) ->
-        {ok, jsx:encode(#{<<"embedding">> => MockVector})}
+        {ok, iolist_to_binary(json:encode(#{<<"embedding">> => MockVector}))}
     end),
 
     {ok, Config} = barrel_vectordb_embed_ollama:init(#{model => <<"mxbai-embed-large">>}),
@@ -160,7 +160,7 @@ test_embed_batch() ->
     CallCount = counters:new(1, []),
     meck:expect(hackney, request, fun(post, _Url, _Headers, Body, _Opts) ->
         counters:add(CallCount, 1, 1),
-        Decoded = jsx:decode(Body, [return_maps]),
+        Decoded = json:decode(Body),
         Prompt = maps:get(<<"prompt">>, Decoded),
         {ok, 200, [], {ref, Prompt}}
     end),
@@ -168,7 +168,7 @@ test_embed_batch() ->
         %% Generate deterministic vector based on prompt
         Hash = erlang:phash2(Prompt, 1000),
         Vec = [Hash / 1000.0, (Hash + 1) / 1000.0, (Hash + 2) / 1000.0],
-        {ok, jsx:encode(#{<<"embedding">> => Vec})}
+        {ok, iolist_to_binary(json:encode(#{<<"embedding">> => Vec}))}
     end),
 
     {ok, Config} = barrel_vectordb_embed_ollama:init(#{}),
@@ -192,7 +192,7 @@ test_embed_batch_partial_fail() ->
         end
     end),
     meck:expect(hackney, body, fun(_) ->
-        {ok, jsx:encode(#{<<"embedding">> => [0.1, 0.2, 0.3]})}
+        {ok, iolist_to_binary(json:encode(#{<<"embedding">> => [0.1, 0.2, 0.3]}))}
     end),
 
     {ok, Config} = barrel_vectordb_embed_ollama:init(#{}),

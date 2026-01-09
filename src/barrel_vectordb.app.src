@@ -10,8 +10,7 @@
         ssl,
         inets,
         rocksdb,
-        hackney,
-        jsx
+        hackney
     ]},
     %% Cluster deps - loaded on demand, not auto-started
     {included_applications, [ra, cowboy]},

@@ -313,7 +313,7 @@ read_json_body(Req0) ->
     case cowboy_req:read_body(Req0) of
         {ok, Body, Req1} ->
             try
-                Json = jsx:decode(Body, [return_maps]),
+                Json = json:decode(Body),
                 {ok, Json, Req1}
             catch
                 _:_ -> {error, Req1}
@@ -323,14 +323,14 @@ read_json_body(Req0) ->
     end.
 
 json_response(Status, Data, Req0, State) ->
-    Body = jsx:encode(Data),
+    Body = iolist_to_binary(json:encode(Data)),
     Req = cowboy_req:reply(Status, #{
         <<"content-type">> => <<"application/json">>
     }, Body, Req0),
     {ok, Req, State}.
 
 json_error(Status, Code, Message, Req0, State) ->
-    Body = jsx:encode(#{error => Code, message => Message}),
+    Body = iolist_to_binary(json:encode(#{error => Code, message => Message})),
     Req = cowboy_req:reply(Status, #{
         <<"content-type">> => <<"application/json">>
     }, Body, Req0),

@@ -141,17 +141,17 @@ test_embed() ->
             V =:= <<"Bearer sk-test">>
         end, Headers)),
         %% Verify body
-        Decoded = jsx:decode(Body, [return_maps]),
+        Decoded = json:decode(Body),
         ?assertEqual(<<"text-embedding-3-small">>, maps:get(<<"model">>, Decoded)),
         ?assertEqual([<<"hello world">>], maps:get(<<"input">>, Decoded)),
         {ok, 200, [], make_ref()}
     end),
     meck:expect(hackney, body, fun(_) ->
-        {ok, jsx:encode(#{
+        {ok, iolist_to_binary(json:encode(#{
             <<"data">> => [
                 #{<<"embedding">> => MockVector, <<"index">> => 0}
             ]
-        })}
+        }))}
     end),
 
     {ok, Config} = barrel_vectordb_embed_openai:init(#{api_key => <<"sk-test">>}),
@@ -161,14 +161,14 @@ test_embed() ->
 test_embed_custom_model() ->
     MockVector = lists:duplicate(3072, 0.5),
     meck:expect(hackney, request, fun(post, _Url, _Headers, Body, _Opts) ->
-        Decoded = jsx:decode(Body, [return_maps]),
+        Decoded = json:decode(Body),
         ?assertEqual(<<"text-embedding-3-large">>, maps:get(<<"model">>, Decoded)),
         {ok, 200, [], make_ref()}
     end),
     meck:expect(hackney, body, fun(_) ->
-        {ok, jsx:encode(#{
+        {ok, iolist_to_binary(json:encode(#{
             <<"data">> => [#{<<"embedding">> => MockVector, <<"index">> => 0}]
-        })}
+        }))}
     end),
 
     {ok, Config} = barrel_vectordb_embed_openai:init(#{
@@ -213,19 +213,19 @@ test_embed_connection_fail() ->
 
 test_embed_batch() ->
     meck:expect(hackney, request, fun(post, _Url, _Headers, Body, _Opts) ->
-        Decoded = jsx:decode(Body, [return_maps]),
+        Decoded = json:decode(Body),
         Input = maps:get(<<"input">>, Decoded),
         ?assertEqual([<<"one">>, <<"two">>, <<"three">>], Input),
         {ok, 200, [], make_ref()}
     end),
     meck:expect(hackney, body, fun(_) ->
-        {ok, jsx:encode(#{
+        {ok, iolist_to_binary(json:encode(#{
             <<"data">> => [
                 #{<<"embedding">> => [0.1, 0.2], <<"index">> => 0},
                 #{<<"embedding">> => [0.3, 0.4], <<"index">> => 1},
                 #{<<"embedding">> => [0.5, 0.6], <<"index">> => 2}
             ]
-        })}
+        }))}
     end),
 
     {ok, Config} = barrel_vectordb_embed_openai:init(#{api_key => <<"sk-test">>}),
@@ -244,13 +244,13 @@ test_embed_batch_order() ->
     end),
     meck:expect(hackney, body, fun(_) ->
         %% Return out of order
-        {ok, jsx:encode(#{
+        {ok, iolist_to_binary(json:encode(#{
             <<"data">> => [
                 #{<<"embedding">> => [0.5, 0.6], <<"index">> => 2},
                 #{<<"embedding">> => [0.1, 0.2], <<"index">> => 0},
                 #{<<"embedding">> => [0.3, 0.4], <<"index">> => 1}
             ]
-        })}
+        }))}
     end),
 
     {ok, Config} = barrel_vectordb_embed_openai:init(#{api_key => <<"sk-test">>}),

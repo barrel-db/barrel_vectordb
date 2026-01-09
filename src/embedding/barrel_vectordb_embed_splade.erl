@@ -222,13 +222,13 @@ find_sparse_script() ->
 
 %% @private
 port_command_sync(Port, Request, Timeout) ->
-    Json = jsx:encode(Request),
+    Json = iolist_to_binary(json:encode(Request)),
     true = port_command(Port, [Json, "\n"]),
 
     receive
         {Port, {data, {eol, Line}}} ->
             try
-                Response = jsx:decode(Line, [return_maps]),
+                Response = json:decode(Line),
                 {ok, Response}
             catch
                 _:Reason ->

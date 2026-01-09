@@ -102,10 +102,10 @@ embed(Text, Config) ->
     Timeout = maps:get(timeout, Config, ?DEFAULT_TIMEOUT),
 
     ApiUrl = <<Url/binary, "/api/embeddings">>,
-    Body = jsx:encode(#{
+    Body = iolist_to_binary(json:encode(#{
         <<"model">> => Model,
         <<"prompt">> => Text
-    }),
+    })),
     Headers = [{<<"Content-Type">>, <<"application/json">>}],
 
     case hackney:request(post, ApiUrl, Headers, Body, [{recv_timeout, Timeout}]) of
@@ -149,7 +149,7 @@ embed_batch(Texts, Config) ->
 %% @private
 parse_embedding_response(Body) ->
     try
-        Response = jsx:decode(Body, [return_maps]),
+        Response = json:decode(Body),
         case maps:find(<<"embedding">>, Response) of
             {ok, Embedding} when is_list(Embedding) ->
                 {ok, Embedding};

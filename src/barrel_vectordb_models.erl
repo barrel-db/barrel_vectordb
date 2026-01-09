@@ -235,7 +235,7 @@ load_models_file() ->
             case file:read_file(Path) of
                 {ok, Content} ->
                     try
-                        Data = jsx:decode(Content, [return_maps]),
+                        Data = json:decode(Content),
                         {ok, Data}
                     catch
                         _:Reason ->

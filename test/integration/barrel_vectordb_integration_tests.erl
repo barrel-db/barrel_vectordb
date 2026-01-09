@@ -334,7 +334,7 @@ check_ollama_model_available(Model) ->
         {ok, 200, _, ClientRef} ->
             {ok, Body} = hackney:body(ClientRef),
             try
-                #{<<"models">> := Models} = jsx:decode(Body, [return_maps]),
+                #{<<"models">> := Models} = json:decode(Body),
                 lists:any(fun(#{<<"name">> := Name}) ->
                     binary:match(Name, Model) =/= nomatch
                 end, Models)
