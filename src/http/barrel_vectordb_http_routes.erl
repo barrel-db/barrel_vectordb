@@ -58,6 +58,7 @@ collection_routes(Prefix) ->
         %% Collection management
         {<<Prefix/binary, "/collections">>, barrel_vectordb_http_handlers, #{action => list_collections}},
         {<<Prefix/binary, "/collections/:collection">>, barrel_vectordb_http_handlers, #{action => collection}},
+        {<<Prefix/binary, "/collections/:collection/reshard">>, barrel_vectordb_http_handlers, #{action => reshard}},
 
         %% Document operations
         {<<Prefix/binary, "/collections/:collection/docs">>, barrel_vectordb_http_handlers, #{action => docs}},

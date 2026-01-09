@@ -198,6 +198,42 @@ apply(_Meta, {promote_replica, ShardId, NewLeader}, State) ->
             {NewState, ok, Effects}
     end;
 
+%% Reshard finalize - update collection metadata and shard assignments
+apply(_Meta, {reshard_finalize, Name, NewNumShards, NewPlacement}, State) ->
+    case maps:get(Name, State#cluster_state.collections, undefined) of
+        undefined ->
+            {State, {error, not_found}, []};
+        Meta ->
+            %% Update collection metadata with new shard count
+            UpdatedMeta = setelement(4, Meta, NewNumShards),
+            Collections = maps:put(Name, UpdatedMeta, State#cluster_state.collections),
+
+            %% Remove old shard assignments for this collection
+            OldShards = maps:filter(
+                fun({ColName, _ShardIdx}, _) -> ColName =/= Name end,
+                State#cluster_state.shards),
+
+            %% Create new shard assignments
+            NewShards = lists:foldl(
+                fun({ShardIdx, Leader, Replicas}, Acc) ->
+                    ShardId = {Name, ShardIdx},
+                    Assignment = #shard_assignment{
+                        shard_id = ShardId,
+                        leader = Leader,
+                        replicas = Replicas,
+                        version = 1
+                    },
+                    maps:put(ShardId, Assignment, Acc)
+                end,
+                OldShards,
+                NewPlacement),
+
+            NewState = State#cluster_state{collections = Collections, shards = NewShards},
+            %% Broadcast to create new shards on all nodes
+            Effects = [{mod_call, barrel_vectordb_shard_manager, broadcast_create_shards, [Name, UpdatedMeta, NewPlacement]}],
+            {NewState, ok, Effects}
+    end;
+
 %% Catch-all
 apply(_Meta, _Command, State) ->
     {State, {error, unknown_command}, []}.

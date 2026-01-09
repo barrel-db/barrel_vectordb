@@ -153,6 +153,37 @@ handle(search, <<"POST">>, IsClustered, Req0, State) ->
             json_error(400, <<"bad_request">>, <<"Invalid JSON body">>, Req1, State)
     end;
 
+%% Reshard collection
+
+handle(reshard, <<"POST">>, true, Req0, State) ->
+    Collection = cowboy_req:binding(collection, Req0),
+    case read_json_body(Req0) of
+        {ok, Body, Req1} ->
+            NewShards = maps:get(<<"num_shards">>, Body, undefined),
+            case NewShards of
+                undefined ->
+                    json_error(400, <<"bad_request">>, <<"'num_shards' required">>, Req1, State);
+                N when is_integer(N), N > 0 ->
+                    case barrel_vectordb_reshard:reshard(Collection, N) of
+                        {ok, Info} ->
+                            json_response(200, #{status => <<"resharding">>, info => Info}, Req1, State);
+                        {error, not_found} ->
+                            json_error(404, <<"not_found">>, <<"Collection not found">>, Req1, State);
+                        {error, same_shard_count} ->
+                            json_error(400, <<"bad_request">>, <<"New shard count same as current">>, Req1, State);
+                        {error, Reason} ->
+                            json_error(500, <<"error">>, format_error(Reason), Req1, State)
+                    end;
+                _ ->
+                    json_error(400, <<"bad_request">>, <<"'num_shards' must be a positive integer">>, Req1, State)
+            end;
+        {error, Req1} ->
+            json_error(400, <<"bad_request">>, <<"Invalid JSON body">>, Req1, State)
+    end;
+
+handle(reshard, <<"POST">>, false, Req0, State) ->
+    json_error(400, <<"not_clustered">>, <<"Resharding only available in cluster mode">>, Req0, State);
+
 %% Cluster status
 
 handle(cluster_status, <<"GET">>, _IsClustered, Req0, State) ->

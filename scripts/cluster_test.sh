@@ -835,6 +835,85 @@ test_network_partition() {
     api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
 }
 
+# Test: Resharding
+test_reshard() {
+    log_section "Test: Resharding"
+
+    # Create collection with 2 shards
+    local test_col="reshard_test"
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+    sleep 1
+
+    log_info "Creating collection with 2 shards..."
+    api_call PUT "$BASE_URL:8081/vectordb/collections/$test_col" \
+        "{\"dimensions\": $DIMENSIONS, \"num_shards\": 2, \"replication_factor\": 2}" >/dev/null
+    sleep 3
+
+    # Add documents
+    log_info "Adding 10 documents..."
+    for i in {1..10}; do
+        local vector
+        vector=$(random_vector $DIMENSIONS)
+        api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/docs" \
+            "{\"id\": \"reshard-doc-$i\", \"text\": \"Document $i for reshard test\", \"metadata\": {\"idx\": $i}, \"vector\": $vector}" >/dev/null
+    done
+    sleep 2
+
+    # Verify documents exist
+    local vector_search
+    vector_search=$(random_vector $DIMENSIONS)
+    local pre_count
+    pre_count=$(api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/search" \
+        "{\"vector\": $vector_search, \"k\": 20}" | jq '.results | length' 2>/dev/null || echo "0")
+
+    log_info "Documents before reshard: $pre_count"
+
+    # Reshard to 4 shards
+    log_info "Resharding from 2 to 4 shards..."
+    local reshard_result
+    reshard_result=$(api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/reshard" \
+        "{\"num_shards\": 4}")
+
+    if echo "$reshard_result" | grep -q '"resharding"'; then
+        log_pass "Reshard initiated: $reshard_result"
+    elif echo "$reshard_result" | grep -q '"error"'; then
+        log_info "Reshard result: $reshard_result"
+    else
+        log_info "Reshard result: $reshard_result"
+    fi
+
+    sleep 5
+
+    # Verify documents still accessible
+    local post_count
+    post_count=$(api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/search" \
+        "{\"vector\": $vector_search, \"k\": 20}" | jq '.results | length' 2>/dev/null || echo "0")
+
+    log_info "Documents after reshard: $post_count"
+
+    if [ "$post_count" -ge "$pre_count" ]; then
+        log_pass "Documents preserved after reshard ($post_count docs)"
+    else
+        log_info "Document count changed: $pre_count -> $post_count"
+    fi
+
+    # Test that writes still work
+    local vector
+    vector=$(random_vector $DIMENSIONS)
+    local write_result
+    write_result=$(api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/docs" \
+        "{\"id\": \"post-reshard-doc\", \"text\": \"Written after reshard\", \"metadata\": {}, \"vector\": $vector}")
+
+    if echo "$write_result" | grep -q '"status"'; then
+        log_pass "Writes work after reshard"
+    else
+        log_info "Post-reshard write: $write_result"
+    fi
+
+    # Cleanup
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+}
+
 # Cleanup
 cleanup() {
     log_section "Cleanup"
@@ -863,6 +942,7 @@ usage() {
     echo "  nodeadd      - Dynamically add node6 to cluster"
     echo "  leave        - Test graceful node leave API"
     echo "  partition    - Simulate network partition with tc"
+    echo "  reshard      - Test resharding (2->4 shards)"
     echo ""
     echo "Test Suites:"
     echo "  all        - Run basic tests"
@@ -892,6 +972,7 @@ main() {
         nodeadd)     test_node_addition ;;
         leave)       test_graceful_leave ;;
         partition)   test_network_partition ;;
+        reshard)     test_reshard ;;
         all)
             wait_for_cluster
             test_cluster_status
