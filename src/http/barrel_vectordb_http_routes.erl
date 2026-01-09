@@ -42,7 +42,8 @@ cluster_routes() ->
 cluster_routes(Prefix) ->
     [
         {<<Prefix/binary, "/cluster/status">>, barrel_vectordb_http_handlers, #{action => cluster_status}},
-        {<<Prefix/binary, "/cluster/nodes">>, barrel_vectordb_http_handlers, #{action => cluster_nodes}}
+        {<<Prefix/binary, "/cluster/nodes">>, barrel_vectordb_http_handlers, #{action => cluster_nodes}},
+        {<<Prefix/binary, "/cluster/leave">>, barrel_vectordb_http_handlers, #{action => cluster_leave}}
     ].
 
 %% @doc Get collection routes with default /vectordb prefix

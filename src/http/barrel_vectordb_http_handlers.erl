@@ -174,6 +174,21 @@ handle(cluster_nodes, <<"GET">>, _IsClustered, Req0, State) ->
             json_response(200, #{nodes => NodeList}, Req0, State)
     end;
 
+handle(cluster_leave, <<"POST">>, true, Req0, State) ->
+    %% Gracefully remove this node from the cluster
+    NodeId = barrel_vectordb_mesh:node_id(),
+    case barrel_vectordb_cluster_client:leave_node(NodeId) of
+        ok ->
+            json_response(200, #{status => <<"leaving">>, node => format_node_id(NodeId)}, Req0, State);
+        {error, not_member} ->
+            json_error(400, <<"not_member">>, <<"Node is not a cluster member">>, Req0, State);
+        {error, Reason} ->
+            json_error(500, <<"leave_failed">>, iolist_to_binary(io_lib:format("~p", [Reason])), Req0, State)
+    end;
+
+handle(cluster_leave, <<"POST">>, false, Req0, State) ->
+    json_error(400, <<"not_clustered">>, <<"Node is not in cluster mode">>, Req0, State);
+
 %% Method not allowed
 
 handle(_Action, _Method, _IsClustered, Req0, State) ->

@@ -526,6 +526,315 @@ test_leader_failover() {
     fi
 }
 
+# Test: Dynamic node addition
+test_node_addition() {
+    log_section "Test: Dynamic Node Addition"
+
+    # Check initial node count
+    local initial_nodes
+    initial_nodes=$(api_call GET "$BASE_URL:8081/vectordb/cluster/nodes")
+    local initial_count
+    initial_count=$(echo "$initial_nodes" | jq '.nodes | length' 2>/dev/null || echo "0")
+
+    log_info "Initial cluster has $initial_count nodes"
+
+    # Start node6
+    log_info "Starting node6..."
+    docker-compose -f docker-compose.cluster.yml --profile dynamic up -d node6 >/dev/null 2>&1
+
+    # Wait for node6 to be healthy
+    local waited=0
+    local max_wait=90
+    while [ $waited -lt $max_wait ]; do
+        if curl -sf "http://127.0.0.1:8086/vectordb/cluster/status" >/dev/null 2>&1; then
+            log_pass "Node6 is up on port 8086"
+            break
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+
+    if [ $waited -ge $max_wait ]; then
+        log_fail "Timeout waiting for node6 to start"
+        docker-compose -f docker-compose.cluster.yml --profile dynamic stop node6 >/dev/null 2>&1
+        return
+    fi
+
+    # Wait for node6 to join cluster
+    sleep 10
+
+    # Check new node count
+    local new_nodes
+    new_nodes=$(api_call GET "$BASE_URL:8081/vectordb/cluster/nodes")
+    local new_count
+    new_count=$(echo "$new_nodes" | jq '.nodes | length' 2>/dev/null || echo "0")
+
+    log_info "Cluster now has $new_count nodes"
+
+    # Verify node6 is in the list
+    if echo "$new_nodes" | grep -q 'node6'; then
+        log_pass "Node6 successfully joined cluster"
+    else
+        log_fail "Node6 not found in cluster nodes"
+    fi
+
+    # Test that node6 can access existing data
+    # First create a collection and add data via node1
+    local test_col="node_add_test"
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+    sleep 1
+
+    api_call PUT "$BASE_URL:8081/vectordb/collections/$test_col" \
+        "{\"dimensions\": $DIMENSIONS, \"num_shards\": 2, \"replication_factor\": 2}" >/dev/null
+    sleep 3
+
+    local vector
+    vector=$(random_vector $DIMENSIONS)
+    api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/docs" \
+        "{\"id\": \"node-add-doc\", \"text\": \"Document for node addition test\", \"metadata\": {}, \"vector\": $vector}" >/dev/null
+    sleep 2
+
+    # Search from node6
+    local result
+    result=$(api_call POST "$BASE_URL:8086/vectordb/collections/$test_col/search" \
+        "{\"vector\": $vector, \"k\": 1}")
+
+    if echo "$result" | grep -q 'node-add-doc'; then
+        log_pass "Node6 can search cluster data"
+    else
+        log_info "Node6 search result: $result"
+    fi
+
+    # Test write via node6
+    local vector2
+    vector2=$(random_vector $DIMENSIONS)
+    local write_result
+    write_result=$(api_call POST "$BASE_URL:8086/vectordb/collections/$test_col/docs" \
+        "{\"id\": \"written-via-node6\", \"text\": \"Document written via new node\", \"metadata\": {}, \"vector\": $vector2}")
+
+    if echo "$write_result" | grep -q '"status"'; then
+        log_pass "Node6 can write to cluster"
+    else
+        log_info "Node6 write failed: $write_result"
+    fi
+
+    # Cleanup
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+
+    # Stop node6 (keep it for other tests if needed)
+    log_info "Stopping node6..."
+    docker-compose -f docker-compose.cluster.yml --profile dynamic stop node6 >/dev/null 2>&1
+
+    # Verify cluster recovers
+    sleep 5
+    local final_nodes
+    final_nodes=$(api_call GET "$BASE_URL:8081/vectordb/cluster/nodes")
+    local final_count
+    final_count=$(echo "$final_nodes" | jq '.nodes | length' 2>/dev/null || echo "0")
+
+    if [ "$final_count" -eq "$initial_count" ]; then
+        log_pass "Cluster recovered to $final_count nodes after node6 stopped"
+    else
+        log_info "Cluster has $final_count nodes (expected $initial_count)"
+    fi
+}
+
+# Test: Graceful node leave
+test_graceful_leave() {
+    log_section "Test: Graceful Node Leave"
+
+    # First start node6 and ensure it joins
+    log_info "Starting node6..."
+    docker-compose -f docker-compose.cluster.yml --profile dynamic up -d node6 >/dev/null 2>&1
+
+    # Wait for node6 to be healthy
+    local waited=0
+    local max_wait=90
+    while [ $waited -lt $max_wait ]; do
+        if curl -sf "http://127.0.0.1:8086/vectordb/cluster/status" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+
+    if [ $waited -ge $max_wait ]; then
+        log_fail "Timeout waiting for node6 to start"
+        return
+    fi
+
+    sleep 10
+
+    # Check node6 is in cluster
+    local nodes_before
+    nodes_before=$(api_call GET "$BASE_URL:8081/vectordb/cluster/nodes")
+    local count_before
+    count_before=$(echo "$nodes_before" | jq '.nodes | length' 2>/dev/null || echo "0")
+
+    if ! echo "$nodes_before" | grep -q 'node6'; then
+        log_fail "Node6 not in cluster before leave test"
+        docker-compose -f docker-compose.cluster.yml --profile dynamic stop node6 >/dev/null 2>&1
+        return
+    fi
+
+    log_info "Cluster has $count_before nodes (including node6)"
+
+    # Call graceful leave on node6
+    log_info "Calling graceful leave on node6..."
+    local leave_result
+    leave_result=$(api_call POST "$BASE_URL:8086/vectordb/cluster/leave" "")
+
+    if echo "$leave_result" | grep -q '"leaving"'; then
+        log_pass "Graceful leave initiated: $leave_result"
+    else
+        log_info "Leave result: $leave_result"
+    fi
+
+    sleep 5
+
+    # Check node count decreased
+    local nodes_after
+    nodes_after=$(api_call GET "$BASE_URL:8081/vectordb/cluster/nodes")
+    local count_after
+    count_after=$(echo "$nodes_after" | jq '.nodes | length' 2>/dev/null || echo "0")
+
+    if [ "$count_after" -lt "$count_before" ]; then
+        log_pass "Node removed from cluster: $count_before -> $count_after nodes"
+    else
+        log_info "Cluster still has $count_after nodes (Ra may need time to propagate)"
+    fi
+
+    # Verify node6 is no longer in the list
+    if ! echo "$nodes_after" | grep -q 'node6'; then
+        log_pass "Node6 removed from cluster node list"
+    else
+        log_info "Node6 still in list (may take time to propagate)"
+    fi
+
+    # Stop node6 container
+    log_info "Stopping node6 container..."
+    docker-compose -f docker-compose.cluster.yml --profile dynamic stop node6 >/dev/null 2>&1
+}
+
+# Test: Network partition simulation
+test_network_partition() {
+    log_section "Test: Network Partition"
+
+    # Create a test collection first
+    local test_col="partition_test"
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+    sleep 1
+
+    api_call PUT "$BASE_URL:8081/vectordb/collections/$test_col" \
+        "{\"dimensions\": $DIMENSIONS, \"num_shards\": 3, \"replication_factor\": 2}" >/dev/null
+    sleep 3
+
+    # Add some documents
+    for i in {1..5}; do
+        local vector
+        vector=$(random_vector $DIMENSIONS)
+        api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/docs" \
+            "{\"id\": \"partition-doc-$i\", \"text\": \"Document $i for partition test\", \"metadata\": {}, \"vector\": $vector}" >/dev/null
+    done
+    sleep 2
+
+    log_info "Added 5 documents to test collection"
+
+    # Get node3's IP address
+    local node3_ip
+    node3_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vectordb-node3 2>/dev/null)
+
+    if [ -z "$node3_ip" ]; then
+        log_fail "Could not get node3 IP address"
+        api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+        return
+    fi
+
+    log_info "Node3 IP: $node3_ip"
+
+    # Block traffic from node1 and node2 to node3 (simulate partial partition)
+    log_info "Creating network partition (blocking node3)..."
+
+    # Block outgoing traffic to node3 from node1
+    docker exec vectordb-node1 tc qdisc add dev eth0 root handle 1: prio 2>/dev/null || true
+    docker exec vectordb-node1 tc filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip dst "$node3_ip" action drop 2>/dev/null || true
+
+    # Block outgoing traffic to node3 from node2
+    docker exec vectordb-node2 tc qdisc add dev eth0 root handle 1: prio 2>/dev/null || true
+    docker exec vectordb-node2 tc filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip dst "$node3_ip" action drop 2>/dev/null || true
+
+    sleep 15  # Wait for partition detection
+
+    # Test: Majority partition (nodes 1,2,4,5) should still work
+    local majority_result
+    majority_result=$(api_call GET "$BASE_URL:8081/vectordb/cluster/status")
+
+    if echo "$majority_result" | grep -q '"state"'; then
+        log_pass "Majority partition (node1) still responding"
+    else
+        log_info "Majority partition status: $majority_result"
+    fi
+
+    # Test: Write to majority partition
+    local vector
+    vector=$(random_vector $DIMENSIONS)
+    local write_result
+    write_result=$(api_call POST "$BASE_URL:8081/vectordb/collections/$test_col/docs" \
+        "{\"id\": \"during-partition\", \"text\": \"Written during partition\", \"metadata\": {}, \"vector\": $vector}")
+
+    if echo "$write_result" | grep -q '"status"'; then
+        log_pass "Writes work on majority partition"
+    else
+        log_info "Write during partition: $write_result"
+    fi
+
+    # Test: Search on majority partition
+    local search_result
+    search_result=$(api_call POST "$BASE_URL:8082/vectordb/collections/$test_col/search" \
+        "{\"vector\": $vector, \"k\": 3}")
+
+    local count
+    count=$(echo "$search_result" | jq '.results | length' 2>/dev/null || echo "0")
+
+    if [ "$count" -gt 0 ]; then
+        log_pass "Search works on majority partition ($count results)"
+    else
+        log_info "Search returned no results during partition"
+    fi
+
+    # Remove partition
+    log_info "Removing network partition..."
+    docker exec vectordb-node1 tc qdisc del dev eth0 root 2>/dev/null || true
+    docker exec vectordb-node2 tc qdisc del dev eth0 root 2>/dev/null || true
+
+    sleep 15  # Wait for recovery
+
+    # Verify cluster recovered
+    local nodes_after
+    nodes_after=$(api_call GET "$BASE_URL:8081/vectordb/cluster/nodes")
+    local node_count
+    node_count=$(echo "$nodes_after" | jq '.nodes | length' 2>/dev/null || echo "0")
+
+    if [ "$node_count" -ge 5 ]; then
+        log_pass "Cluster recovered after partition ($node_count nodes)"
+    else
+        log_info "Cluster has $node_count nodes after partition recovery"
+    fi
+
+    # Verify node3 can respond
+    local node3_status
+    node3_status=$(api_call GET "$BASE_URL:8083/vectordb/cluster/status")
+
+    if echo "$node3_status" | grep -q '"state"'; then
+        log_pass "Node3 recovered and responding"
+    else
+        log_info "Node3 status after recovery: $node3_status"
+    fi
+
+    # Cleanup
+    api_call DELETE "$BASE_URL:8081/vectordb/collections/$test_col" >/dev/null 2>&1 || true
+}
+
 # Cleanup
 cleanup() {
     log_section "Cleanup"
@@ -551,6 +860,9 @@ usage() {
     echo "  replication  - Verify replication factor works"
     echo "  concurrent   - Stress test with parallel writes"
     echo "  failover     - Test shard leader failover"
+    echo "  nodeadd      - Dynamically add node6 to cluster"
+    echo "  leave        - Test graceful node leave API"
+    echo "  partition    - Simulate network partition with tc"
     echo ""
     echo "Test Suites:"
     echo "  all        - Run basic tests"
@@ -577,6 +889,9 @@ main() {
         replication) test_replication ;;
         concurrent)  test_concurrent ;;
         failover)    test_leader_failover ;;
+        nodeadd)     test_node_addition ;;
+        leave)       test_graceful_leave ;;
+        partition)   test_network_partition ;;
         all)
             wait_for_cluster
             test_cluster_status
@@ -594,6 +909,8 @@ main() {
             test_replication
             test_concurrent
             test_leader_failover
+            test_node_addition
+            test_graceful_leave
             ;;
         cleanup)    cleanup ;;
         *)          usage ;;

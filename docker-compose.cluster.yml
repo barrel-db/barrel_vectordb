@@ -4,6 +4,8 @@ x-vectordb-common: &vectordb-common
   networks:
     - vectordb-net
   restart: unless-stopped
+  cap_add:
+    - NET_ADMIN
 
 services:
   # Seed node (first to start, creates cluster)
@@ -104,6 +106,25 @@ services:
       node3:
         condition: service_started
 
+  # Node 6 - dynamic node for testing node addition
+  # Only starts with: docker-compose --profile dynamic up node6
+  node6:
+    <<: *vectordb-common
+    container_name: vectordb-node6
+    hostname: node6
+    profiles:
+      - dynamic
+    environment:
+      RELEASE_COOKIE: barrel_vectordb_test_cluster
+      BARREL_NODE_NAME: barrel_vectordb@node6
+      BARREL_ENABLE_CLUSTER: "true"
+      BARREL_SEED_NODES: "'barrel_vectordb@node1'"
+      BARREL_HTTP_PORT: "8080"
+    ports:
+      - "8086:8080"
+    volumes:
+      - node6-data:/app/data
+
 networks:
   vectordb-net:
     driver: bridge
@@ -114,3 +135,4 @@ volumes:
   node3-data:
   node4-data:
   node5-data:
+  node6-data:
