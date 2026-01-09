@@ -720,8 +720,8 @@ is_clustered() ->
 %%
 %% @param Name Collection name (binary)
 %% @param Opts Collection options (dimensions, num_shards, replication_factor)
-%% @returns `ok' on success, `{error, Reason}' on failure
--spec create_collection(binary(), map()) -> ok | {error, term()}.
+%% @returns `{ok, Meta}' on success, `{error, Reason}' on failure
+-spec create_collection(binary(), map()) -> {ok, term()} | {error, term()}.
 create_collection(Name, Opts) when is_binary(Name) ->
     case is_clustered() of
         true ->

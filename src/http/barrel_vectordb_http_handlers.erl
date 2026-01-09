@@ -21,12 +21,10 @@ init(Req0, State) ->
 
 handle(list_collections, <<"GET">>, true, Req0, State) ->
     case barrel_vectordb:list_collections() of
-        {ok, Collections} when is_map(Collections) ->
+        {ok, Collections} ->
             %% Convert collection records to JSON-serializable maps
             JsonCollections = maps:map(fun(_, Meta) -> format_collection_meta(Meta) end, Collections),
             json_response(200, JsonCollections, Req0, State);
-        {ok, Collections} ->
-            json_response(200, Collections, Req0, State);
         {error, Reason} ->
             json_error(500, <<"error">>, format_error(Reason), Req0, State)
     end;

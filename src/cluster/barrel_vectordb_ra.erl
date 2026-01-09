@@ -16,7 +16,7 @@ start() ->
     start(#{}).
 
 start(Config) ->
-    ensure_ra_started(),
+    _ = ensure_ra_started(),
     DataDir = ra_data_dir(),
     logger:info("Ra data dir: ~p", [DataDir]),
     ok = filelib:ensure_dir(filename:join(DataDir, "dummy")),
@@ -44,7 +44,7 @@ start(Config) ->
 %% @doc Join an existing cluster via a seed node
 join(SeedNode) when is_atom(SeedNode) ->
     logger:info("join/1 called with SeedNode: ~p", [SeedNode]),
-    ensure_ra_started(),
+    _ = ensure_ra_started(),
     DataDir = ra_data_dir(),
     ok = filelib:ensure_dir(filename:join(DataDir, "dummy")),
 
@@ -115,7 +115,7 @@ leave() ->
     ServerId = server_id(),
     case ra:leave_and_terminate(?RA_SYSTEM, ServerId, ServerId) of
         ok -> ok;
-        {timeout, _} -> {error, timeout};
+        timeout -> {error, timeout};
         {error, Reason} -> {error, Reason}
     end.
 

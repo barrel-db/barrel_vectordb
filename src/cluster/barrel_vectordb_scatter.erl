@@ -55,7 +55,7 @@ embed_query(Query, EmbedderInfo) when is_map(EmbedderInfo) ->
         undefined ->
             {error, embedder_not_configured};
         Embedder ->
-            barrel_vectordb_embedder:embed(Query, Embedder)
+            barrel_vectordb_embed:embed(Query, Embedder)
     end;
 embed_query(_Query, _) ->
     {error, embedder_not_configured}.

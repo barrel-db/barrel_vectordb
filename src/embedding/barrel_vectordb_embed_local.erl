@@ -141,14 +141,14 @@ embed(Text, Config) ->
             {ok, Vector};
         {ok, [[]]} ->
             %% Python returned empty embedding - likely model issue
-            lager:error("Embedding returned empty vector for text: ~p", [Text]),
+            logger:error("Embedding returned empty vector for text: ~p", [Text]),
             {error, {empty_embedding, Text}};
         {ok, []} ->
             %% No embeddings returned
-            lager:error("No embeddings returned for text: ~p", [Text]),
+            logger:error("No embeddings returned for text: ~p", [Text]),
             {error, {no_embedding, Text}};
         {ok, Other} ->
-            lager:error("Unexpected embedding result: ~p for text: ~p", [Other, Text]),
+            logger:error("Unexpected embedding result: ~p for text: ~p", [Other, Text]),
             {error, {unexpected_embedding, Other}};
         {error, _} = Error ->
             Error

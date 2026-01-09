@@ -54,25 +54,20 @@ do_reshard(Collection, OldNumShards, NewNumShards, Dimension, RF) ->
             case create_new_shards(TempCollection, NewNumShards, Dimension, RF, NewPlacement) of
                 ok ->
                     %% Step 4: Migrate data
-                    case migrate_data(Collection, TempCollection, OldNumShards, NewNumShards) of
-                        {ok, MigratedCount} ->
-                            %% Step 5: Swap collections (update metadata to new shard count)
-                            case finalize_reshard(Collection, NewNumShards, NewPlacement) of
-                                ok ->
-                                    %% Step 6: Cleanup old shards and temp
-                                    cleanup_old_shards(Collection, OldNumShards),
-                                    cleanup_temp_shards(TempCollection, NewNumShards),
+                    {ok, MigratedCount} = migrate_data(Collection, TempCollection, OldNumShards, NewNumShards),
+                    %% Step 5: Swap collections (update metadata to new shard count)
+                    case finalize_reshard(Collection, NewNumShards, NewPlacement) of
+                        ok ->
+                            %% Step 6: Cleanup old shards and temp
+                            cleanup_old_shards(Collection, OldNumShards),
+                            cleanup_temp_shards(TempCollection, NewNumShards),
 
-                                    logger:info("Reshard complete: ~p documents migrated", [MigratedCount]),
-                                    {ok, #{
-                                        old_shards => OldNumShards,
-                                        new_shards => NewNumShards,
-                                        documents_migrated => MigratedCount
-                                    }};
-                                {error, _} = Error ->
-                                    cleanup_temp_shards(TempCollection, NewNumShards),
-                                    Error
-                            end;
+                            logger:info("Reshard complete: ~p documents migrated", [MigratedCount]),
+                            {ok, #{
+                                old_shards => OldNumShards,
+                                new_shards => NewNumShards,
+                                documents_migrated => MigratedCount
+                            }};
                         {error, _} = Error ->
                             cleanup_temp_shards(TempCollection, NewNumShards),
                             Error
@@ -176,17 +171,10 @@ migrate_shard(OldCollection, NewCollection, ShardIdx, NewNumShards) ->
 
 migrate_local_shard(StoreName, NewCollection, NewNumShards) ->
     %% Scan all documents and re-route to new shards
-    case barrel_vectordb:peek(StoreName, ?BATCH_SIZE) of
-        {ok, []} ->
-            {ok, 0};
-        {ok, Docs} ->
-            migrate_docs(Docs, NewCollection, NewNumShards, 0);
-        {error, _} = Error ->
-            Error
-    end.
+    %% peek/2 always returns {ok, [map()]} per spec
+    {ok, Docs} = barrel_vectordb:peek(StoreName, ?BATCH_SIZE),
+    migrate_docs(Docs, NewCollection, NewNumShards, 0).
 
-migrate_docs([], _NewCollection, _NewNumShards, Count) ->
-    {ok, Count};
 migrate_docs(Docs, NewCollection, NewNumShards, Count) ->
     %% Migrate each doc to the appropriate new shard
     NewCount = lists:foldl(

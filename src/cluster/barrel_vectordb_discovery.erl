@@ -104,14 +104,14 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(discover, State) ->
-    do_discover(State),
+    _ = do_discover(State),
     {noreply, maybe_schedule_discover(State)};
 
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, #state{discover_timer = Timer}) ->
-    case Timer of
+    _ = case Timer of
         undefined -> ok;
         Ref -> erlang:cancel_timer(Ref)
     end,

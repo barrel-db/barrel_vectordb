@@ -98,7 +98,7 @@ cluster_leave() ->
             %% Leave Ra cluster
             Result = barrel_vectordb_ra:leave(),
             %% Stop mesh supervisor
-            stop_mesh_sup(),
+            _ = stop_mesh_sup(),
             Result
     end.
 
@@ -218,8 +218,9 @@ stop_mesh_sup() ->
         undefined ->
             ok;
         _Pid ->
-            supervisor:terminate_child(barrel_vectordb_sup, barrel_vectordb_mesh_sup),
-            supervisor:delete_child(barrel_vectordb_sup, barrel_vectordb_mesh_sup)
+            _ = supervisor:terminate_child(barrel_vectordb_sup, barrel_vectordb_mesh_sup),
+            _ = supervisor:delete_child(barrel_vectordb_sup, barrel_vectordb_mesh_sup),
+            ok
     end.
 
 make_node_info() ->

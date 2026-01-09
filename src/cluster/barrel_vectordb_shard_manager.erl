@@ -283,7 +283,7 @@ create_shard_store(DataDir, CollectionName, ShardIdx, Dimension) ->
     StoreConfig = #{
         name => StoreName,
         path => StorePath,
-        dimension => Dimension
+        dimensions => Dimension
     },
 
     case barrel_vectordb:start_link(StoreConfig) of

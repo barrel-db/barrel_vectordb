@@ -156,7 +156,7 @@ terminate(_Reason, State) ->
 %% Internal functions
 
 notify_subscribers(Event, #state{subscribers = Subscribers}) ->
-    [Pid ! {health_event, Event} || Pid <- Subscribers],
+    _ = [Pid ! {health_event, Event} || Pid <- Subscribers],
     ok.
 
 handle_node_down(Node) ->

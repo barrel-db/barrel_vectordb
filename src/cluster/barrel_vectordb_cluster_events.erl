@@ -57,6 +57,6 @@ notify_subscribers(Event) ->
         {'EXIT', _} -> ok;
         [] -> ok;
         Members ->
-            [Pid ! {cluster_event, Event} || Pid <- Members],
+            _ = [Pid ! {cluster_event, Event} || Pid <- Members],
             ok
     end.
