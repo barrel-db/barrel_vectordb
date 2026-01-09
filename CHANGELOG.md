@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-01-09
+
+### Changed
+
+- **Remove jsx dependency**: Replace `jsx` library with Erlang's built-in `json` module (OTP 27+)
+  - `jsx:encode/1` → `iolist_to_binary(json:encode/1)`
+  - `jsx:decode/2` → `json:decode/1`
+
+### Fixed
+
+- Fix 49 dialyzer warnings across cluster and embedding modules:
+  - Add `aten`, `gen_batch_server` to plt_extra_apps
+  - Fix unmatched return values in Ra, cluster events, discovery, health, mesh modules
+  - Fix typo: `barrel_vectordb_embedder` → `barrel_vectordb_embed` in scatter module
+  - Fix key name: `dimension` → `dimensions` in shard_manager
+  - Fix unreachable patterns in http_handlers and reshard modules
+  - Replace `lager:error` with `logger:error` in embed_local
+  - Update `create_collection` spec to match Ra state machine return type
+
+### Added
+
+- Comprehensive test coverage for scatter module (19 new tests)
+  - Tests for `search/4`, `search_vector/3`, `search_local_shard/3`
+  - Tests for embedder configuration, local/remote shards, RPC handling
+  - Tests for result gathering, deduplication, and score ordering
+
 ## [1.2.5] - 2026-01-05
 
 ### Fixed
