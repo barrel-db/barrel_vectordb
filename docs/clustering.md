@@ -216,6 +216,157 @@ Cluster uses [aten](https://github.com/rabbitmq/aten) (via Ra) for fast failure 
 - Adaptive heartbeat intervals
 - Network partition handling
 
+## Dynamic Node Management
+
+### Adding Nodes
+
+New nodes can join an existing cluster at any time. The node will:
+
+1. Connect to seed nodes and join the Ra cluster
+2. Register itself in the cluster state machine
+3. Become available for shard placement
+
+```erlang
+%% New node joins via seed nodes
+{barrel_vectordb, [
+    {enable_cluster, true},
+    {cluster_options, #{
+        cluster_name => barrel_vectors,
+        seed_nodes => ['barrel@node1.example.com']
+    }}
+]}
+```
+
+When a node joins:
+
+- Existing shards are **not** automatically rebalanced
+- New collections will include the new node in shard placement
+- Use resharding to redistribute existing data
+
+### Graceful Leave
+
+Nodes can gracefully leave the cluster, allowing for proper shard handoff:
+
+```erlang
+%% Leave cluster gracefully
+barrel_vectordb:cluster_leave().
+```
+
+Or via HTTP API:
+
+```bash
+curl -X POST http://localhost:8080/vectordb/cluster/leave
+```
+
+When a node leaves gracefully:
+
+1. Node is removed from cluster membership
+2. Shard coordinator reassigns shards owned by the leaving node
+3. Data remains available via replicas during transition
+
+!!! warning "Data Availability"
+    Ensure replication_factor > 1 before removing nodes to prevent data loss.
+
+### Node Failure Handling
+
+When a node fails unexpectedly:
+
+1. **aten** detects failure within 1-5 seconds
+2. Shard coordinator promotes replicas to leaders
+3. New replicas are created to maintain replication factor
+
+## Resharding
+
+Resharding changes the number of shards for a collection. This is useful when:
+
+- Scaling out (more shards for better distribution)
+- Scaling in (fewer shards to reduce overhead)
+- Rebalancing after significant cluster changes
+
+### How Resharding Works
+
+```
+Original (2 shards)          After Reshard (4 shards)
+┌──────────┬──────────┐      ┌─────┬─────┬─────┬─────┐
+│ Shard 0  │ Shard 1  │  →   │ S0  │ S1  │ S2  │ S3  │
+│ 50% data │ 50% data │      │ 25% │ 25% │ 25% │ 25% │
+└──────────┴──────────┘      └─────┴─────┴─────┴─────┘
+```
+
+### Reshard via API
+
+```bash
+curl -X POST http://localhost:8080/vectordb/collections/my_collection/reshard \
+  -H "Content-Type: application/json" \
+  -d '{"num_shards": 4}'
+```
+
+**Response:**
+
+```json
+{
+  "status": "resharding",
+  "info": {
+    "old_shards": 2,
+    "new_shards": 4,
+    "documents_migrated": 1000
+  }
+}
+```
+
+### Reshard Process
+
+1. **Create temporary shards** with new shard count
+2. **Migrate documents** from old shards to new shards (batch processing)
+3. **Update metadata** in Ra state machine
+4. **Cleanup** old shards and temporary data
+
+!!! note "Online Operation"
+    Resharding is an online operation. The collection remains readable during the process, but writes may be briefly delayed during the final metadata swap.
+
+### Best Practices
+
+- Reshard during low-traffic periods for best performance
+- Monitor cluster health during resharding
+- Ensure sufficient disk space for temporary data (2x collection size)
+- Use replication_factor ≥ 2 for fault tolerance during reshard
+
+## Network Partitions
+
+Barrel VectorDB handles network partitions using Raft consensus:
+
+### Majority Partition
+
+The partition with majority of nodes continues operating:
+
+```
+┌─────────────────┐    PARTITION    ┌─────────────────┐
+│   Majority      │       ║        │    Minority     │
+│  (continues)    │       ║        │   (read-only)   │
+│                 │       ║        │                 │
+│ node1 ◄─────────╫───────╫────────│ node3           │
+│ node2           │       ║        │                 │
+│ node4           │       ║        │                 │
+│ node5           │       ║        │                 │
+└─────────────────┘       ║        └─────────────────┘
+```
+
+### Partition Behavior
+
+| Partition Type | Writes | Reads | Notes |
+|----------------|--------|-------|-------|
+| **Majority** | ✅ Yes | ✅ Yes | Full operation |
+| **Minority** | ❌ No | ⚠️ Stale | Can read local replicas |
+| **Equal split** | ❌ No | ⚠️ Stale | No quorum |
+
+### Recovery
+
+When the partition heals:
+
+1. Minority nodes reconnect to the cluster
+2. Ra syncs state from the leader
+3. Full operation resumes
+
 ## Architecture
 
 - **Ra/Raft**: Consensus for shard metadata and leader election

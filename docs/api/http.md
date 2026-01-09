@@ -232,6 +232,74 @@ GET /vectordb/cluster/nodes
 }
 ```
 
+#### Leave Cluster
+
+Gracefully remove the current node from the cluster.
+
+```
+POST /vectordb/cluster/leave
+```
+
+**Response:**
+
+```json
+{
+  "status": "leaving",
+  "node": "barrel@paris.enki.io"
+}
+```
+
+| Status | Error Code | Description |
+|--------|------------|-------------|
+| 200 | - | Node is leaving the cluster |
+| 400 | `not_member` | Node is not a cluster member |
+| 400 | `not_clustered` | Node is not in cluster mode |
+
+!!! warning "Irreversible"
+    Once a node leaves, it must rejoin as a new node with fresh data.
+
+### Collection Operations
+
+#### Reshard Collection
+
+Change the number of shards for a collection. Documents are automatically migrated.
+
+```
+POST /vectordb/collections/:collection/reshard
+```
+
+**Request Body:**
+
+```json
+{
+  "num_shards": 4
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "resharding",
+  "info": {
+    "old_shards": 2,
+    "new_shards": 4,
+    "documents_migrated": 1000
+  }
+}
+```
+
+| Status | Error Code | Description |
+|--------|------------|-------------|
+| 200 | - | Resharding completed successfully |
+| 400 | `bad_request` | Invalid or missing num_shards |
+| 400 | `same_shard_count` | New shard count equals current |
+| 400 | `not_clustered` | Only available in cluster mode |
+| 404 | `not_found` | Collection not found |
+
+!!! note "Duration"
+    Resharding duration depends on collection size. The collection remains readable during the operation.
+
 ## Error Responses
 
 All error responses have the format:

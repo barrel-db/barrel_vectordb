@@ -65,6 +65,7 @@ nav:
   - HTTP API: api/http.md
   - Development:
     - Contributing: development/contributing.md
+    - Cluster Testing: development/testing.md
 
 markdown_extensions:
   - pymdownx.highlight:
