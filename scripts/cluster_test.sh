@@ -190,7 +190,7 @@ test_search() {
 
     if [ "$count" -gt 0 ]; then
         log_pass "Search returned $count results via node3"
-        echo "$result" | jq -r '.results[] | "  - \(.id): score=\(.score)"' | head -3
+        echo "$result" | jq -r '.results[] | "  - \(.key): score=\(.score)"' | head -3
     else
         log_fail "Search returned no results"
     fi
