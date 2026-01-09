@@ -192,8 +192,8 @@ maybe_get_collection(false, Collection) ->
 
 maybe_create_collection(true, Collection, Body) ->
     Opts = #{
-        dimensions => maps:get(<<"dimensions">>, Body, 768),
-        num_shards => maps:get(<<"num_shards">>, Body, 4),
+        dimension => maps:get(<<"dimensions">>, Body, 768),
+        shards => maps:get(<<"num_shards">>, Body, 4),
         replication_factor => maps:get(<<"replication_factor">>, Body, 2)
     },
     barrel_vectordb:create_collection(Collection, Opts);

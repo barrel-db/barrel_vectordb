@@ -79,7 +79,8 @@ get_shard_info(Collection, DocId) ->
                 undefined ->
                     {error, collection_not_found};
                 CollectionMeta ->
-                    NumShards = element(2, CollectionMeta),  %% num_shards field
+                    %% collection_meta record: {collection_meta, name, dimension, num_shards, ...}
+                    NumShards = element(4, CollectionMeta),  %% num_shards is element 4
                     ShardIdx = barrel_vectordb_shard_locator:shard_for_key(DocId, NumShards),
                     ShardId = {Collection, ShardIdx},
 

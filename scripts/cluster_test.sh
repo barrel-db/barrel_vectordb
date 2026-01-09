@@ -19,11 +19,16 @@ log_fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 log_info() { echo -e "${YELLOW}► $1${NC}"; }
 log_section() { echo -e "\n${BLUE}=== $1 ===${NC}"; }
 
+# Counter for unique seeds
+SEED_COUNTER=0
+
 # Generate random vector using awk (no Python needed)
 random_vector() {
     local dim=$1
-    awk -v dim="$dim" 'BEGIN {
-        srand();
+    SEED_COUNTER=$((SEED_COUNTER + 1))
+    local seed=$(($(date +%s%N 2>/dev/null || echo $$) + SEED_COUNTER))
+    awk -v dim="$dim" -v seed="$seed" 'BEGIN {
+        srand(seed);
         printf "[";
         for (i = 1; i <= dim; i++) {
             printf "%.6f", rand();
@@ -33,13 +38,13 @@ random_vector() {
     }'
 }
 
-# API call helper
+# API call helper (returns response body, exits 0 even on HTTP errors)
 api_call() {
     local method=$1 url=$2 data=$3
     if [ -n "$data" ]; then
-        curl -sf -X "$method" -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null
+        curl -s -X "$method" -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null || true
     else
-        curl -sf -X "$method" "$url" 2>/dev/null
+        curl -s -X "$method" "$url" 2>/dev/null || true
     fi
 }
 

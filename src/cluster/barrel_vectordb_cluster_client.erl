@@ -10,6 +10,7 @@
 -export([create_collection/2, delete_collection/1]).
 -export([join_node/2, leave_node/1]).
 -export([get_nodes/0, get_collections/0, get_shards/0, get_shards/1]).
+-export([get_shard_placement/1]).
 
 -define(DEFAULT_TIMEOUT, 5000).
 
@@ -96,6 +97,25 @@ get_shards() ->
 %% @doc Get shard assignments for a specific collection
 get_shards(CollectionName) ->
     query(fun(State) -> get_collection_shards_from_state(State, CollectionName) end).
+
+%% @doc Get shard placement for a collection (format: [{ShardIdx, Leader, Replicas}, ...])
+get_shard_placement(CollectionName) ->
+    case get_shards(CollectionName) of
+        {ok, ShardsMap} ->
+            %% Convert shard_assignment records to placement tuples
+            %% shard_assignment: {shard_assignment, shard_id, leader, replicas, version}
+            Placements = maps:fold(
+                fun({_ColName, ShardIdx}, Assignment, Acc) ->
+                    Leader = element(3, Assignment),   %% leader field
+                    Replicas = element(4, Assignment), %% replicas field
+                    [{ShardIdx, Leader, Replicas} | Acc]
+                end,
+                [],
+                ShardsMap),
+            {ok, lists:sort(Placements)};
+        Error ->
+            Error
+    end.
 
 %% Internal functions
 
