@@ -127,8 +127,8 @@ apply(_Meta, {create_collection, Name, Config, Placement}, State) ->
                 State#cluster_state.shards,
                 Placement),
             NewState = State#cluster_state{collections = Collections, shards = Shards},
-            %% Effect to create local shards on each node
-            Effects = [{mod_call, barrel_vectordb_shard_manager, create_collection_shards, [Name, Meta, Placement]}],
+            %% Effect to broadcast shard creation to all relevant nodes
+            Effects = [{mod_call, barrel_vectordb_shard_manager, broadcast_create_shards, [Name, Meta, Placement]}],
             {NewState, {ok, Meta}, Effects}
     end;
 
@@ -150,7 +150,7 @@ apply(_Meta, {delete_collection, Name}, State) ->
                 fun({ColName, _ShardIdx}, _) -> ColName =/= Name end,
                 State#cluster_state.shards),
             NewState = State#cluster_state{collections = Collections, shards = Shards},
-            Effects = [{mod_call, barrel_vectordb_shard_manager, delete_collection_shards, [Name]}],
+            Effects = [{mod_call, barrel_vectordb_shard_manager, broadcast_delete_shards, [Name]}],
             {NewState, ok, Effects};
         error ->
             {State, {error, not_found}, []}

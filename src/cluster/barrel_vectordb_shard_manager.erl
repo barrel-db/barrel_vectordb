@@ -9,6 +9,7 @@
 
 -export([start_link/0]).
 -export([create_collection_shards/3, delete_collection_shards/1]).
+-export([broadcast_create_shards/3, broadcast_delete_shards/1]).
 -export([update_assignments/2, leader_changed/2]).
 -export([get_local_store/1, get_local_stores/1]).
 -export([is_local_shard/1, is_local_leader/1]).
@@ -58,6 +59,55 @@ is_local_shard(ShardId) ->
 %% @doc Check if we're the leader for a shard
 is_local_leader(ShardId) ->
     gen_server:call(?MODULE, {is_leader, ShardId}).
+
+%% @doc Broadcast shard creation to all relevant nodes (called from Ra leader)
+broadcast_create_shards(CollectionName, CollectionMeta, Placement) ->
+    %% First create local shards
+    create_collection_shards(CollectionName, CollectionMeta, Placement),
+    %% Then RPC to all other nodes that should have shards
+    LocalNode = node(),
+    TargetNodes = lists:usort([
+        Node || {_ShardIdx, {_, LeaderNode}, Replicas} <- Placement,
+                Node <- [LeaderNode | [N || {_, N} <- Replicas]],
+                Node =/= LocalNode
+    ]),
+    logger:info("Broadcasting shard creation for ~p to nodes: ~p", [CollectionName, TargetNodes]),
+    lists:foreach(
+        fun(Node) ->
+            spawn(fun() ->
+                case rpc:call(Node, ?MODULE, create_collection_shards,
+                              [CollectionName, CollectionMeta, Placement], 30000) of
+                    {badrpc, Reason} ->
+                        logger:warning("Failed to create shards on ~p: ~p", [Node, Reason]);
+                    ok ->
+                        logger:info("Created shards on ~p", [Node])
+                end
+            end)
+        end,
+        TargetNodes),
+    ok.
+
+%% @doc Broadcast shard deletion to all nodes (called from Ra leader)
+broadcast_delete_shards(CollectionName) ->
+    %% First delete local shards
+    delete_collection_shards(CollectionName),
+    %% Then RPC to all other nodes
+    LocalNode = node(),
+    case barrel_vectordb_cluster_client:get_nodes() of
+        {ok, NodesMap} ->
+            TargetNodes = [N || {_, N} <- maps:keys(NodesMap), N =/= LocalNode],
+            lists:foreach(
+                fun(Node) ->
+                    spawn(fun() ->
+                        rpc:call(Node, ?MODULE, delete_collection_shards,
+                                 [CollectionName], 30000)
+                    end)
+                end,
+                TargetNodes);
+        _ ->
+            ok
+    end,
+    ok.
 
 %% gen_server callbacks
 

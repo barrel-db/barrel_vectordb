@@ -67,7 +67,8 @@ get_all_shard_stores(Collection) ->
                 undefined ->
                     {error, collection_not_found};
                 CollectionMeta ->
-                    NumShards = element(2, CollectionMeta),
+                    %% collection_meta record: {collection_meta, name, dimension, num_shards, ...}
+                    NumShards = element(4, CollectionMeta),  %% num_shards is element 4
                     get_shard_stores(Collection, NumShards)
             end;
         {error, _} = Error ->
