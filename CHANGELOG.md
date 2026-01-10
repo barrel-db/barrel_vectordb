@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-01-10
+
+### Fixed
+
+- Fix cluster collection creation timeout with retry logic:
+  - Increase DEFAULT_TIMEOUT from 5000ms to 10000ms
+  - Add LONG_TIMEOUT (30000ms) for create_collection operations
+  - Add retry logic with exponential backoff for node registration
+  - Nodes now retry up to 5 times when registering in the Ra state machine
+  - Fixes bug where nodes join Ra Raft cluster but fail to register in application-level state machine
+
 ## [1.3.0] - 2026-01-09
 
 ### Changed
