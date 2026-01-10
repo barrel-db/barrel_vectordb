@@ -142,7 +142,7 @@ discover_from_seeds([]) ->
                 {ok, ServerId} ->
                     logger:info("Cluster bootstrapped successfully with ServerId: ~p", [ServerId]),
                     %% Register ourselves in the cluster state machine
-                    register_self_in_cluster(),
+                    _ = register_self_in_cluster(),
                     {ok, bootstrap};
                 {error, Reason} ->
                     logger:error("Failed to bootstrap cluster: ~p", [Reason]),
@@ -174,7 +174,7 @@ try_seeds([SeedNode | Rest]) ->
         {ok, ServerId} ->
             logger:info("Successfully joined cluster via ~p, ServerId: ~p", [SeedNode, ServerId]),
             %% Register ourselves in the cluster state machine
-            register_self_in_cluster(),
+            _ = register_self_in_cluster(),
             %% Register seed for health monitoring
             barrel_vectordb_health:register_node(SeedNode),
             {ok, SeedNode};
@@ -183,17 +183,37 @@ try_seeds([SeedNode | Rest]) ->
             try_seeds(Rest)
     end.
 
-%% @private Register this node in the cluster state machine
+%% @private Register this node in the cluster state machine with retry
 register_self_in_cluster() ->
+    register_self_in_cluster(5).
+
+register_self_in_cluster(0) ->
+    logger:error("Exhausted retries registering node in cluster"),
+    {error, max_retries_exceeded};
+register_self_in_cluster(Retries) ->
     NodeId = barrel_vectordb_mesh:node_id(),
     NodeInfo = barrel_vectordb_mesh:local_node(),
     case barrel_vectordb_cluster_client:join_node(NodeId, NodeInfo) of
         ok ->
-            logger:info("Registered node ~p in cluster", [NodeId]);
+            logger:info("Registered node ~p in cluster", [NodeId]),
+            ok;
         {ok, _, _} ->
-            logger:info("Registered node ~p in cluster", [NodeId]);
+            logger:info("Registered node ~p in cluster", [NodeId]),
+            ok;
+        {error, already_member} ->
+            %% Already registered, that's fine
+            logger:info("Node ~p already registered in cluster", [NodeId]),
+            ok;
+        {error, timeout} ->
+            %% Ra consensus might still be forming, retry with backoff
+            Delay = (6 - Retries) * 1000 + rand:uniform(500),
+            logger:info("Timeout registering node, retrying in ~pms (retries left: ~p)", [Delay, Retries - 1]),
+            timer:sleep(Delay),
+            register_self_in_cluster(Retries - 1);
         {error, Reason} ->
-            logger:warning("Failed to register node in cluster: ~p", [Reason])
+            logger:warning("Failed to register node in cluster: ~p, retrying", [Reason]),
+            timer:sleep(1000),
+            register_self_in_cluster(Retries - 1)
     end.
 
 discover_from_dns(#{domain := Domain} = Config) ->

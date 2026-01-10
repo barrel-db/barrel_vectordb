@@ -12,7 +12,8 @@
 -export([get_nodes/0, get_collections/0, get_shards/0, get_shards/1]).
 -export([get_shard_placement/1]).
 
--define(DEFAULT_TIMEOUT, 5000).
+-define(DEFAULT_TIMEOUT, 10000).
+-define(LONG_TIMEOUT, 30000).
 
 %% @doc Execute a command through Ra consensus
 command(Command) ->
@@ -63,7 +64,8 @@ create_collection(Name, Config) ->
     case get_active_nodes() of
         {ok, Nodes} when length(Nodes) >= RF ->
             Placement = calculate_placement(NumShards, RF, Nodes),
-            command({create_collection, Name, Config, Placement});
+            %% Use longer timeout for collection creation as it involves shard setup
+            command({create_collection, Name, Config, Placement}, ?LONG_TIMEOUT);
         {ok, Nodes} ->
             {error, {insufficient_nodes, length(Nodes), RF}};
         Error ->

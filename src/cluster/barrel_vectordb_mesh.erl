@@ -34,10 +34,8 @@ start_cluster(Config) ->
                     %% Start Ra cluster
                     case barrel_vectordb_ra:start(Config) of
                         {ok, ServerId} ->
-                            %% Register ourselves in the cluster
-                            NodeId = node_id(),
-                            NodeInfo = make_node_info(),
-                            barrel_vectordb_cluster_client:join_node(NodeId, NodeInfo),
+                            %% Register ourselves in the cluster with retry
+                            _ = register_self_with_retry(5),
                             {ok, ServerId};
                         Error ->
                             Error
@@ -64,10 +62,8 @@ cluster_join(SeedNode) when is_atom(SeedNode) ->
                             %% Join Ra cluster
                             case barrel_vectordb_ra:join(SeedNode) of
                                 {ok, _ServerId} ->
-                                    %% Register ourselves
-                                    NodeId = node_id(),
-                                    NodeInfo = make_node_info(),
-                                    barrel_vectordb_cluster_client:join_node(NodeId, NodeInfo),
+                                    %% Register ourselves with retry
+                                    _ = register_self_with_retry(5),
                                     %% Register seed for health monitoring
                                     barrel_vectordb_health:register_node(SeedNode),
                                     ok;
@@ -248,4 +244,32 @@ try_join_seeds([Seed | Rest]) ->
     case cluster_join(Seed) of
         ok -> ok;
         {error, _} -> try_join_seeds(Rest)
+    end.
+
+%% @private Register this node in cluster state machine with retry
+register_self_with_retry(0) ->
+    logger:error("Exhausted retries registering node in cluster"),
+    {error, max_retries_exceeded};
+register_self_with_retry(Retries) ->
+    NodeId = node_id(),
+    NodeInfo = make_node_info(),
+    case barrel_vectordb_cluster_client:join_node(NodeId, NodeInfo) of
+        ok ->
+            logger:info("Registered node ~p in cluster", [NodeId]),
+            ok;
+        {ok, _, _} ->
+            logger:info("Registered node ~p in cluster", [NodeId]),
+            ok;
+        {error, already_member} ->
+            logger:info("Node ~p already registered in cluster", [NodeId]),
+            ok;
+        {error, timeout} ->
+            Delay = (6 - Retries) * 1000 + rand:uniform(500),
+            logger:info("Timeout registering node, retrying in ~pms (retries left: ~p)", [Delay, Retries - 1]),
+            timer:sleep(Delay),
+            register_self_with_retry(Retries - 1);
+        {error, Reason} ->
+            logger:warning("Failed to register node: ~p, retrying", [Reason]),
+            timer:sleep(1000),
+            register_self_with_retry(Retries - 1)
     end.
