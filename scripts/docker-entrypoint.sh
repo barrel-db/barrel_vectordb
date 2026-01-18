@@ -57,6 +57,12 @@ if [ "${BARREL_ENABLE_CLUSTER}" = "true" ]; then
     log_info "  Replication factor: ${BARREL_REPLICATION_FACTOR:-1}"
 fi
 
+if [ "${BARREL_GATEWAY_ENABLED}" = "true" ]; then
+    log_info "  Gateway enabled: true"
+    log_info "  Gateway port: ${BARREL_GATEWAY_PORT:-8080}"
+    log_info "  Gateway default RPM: ${BARREL_GATEWAY_DEFAULT_RPM:-100}"
+fi
+
 # Parse HTTP bind IP
 HTTP_IP="${BARREL_HTTP_IP:-0.0.0.0}"
 if [[ "$HTTP_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -114,6 +120,27 @@ if [ -n "$BARREL_EMBEDDER_PROVIDER" ]; then
     fi
 fi
 
+# Build Gateway configuration if enabled
+GATEWAY_CONFIG=""
+if [ "${BARREL_GATEWAY_ENABLED:-false}" = "true" ]; then
+    if [ -z "$BARREL_GATEWAY_MASTER_KEY" ]; then
+        log_error "BARREL_GATEWAY_MASTER_KEY is required when gateway is enabled"
+        exit 1
+    fi
+    GATEWAY_CONFIG="        {gateway, #{
+            enabled => true,
+            port => ${BARREL_GATEWAY_PORT:-8080},
+            master_api_key => <<\"${BARREL_GATEWAY_MASTER_KEY}\">>,
+            system_db_path => \"${BARREL_DATA_PATH:-/app/data}/system\",
+            default_rate_limit => ${BARREL_GATEWAY_DEFAULT_RPM:-100},
+            default_quotas => #{
+                max_storage_mb => ${BARREL_GATEWAY_MAX_STORAGE_MB:-1024},
+                max_vectors => ${BARREL_GATEWAY_MAX_VECTORS:-100000},
+                max_collections => ${BARREL_GATEWAY_MAX_COLLECTIONS:-10}
+            }
+        }},"
+fi
+
 # Build Prometheus configuration if enabled
 PROMETHEUS_CONFIG=""
 if [ "${BARREL_PROMETHEUS_ENABLED:-false}" = "true" ]; then
@@ -130,6 +157,7 @@ cat > "${RELEASE_DIR}sys.config" << EOF
         {path, "${BARREL_DATA_PATH:-/app/data}"},
         {enable_cluster, ${BARREL_ENABLE_CLUSTER:-false}},
 $EMBEDDER_CONFIG
+$GATEWAY_CONFIG
         {cluster_options, #{
             cluster_name => '${BARREL_CLUSTER_NAME:-barrel_vectordb}',
             seed_nodes => [${BARREL_SEED_NODES:-}],

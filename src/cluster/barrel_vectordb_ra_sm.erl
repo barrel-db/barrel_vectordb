@@ -234,6 +234,31 @@ apply(_Meta, {reshard_finalize, Name, NewNumShards, NewPlacement}, State) ->
             {NewState, ok, Effects}
     end;
 
+%%====================================================================
+%% Gateway commands - write to local system RocksDB on each node
+%%====================================================================
+
+%% Create an API key - writes to local system RocksDB
+apply(_Meta, {gateway_create_key, KeyRecord}, State) ->
+    %% Write to local system DB (side effect applied on all nodes)
+    Result = barrel_vectordb_system_db:put_key(KeyRecord),
+    {State, Result, []};
+
+%% Delete an API key
+apply(_Meta, {gateway_delete_key, ApiKey}, State) ->
+    Result = barrel_vectordb_system_db:delete_key(ApiKey),
+    {State, Result, []};
+
+%% Initialize quota for a tenant
+apply(_Meta, {gateway_init_quota, TenantId}, State) ->
+    Result = barrel_vectordb_system_db:init_quota(TenantId),
+    {State, Result, []};
+
+%% Update tenant quota (increment/decrement counters)
+apply(_Meta, {gateway_update_quota, TenantId, Op}, State) ->
+    Result = barrel_vectordb_system_db:update_quota(TenantId, Op),
+    {State, Result, []};
+
 %% Catch-all
 apply(_Meta, _Command, State) ->
     {State, {error, unknown_command}, []}.

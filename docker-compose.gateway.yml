@@ -1,0 +1,71 @@
+# Docker Compose for testing barrel_vectordb multi-tenant gateway
+#
+# Usage:
+#   docker-compose -f docker-compose.gateway.yml up --build
+#
+# Environment variables:
+#   GATEWAY_MASTER_KEY - Master API key (default: test-master-key)
+#
+# Test with:
+#   ./scripts/test-gateway.sh
+
+services:
+  # Standalone node with gateway enabled
+  gateway:
+    build: .
+    image: barrel-vectordb:latest
+    container_name: vectordb-gateway
+    hostname: gateway
+    environment:
+      RELEASE_COOKIE: barrel_vectordb_gateway_test
+      BARREL_NODE_NAME: barrel_vectordb@gateway
+      BARREL_ENABLE_CLUSTER: "false"
+      BARREL_HTTP_PORT: "8080"
+      BARREL_GATEWAY_ENABLED: "true"
+      BARREL_GATEWAY_PORT: "8080"
+      BARREL_GATEWAY_MASTER_KEY: "${GATEWAY_MASTER_KEY:-test-master-key}"
+      BARREL_GATEWAY_DEFAULT_RPM: "100"
+      BARREL_GATEWAY_MAX_VECTORS: "100000"
+      BARREL_GATEWAY_MAX_COLLECTIONS: "10"
+      BARREL_GATEWAY_MAX_STORAGE_MB: "1024"
+      BARREL_LOG_LEVEL: "info"
+      # Use Ollama for embeddings (optional)
+      BARREL_EMBEDDER_PROVIDER: "${BARREL_EMBEDDER_PROVIDER:-}"
+      BARREL_EMBEDDER_MODEL: "${BARREL_EMBEDDER_MODEL:-}"
+      BARREL_EMBEDDER_URL: "${BARREL_EMBEDDER_URL:-http://ollama:11434}"
+    ports:
+      - "8090:8080"
+    volumes:
+      - gateway-data:/app/data
+    networks:
+      - gateway-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-H", "X-Api-Key: ${GATEWAY_MASTER_KEY:-test-master-key}", "http://localhost:8080/v1/collections"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Optional: Ollama for local embeddings
+  ollama:
+    image: ollama/ollama:latest
+    container_name: vectordb-ollama
+    hostname: ollama
+    profiles:
+      - embeddings
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+networks:
+  gateway-net:
+    driver: bridge
+
+volumes:
+  gateway-data:
+  ollama-data:
