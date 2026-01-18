@@ -661,6 +661,44 @@ rebar3 as bench_faiss shell
 barrel_vectordb_backend_bench:run_all().
 ```
 
+## Multi-Tenant Gateway
+
+barrel_vectordb includes an optional HTTP gateway for multi-tenant deployments with:
+
+- **Tenant Isolation**: Each tenant's data is transparently prefixed and isolated
+- **API Key Authentication**: Secure API keys for tenant identification
+- **Rate Limiting**: Configurable requests-per-minute limits per tenant
+- **Quota Enforcement**: Limits on vectors, collections, and storage per tenant
+
+```erlang
+{barrel_vectordb, [
+    {gateway, #{
+        enabled => true,
+        port => 8080,
+        master_api_key => <<"secret">>,
+        default_rate_limit => 100,
+        default_quotas => #{
+            max_vectors => 100000,
+            max_collections => 10,
+            max_storage_mb => 1024
+        }
+    }}
+]}.
+```
+
+```bash
+# Create tenant
+curl -X POST http://localhost:8080/admin/tenants \
+  -H "X-Api-Key: secret" \
+  -d '{"tenant_id": "acme"}'
+
+# Use tenant API
+curl http://localhost:8080/v1/collections \
+  -H "X-Api-Key: bvdb_tenant_key..."
+```
+
+See [docs/gateway.md](docs/gateway.md) for full documentation.
+
 ## Architecture
 
 - **Storage**: RocksDB with column families

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-Tenant HTTP Gateway**: REST API with complete multi-tenancy support
+  - Tenant isolation via API key authentication (`X-Api-Key` header)
+  - Transparent collection name prefixing (`{hash}_{tenant}_{collection}`)
+  - Token bucket rate limiting per tenant (configurable RPM)
+  - Quota enforcement for vectors, collections, and storage per tenant
+  - Backend abstraction supporting both standalone and clustered deployments
+  - Admin endpoints for tenant management, API key rotation, and usage monitoring
+  - New modules: `barrel_vectordb_gateway`, `barrel_vectordb_gateway_keys`,
+    `barrel_vectordb_gateway_quotas`, `barrel_vectordb_gateway_rate`,
+    `barrel_vectordb_gateway_stores`, `barrel_vectordb_system_db`
+  - Docker support with `docker-compose.gateway.yml` and environment variables
+  - See [Gateway Documentation](docs/gateway.md) for full details
+
 ## [1.3.1] - 2026-01-10
 
 ### Fixed
