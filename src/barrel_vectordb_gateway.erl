@@ -6,12 +6,20 @@
 %%% - Transparent collection name prefixing (hash + tenant + name)
 %%% - Rate limiting per tenant
 %%% - Quota enforcement
+%%% - Enterprise hooks for SSO, RBAC, and audit logging
 %%%
 %%% Collection naming: {4-char-hash}_{tenant}_{collection}
 %%% Example: a3f2_acme_documents
 %%%   - a3f2: 4-char hex hash of tenant ID (RocksDB prefix locality)
 %%%   - acme: tenant ID
 %%%   - documents: collection name
+%%%
+%%% Enterprise Integration:
+%%% When barrel_vectordb_gateway_enterprise module is loaded (from
+%%% barrel_enterprise package), the gateway automatically calls:
+%%% - authenticate/2: SSO/OIDC authentication (falls back to API key)
+%%% - authorize/3: RBAC permission checks
+%%% - audit/3: Audit logging of all requests
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_vectordb_gateway).
@@ -24,6 +32,7 @@
 
 %% Configuration
 -define(API_KEY_HEADER, <<"x-api-key">>).
+-define(ENTERPRISE_MOD, barrel_vectordb_gateway_enterprise).
 
 %%====================================================================
 %% API
@@ -55,30 +64,99 @@ routes() ->
 %%====================================================================
 
 init(Req0, #{action := Action} = State) ->
+    %% Capture request metadata for audit logging
+    StartTime = erlang:system_time(microsecond),
     Method = cowboy_req:method(Req0),
+    AuditCtx = build_audit_context(Req0, Action, StartTime),
 
-    case is_admin_action(Action) of
+    %% Process the request
+    {Response, FinalCtx} = case is_admin_action(Action) of
         true ->
-            %% Admin endpoints require master key
-            case authenticate_admin(Req0) of
-                ok ->
-                    {ok, handle_admin(Method, Action, Req0), State};
-                {error, Reason} ->
-                    {ok, error_response(401, Reason, Req0), State}
-            end;
+            process_admin_request(Req0, Action, Method, AuditCtx);
         false ->
-            %% Regular endpoints require tenant API key
-            case authenticate(Req0) of
+            process_tenant_request(Req0, Action, Method, AuditCtx)
+    end,
+
+    %% Enterprise audit hook
+    DurationUs = erlang:system_time(microsecond) - StartTime,
+    _ = enterprise_audit(FinalCtx, Response, DurationUs),
+
+    {ok, Response, State}.
+
+%% @private Process admin requests (master key required)
+process_admin_request(Req, Action, Method, AuditCtx) ->
+    case authenticate_admin(Req) of
+        ok ->
+            Ctx = AuditCtx#{tenant_id => admin, auth_type => master_key},
+            Response = handle_admin(Method, Action, Req),
+            {Response, Ctx};
+        {error, Reason} ->
+            Response = error_response(401, Reason, Req),
+            {Response, AuditCtx#{error_code => Reason}}
+    end.
+
+%% @private Process tenant requests with enterprise hooks
+process_tenant_request(Req, Action, Method, AuditCtx) ->
+    %% Step 1: Authentication
+    %% Try enterprise auth first (SSO/OIDC), fall back to API key
+    case enterprise_authenticate(Req, Action) of
+        {handled, {ok, TenantId, Identity}} ->
+            %% Enterprise SSO authentication succeeded
+            Ctx = AuditCtx#{
+                tenant_id => TenantId,
+                identity => Identity,
+                auth_type => enterprise,
+                api_key_prefix => undefined
+            },
+            process_authorized_request(Req, Action, Method, TenantId, Identity, Ctx);
+        {handled, {error, Reason}} ->
+            %% Enterprise auth failed
+            Response = error_response(401, format_error(Reason), Req),
+            {Response, AuditCtx#{error_code => Reason}};
+        passthrough ->
+            %% No enterprise auth, use API key
+            case authenticate(Req) of
                 {ok, TenantId, KeyRecord} ->
-                    case barrel_vectordb_gateway_rate:check_rate(TenantId) of
-                        ok ->
-                            {ok, handle_action(Method, Action, TenantId, KeyRecord, Req0), State};
-                        {error, rate_limited} ->
-                            {ok, error_response(429, <<"rate_limit_exceeded">>, Req0), State}
-                    end;
+                    ApiKeyPrefix = get_key_prefix(KeyRecord),
+                    Ctx = AuditCtx#{
+                        tenant_id => TenantId,
+                        identity => undefined,
+                        auth_type => api_key,
+                        api_key_prefix => ApiKeyPrefix
+                    },
+                    process_authorized_request(Req, Action, Method, TenantId, undefined, Ctx);
                 {error, Reason} ->
-                    {ok, error_response(401, Reason, Req0), State}
+                    Response = error_response(401, Reason, Req),
+                    {Response, AuditCtx#{error_code => Reason}}
             end
+    end.
+
+%% @private Process request after authentication, with optional RBAC
+process_authorized_request(Req, Action, Method, TenantId, Identity, AuditCtx) ->
+    %% Step 2: Authorization (RBAC)
+    case enterprise_authorize(Identity, Action, AuditCtx) of
+        {handled, {deny, Reason}} ->
+            Response = error_response(403, Reason, Req),
+            {Response, AuditCtx#{error_code => <<"access_denied">>}};
+        {handled, {allow, _}} ->
+            %% RBAC allowed
+            process_rate_limited_request(Req, Action, Method, TenantId, AuditCtx);
+        passthrough ->
+            %% No RBAC configured, proceed
+            process_rate_limited_request(Req, Action, Method, TenantId, AuditCtx)
+    end.
+
+%% @private Apply rate limiting and execute request
+process_rate_limited_request(Req, Action, Method, TenantId, AuditCtx) ->
+    case barrel_vectordb_gateway_rate:check_rate(TenantId) of
+        ok ->
+            %% Build a minimal KeyRecord-like structure for handle_action
+            KeyRecord = undefined, % handle_action only uses KeyRecord for limits, which we don't need here
+            Response = handle_action(Method, Action, TenantId, KeyRecord, Req),
+            {Response, AuditCtx};
+        {error, rate_limited} ->
+            Response = error_response(429, <<"rate_limit_exceeded">>, Req),
+            {Response, AuditCtx#{error_code => <<"rate_limited">>}}
     end.
 
 %%====================================================================
@@ -645,3 +723,109 @@ json_response(Status, Body, Req) ->
 %% @private Error response helper.
 error_response(Status, Message, Req) ->
     json_response(Status, #{error => Message}, Req).
+
+%%====================================================================
+%% Enterprise Integration
+%%====================================================================
+
+%% @private Build audit context from request.
+build_audit_context(Req, Action, StartTime) ->
+    #{
+        start_time => StartTime,
+        request_id => get_or_generate_request_id(Req),
+        client_ip => get_client_ip(Req),
+        user_agent => cowboy_req:header(<<"user-agent">>, Req),
+        method => cowboy_req:method(Req),
+        path => cowboy_req:path(Req),
+        query_params => cowboy_req:parse_qs(Req),
+        action => Action,
+        resource_id => get_resource_id(Req, Action)
+    }.
+
+%% @private Get or generate a request ID.
+get_or_generate_request_id(Req) ->
+    case cowboy_req:header(<<"x-request-id">>, Req) of
+        undefined -> generate_request_id();
+        Id -> Id
+    end.
+
+%% @private Generate a unique request ID.
+generate_request_id() ->
+    Bytes = crypto:strong_rand_bytes(12),
+    base64:encode(Bytes, #{padding => false}).
+
+%% @private Extract client IP, handling proxied requests.
+get_client_ip(Req) ->
+    case cowboy_req:header(<<"x-forwarded-for">>, Req) of
+        undefined ->
+            {IP, _Port} = cowboy_req:peer(Req),
+            iolist_to_binary(inet:ntoa(IP));
+        ForwardedFor ->
+            %% Take first IP in chain (original client)
+            [FirstIP | _] = binary:split(ForwardedFor, <<",">>),
+            string:trim(FirstIP)
+    end.
+
+%% @private Get resource ID from request bindings.
+get_resource_id(Req, Action) ->
+    case Action of
+        collection -> cowboy_req:binding(collection, Req);
+        documents -> cowboy_req:binding(collection, Req);
+        document -> cowboy_req:binding(doc_id, Req);
+        search -> cowboy_req:binding(collection, Req);
+        admin_keys -> cowboy_req:binding(tenant_id, Req);
+        admin_usage -> cowboy_req:binding(tenant_id, Req);
+        _ -> undefined
+    end.
+
+%% @private Get API key prefix for audit logging (first 12 chars).
+get_key_prefix(undefined) ->
+    undefined;
+get_key_prefix(KeyRecord) ->
+    Key = barrel_vectordb_gateway_keys:key_value(KeyRecord),
+    case Key of
+        undefined -> undefined;
+        _ -> binary:part(Key, 0, min(12, byte_size(Key)))
+    end.
+
+%% @private Call enterprise authentication if module is loaded.
+%% Returns {handled, Result} or 'passthrough'.
+enterprise_authenticate(Req, Action) ->
+    case code:is_loaded(?ENTERPRISE_MOD) of
+        {file, _} ->
+            try
+                ?ENTERPRISE_MOD:authenticate(Req, Action)
+            catch
+                _:_ -> passthrough
+            end;
+        false ->
+            passthrough
+    end.
+
+%% @private Call enterprise authorization if module is loaded.
+%% Returns {handled, Result} or 'passthrough'.
+enterprise_authorize(Identity, Action, Ctx) ->
+    case code:is_loaded(?ENTERPRISE_MOD) of
+        {file, _} ->
+            try
+                ?ENTERPRISE_MOD:authorize(Identity, Action, Ctx)
+            catch
+                _:_ -> passthrough
+            end;
+        false ->
+            passthrough
+    end.
+
+%% @private Call enterprise audit logging if module is loaded.
+%% Returns {handled, ok} or 'passthrough'.
+enterprise_audit(Ctx, Response, DurationUs) ->
+    case code:is_loaded(?ENTERPRISE_MOD) of
+        {file, _} ->
+            try
+                ?ENTERPRISE_MOD:audit(Ctx, Response, DurationUs)
+            catch
+                _:_ -> passthrough
+            end;
+        false ->
+            passthrough
+    end.

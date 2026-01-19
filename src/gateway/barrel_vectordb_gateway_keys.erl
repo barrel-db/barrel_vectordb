@@ -13,7 +13,7 @@
 -export([get_tenant_limits/1]).
 
 %% Key record accessors
--export([key_id/1, key_tenant_id/1, key_rpm_limit/1,
+-export([key_id/1, key_value/1, key_tenant_id/1, key_rpm_limit/1,
          key_max_storage_mb/1, key_max_vectors/1, key_max_collections/1]).
 
 %% Types
@@ -141,6 +141,7 @@ get_tenant_limits(TenantId) when is_binary(TenantId) ->
 %%                 max_storage_mb, max_vectors, max_collections}
 
 key_id(Record) -> element(2, Record).
+key_value(Record) -> element(2, Record).  % Alias for key_id, used for audit logging
 key_tenant_id(Record) -> element(3, Record).
 key_created_at(Record) -> element(4, Record).
 key_rpm_limit(Record) -> element(5, Record).
