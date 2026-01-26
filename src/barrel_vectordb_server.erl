@@ -19,6 +19,10 @@
 
 -include("barrel_vectordb.hrl").
 
+%% Long timeout for operations that may take a while (1 hour in ms)
+%% Using explicit value instead of infinity for gen_batch_server compatibility
+-define(LONG_TIMEOUT, 3600000).
+
 %% API
 -export([
     start_link/2,
@@ -95,24 +99,24 @@ stop(Store) ->
 %% @doc Add document with auto-embedding.
 -spec add(atom() | pid(), binary(), binary(), map()) -> ok | {error, term()}.
 add(Store, Id, Text, Metadata) ->
-    gen_batch_server:call(Store, {add, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {add, Id, Text, Metadata}, ?LONG_TIMEOUT).
 
 %% @doc Add document with explicit vector.
 -spec add_vector(atom() | pid(), binary(), binary(), map(), [float()]) -> ok | {error, term()}.
 add_vector(Store, Id, Text, Metadata, Vector) ->
-    gen_batch_server:call(Store, {add_vector, Id, Text, Metadata, Vector}, infinity).
+    gen_batch_server:call(Store, {add_vector, Id, Text, Metadata, Vector}, ?LONG_TIMEOUT).
 
 %% @doc Add multiple documents.
 -spec add_batch(atom() | pid(), [{binary(), binary(), map()}]) ->
     {ok, #{inserted := non_neg_integer()}} | {error, term()}.
 add_batch(Store, Docs) ->
-    gen_batch_server:call(Store, {add_batch, Docs}, infinity).
+    gen_batch_server:call(Store, {add_batch, Docs}, ?LONG_TIMEOUT).
 
 %% @doc Add multiple documents with pre-computed vectors (bulk insert).
 -spec add_vector_batch(atom() | pid(), [{binary(), binary(), map(), [float()]}]) ->
     {ok, #{inserted := non_neg_integer()}} | {error, term()}.
 add_vector_batch(Store, Docs) ->
-    gen_batch_server:call(Store, {add_vector_batch, Docs}, infinity).
+    gen_batch_server:call(Store, {add_vector_batch, Docs}, ?LONG_TIMEOUT).
 
 %% @doc Get document by ID.
 -spec get(atom() | pid(), binary()) -> {ok, map()} | not_found | {error, term()}.
@@ -122,12 +126,12 @@ get(Store, Id) ->
 %% @doc Update document metadata (re-embeds the text).
 -spec update(atom() | pid(), binary(), binary(), map()) -> ok | not_found | {error, term()}.
 update(Store, Id, Text, Metadata) ->
-    gen_batch_server:call(Store, {update, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {update, Id, Text, Metadata}, ?LONG_TIMEOUT).
 
 %% @doc Insert or update document.
 -spec upsert(atom() | pid(), binary(), binary(), map()) -> ok | {error, term()}.
 upsert(Store, Id, Text, Metadata) ->
-    gen_batch_server:call(Store, {upsert, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {upsert, Id, Text, Metadata}, ?LONG_TIMEOUT).
 
 %% @doc Delete document.
 -spec delete(atom() | pid(), binary()) -> ok | {error, term()}.
@@ -142,22 +146,22 @@ peek(Store, Limit) ->
 %% @doc Search with text query.
 -spec search(atom() | pid(), binary(), map()) -> {ok, [map()]} | {error, term()}.
 search(Store, Query, Opts) ->
-    gen_batch_server:call(Store, {search, Query, Opts}, infinity).
+    gen_batch_server:call(Store, {search, Query, Opts}, ?LONG_TIMEOUT).
 
 %% @doc Search with vector query.
 -spec search_vector(atom() | pid(), [float()], map()) -> {ok, [map()]} | {error, term()}.
 search_vector(Store, Vector, Opts) ->
-    gen_batch_server:call(Store, {search_vector, Vector, Opts}, infinity).
+    gen_batch_server:call(Store, {search_vector, Vector, Opts}, ?LONG_TIMEOUT).
 
 %% @doc Embed single text.
 -spec embed(atom() | pid(), binary()) -> {ok, [float()]} | {error, term()}.
 embed(Store, Text) ->
-    gen_batch_server:call(Store, {embed, Text}, infinity).
+    gen_batch_server:call(Store, {embed, Text}, ?LONG_TIMEOUT).
 
 %% @doc Embed multiple texts.
 -spec embed_batch(atom() | pid(), [binary()]) -> {ok, [[float()]]} | {error, term()}.
 embed_batch(Store, Texts) ->
-    gen_batch_server:call(Store, {embed_batch, Texts}, infinity).
+    gen_batch_server:call(Store, {embed_batch, Texts}, ?LONG_TIMEOUT).
 
 %% @doc Get store statistics.
 -spec stats(atom() | pid()) -> {ok, map()}.
