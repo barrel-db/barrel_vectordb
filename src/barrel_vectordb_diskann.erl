@@ -32,6 +32,7 @@
     info/1,
     get_vector/2,
     consolidate_deletes/1,
+    needs_consolidation/1,
     %% Persistence API
     open/1,
     close/1,
@@ -1029,7 +1030,19 @@ insert_batch_memory(Index0, Vectors, _Opts) ->
 
 %% @doc Lazy delete - marks node as deleted
 -spec delete(diskann_index(), binary()) -> {ok, diskann_index()}.
+delete(#diskann_index{storage_mode = disk} = Index, Id) ->
+    %% Disk mode: need to update both string and int deleted sets
+    NewDeletedStr = sets:add_element(Id, Index#diskann_index.deleted_set),
+    case string_id_to_int(Index, Id) of
+        {ok, IntId} ->
+            NewDeletedInt = sets:add_element(IntId, Index#diskann_index.deleted_int_set),
+            {ok, Index#diskann_index{deleted_set = NewDeletedStr, deleted_int_set = NewDeletedInt}};
+        not_found ->
+            %% ID not found, just update string set
+            {ok, Index#diskann_index{deleted_set = NewDeletedStr}}
+    end;
 delete(Index, Id) ->
+    %% Memory mode: only string set needed
     NewDeleted = sets:add_element(Id, Index#diskann_index.deleted_set),
     {ok, Index#diskann_index{deleted_set = NewDeleted}}.
 
@@ -1308,10 +1321,24 @@ get_vector(#diskann_index{storage_mode = disk} = Index, StringId) ->
             not_found
     end.
 
+%% @doc Check if consolidation is needed (threshold-based)
+%% Returns true if deleted count exceeds 10% of active size
+-spec needs_consolidation(diskann_index()) -> boolean().
+needs_consolidation(#diskann_index{storage_mode = memory, deleted_set = DeletedSet, size = Size}) ->
+    DeletedCount = sets:size(DeletedSet),
+    ActiveSize = Size - DeletedCount,
+    ActiveSize > 0 andalso DeletedCount > ActiveSize div 10;
+needs_consolidation(#diskann_index{storage_mode = disk, deleted_int_set = DeletedIntSet, size = Size}) ->
+    DeletedCount = sets:size(DeletedIntSet),
+    ActiveSize = Size - DeletedCount,
+    ActiveSize > 0 andalso DeletedCount > ActiveSize div 10.
+
 %% @doc Consolidate deleted nodes (batch cleanup)
 %% This repairs the graph by removing edges to deleted nodes
 %% and adding new edges to maintain navigability
 -spec consolidate_deletes(diskann_index()) -> {ok, diskann_index()}.
+consolidate_deletes(#diskann_index{storage_mode = disk} = Index) ->
+    consolidate_deletes_disk(Index);
 consolidate_deletes(#diskann_index{deleted_set = DeletedSet, config = Config,
                                    nodes = Nodes, vectors = Vectors} = Index) ->
     case sets:size(DeletedSet) of
@@ -1388,6 +1415,145 @@ consolidate_deletes_impl(Index, DeletedSet, Config, Nodes, Vectors) ->
         size = NewSize,
         medoid_id = NewMedoid
     }}.
+
+%% Disk mode consolidation - repairs graph on disk
+consolidate_deletes_disk(#diskann_index{deleted_int_set = DeletedIntSet} = Index) ->
+    case sets:size(DeletedIntSet) of
+        0 ->
+            {ok, Index};
+        _ ->
+            consolidate_deletes_disk_impl(Index)
+    end.
+
+consolidate_deletes_disk_impl(#diskann_index{deleted_int_set = DeletedIntSet,
+                                              config = Config,
+                                              file_handle = FH} = Index) ->
+    #diskann_config{alpha = Alpha, r = R} = Config,
+
+    %% Get all non-deleted node IDs
+    AllIntIds = get_all_int_ids(Index),
+    ActiveIntIds = [Id || Id <- AllIntIds, not sets:is_element(Id, DeletedIntSet)],
+
+    %% For each active node, check if it has edges to deleted nodes
+    UpdatedNodesInt = lists:foldl(
+        fun(IntId, AccNodes) ->
+            Neighbors = get_neighbors_int(Index, IntId),
+            DeletedNeighbors = [N || N <- Neighbors, sets:is_element(N, DeletedIntSet)],
+            case DeletedNeighbors of
+                [] ->
+                    AccNodes;
+                _ ->
+                    %% Repair: find new candidates from deleted nodes' neighbors
+                    SurvivingNeighbors = Neighbors -- DeletedNeighbors,
+                    DeletedOutNeighbors = lists:flatmap(
+                        fun(V) ->
+                            VNs = get_neighbors_int(Index, V),
+                            [N || N <- VNs, not sets:is_element(N, DeletedIntSet)]
+                        end,
+                        DeletedNeighbors
+                    ),
+                    Candidates = lists:usort(SurvivingNeighbors ++ DeletedOutNeighbors) -- [IntId],
+
+                    %% Re-prune with alpha using robust_prune_int
+                    Index2 = Index#diskann_index{nodes_int = AccNodes},
+                    NewNeighbors = prune_candidates_int(Index2, IntId, Candidates, Alpha, R),
+
+                    %% Write updated neighbors to disk
+                    ok = barrel_vectordb_diskann_file:write_node_int(FH, IntId, NewNeighbors, R),
+
+                    maps:put(IntId, NewNeighbors, AccNodes)
+            end
+        end,
+        Index#diskann_index.nodes_int,
+        ActiveIntIds
+    ),
+
+    %% Update medoid if it was deleted
+    NewMedoidIntId = case sets:is_element(Index#diskann_index.medoid_int_id, DeletedIntSet) of
+        true ->
+            case ActiveIntIds of
+                [] -> undefined;
+                [First | _] -> First
+            end;
+        false ->
+            Index#diskann_index.medoid_int_id
+    end,
+
+    NewMedoidId = case NewMedoidIntId of
+        undefined -> undefined;
+        _ ->
+            case int_id_to_string(Index, NewMedoidIntId) of
+                {ok, StrId} -> StrId;
+                not_found -> undefined
+            end
+    end,
+
+    NewSize = length(ActiveIntIds),
+
+    {ok, Index#diskann_index{
+        nodes_int = UpdatedNodesInt,
+        deleted_int_set = sets:new(),
+        deleted_set = sets:new(),
+        size = NewSize,
+        medoid_int_id = NewMedoidIntId,
+        medoid_id = NewMedoidId
+    }}.
+
+%% Helper to prune candidates using robust prune logic with integer IDs
+prune_candidates_int(Index, IntId, Candidates, Alpha, R) ->
+    Vec = get_vector_by_int_id(Index, IntId),
+    case Vec of
+        undefined -> [];
+        _ ->
+            %% Score all candidates by distance
+            Scored = lists:filtermap(
+                fun(CandId) when CandId =/= IntId ->
+                    CandVec = get_vector_by_int_id(Index, CandId),
+                    case CandVec of
+                        undefined -> false;
+                        _ -> {true, {distance_vec(Index#diskann_index.config, Vec, CandVec), CandId}}
+                    end;
+                   (_) -> false
+                end,
+                Candidates
+            ),
+            Sorted = lists:sort(Scored),
+            %% Alpha-RNG pruning
+            alpha_rng_prune_int(Sorted, [], Alpha, R, Index)
+    end.
+
+alpha_rng_prune_int([], Acc, _Alpha, _R, _Index) ->
+    lists:reverse(Acc);
+alpha_rng_prune_int(_Remaining, Acc, _Alpha, R, _Index) when length(Acc) >= R ->
+    lists:reverse(Acc);
+alpha_rng_prune_int([{Dist, CandId} | Rest], Acc, Alpha, R, Index) ->
+    CandVec = get_vector_by_int_id(Index, CandId),
+    %% Check alpha-RNG condition: keep if not dominated by existing neighbors
+    IsDominated = lists:any(
+        fun(SelectedId) ->
+            SelectedVec = get_vector_by_int_id(Index, SelectedId),
+            case SelectedVec of
+                undefined -> false;
+                _ ->
+                    DistToSelected = distance_vec(Index#diskann_index.config, CandVec, SelectedVec),
+                    DistToSelected * Alpha < Dist
+            end
+        end,
+        Acc
+    ),
+    case IsDominated of
+        true ->
+            alpha_rng_prune_int(Rest, Acc, Alpha, R, Index);
+        false ->
+            alpha_rng_prune_int(Rest, [CandId | Acc], Alpha, R, Index)
+    end.
+
+%% Get all integer IDs from the index
+get_all_int_ids(#diskann_index{storage_mode = memory, idx_to_id = IdxToId}) ->
+    maps:keys(IdxToId);
+get_all_int_ids(#diskann_index{storage_mode = disk, next_int_id = NextId}) ->
+    %% For disk mode, IDs are 0 to next_int_id - 1
+    lists:seq(0, NextId - 1).
 
 %%====================================================================
 %% Persistence API

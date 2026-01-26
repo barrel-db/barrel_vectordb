@@ -44,7 +44,10 @@ diskann_disk_test_() ->
         {"cache warming persists", fun test_cache_warming_persists/0},
         {"batch insert deferred correctness", fun test_batch_insert_deferred/0},
         {"batch insert deferred recall", fun test_batch_insert_recall_deferred/0},
-        {"cache prewarm coverage for batch", fun test_cache_prewarm_coverage/0}
+        {"cache prewarm coverage for batch", fun test_cache_prewarm_coverage/0},
+        {"lazy delete disk mode", fun test_lazy_delete_disk/0},
+        {"consolidate deletes disk mode", fun test_consolidate_deletes_disk/0},
+        {"needs consolidation threshold", fun test_needs_consolidation/0}
     ].
 
 %% V2 format tests with RocksDB ID mapping
@@ -697,6 +700,142 @@ test_cache_prewarm_coverage() ->
         ?assert(AvgRecall >= 0.30),
 
         ok = barrel_vectordb_diskann:close(Index1)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_lazy_delete_disk() ->
+    %% Test that lazy delete in disk mode filters results without graph updates
+    TmpDir = setup_disk(),
+    try
+        rand:seed(exsss, {111, 333, 555}),
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 50)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 30,
+            l_search => 30,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => false
+        },
+        {ok, Index0} = barrel_vectordb_diskann:build(Config, Vectors),
+
+        %% Delete some vectors (lazy - instant)
+        {ok, Index1} = barrel_vectordb_diskann:delete(Index0, <<"1">>),
+        {ok, Index2} = barrel_vectordb_diskann:delete(Index1, <<"2">>),
+        {ok, Index3} = barrel_vectordb_diskann:delete(Index2, <<"3">>),
+
+        %% Search should not return deleted vectors
+        Results = barrel_vectordb_diskann:search(Index3, random_vector(16), 50),
+        ResultIds = [Id || {Id, _} <- Results],
+        ?assertNot(lists:member(<<"1">>, ResultIds)),
+        ?assertNot(lists:member(<<"2">>, ResultIds)),
+        ?assertNot(lists:member(<<"3">>, ResultIds)),
+
+        %% Size should still report deleted vectors (until consolidation)
+        Info = barrel_vectordb_diskann:info(Index3),
+        ?assertEqual(3, maps:get(deleted_count, Info)),
+
+        ok = barrel_vectordb_diskann:close(Index3)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_consolidate_deletes_disk() ->
+    %% Test that consolidate_deletes repairs graph in disk mode
+    TmpDir = setup_disk(),
+    try
+        rand:seed(exsss, {222, 444, 666}),
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 100)],
+        Config = #{
+            dimension => 16,
+            r => 16,
+            l_build => 50,
+            l_search => 50,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => false
+        },
+        {ok, Index0} = barrel_vectordb_diskann:build(Config, Vectors),
+
+        %% Delete 10% of vectors
+        Index1 = lists:foldl(
+            fun(I, AccIndex) ->
+                {ok, NewIndex} = barrel_vectordb_diskann:delete(AccIndex, integer_to_binary(I)),
+                NewIndex
+            end,
+            Index0,
+            lists:seq(1, 10)
+        ),
+
+        %% Verify deleted count before consolidation
+        Info1 = barrel_vectordb_diskann:info(Index1),
+        ?assertEqual(10, maps:get(deleted_count, Info1)),
+
+        %% Consolidate
+        {ok, Index2} = barrel_vectordb_diskann:consolidate_deletes(Index1),
+
+        %% Verify deleted count is now 0
+        Info2 = barrel_vectordb_diskann:info(Index2),
+        ?assertEqual(0, maps:get(deleted_count, Info2)),
+        ?assertEqual(90, maps:get(active_size, Info2)),
+
+        %% Search should still work after consolidation
+        Results = barrel_vectordb_diskann:search(Index2, random_vector(16), 10),
+        ?assert(length(Results) >= 5),
+
+        ok = barrel_vectordb_diskann:close(Index2)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_needs_consolidation() ->
+    %% Test needs_consolidation threshold (10% deleted triggers true)
+    TmpDir = setup_disk(),
+    try
+        rand:seed(exsss, {333, 555, 777}),
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 100)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 30,
+            l_search => 30,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => false
+        },
+        {ok, Index0} = barrel_vectordb_diskann:build(Config, Vectors),
+
+        %% Initially no consolidation needed
+        ?assertEqual(false, barrel_vectordb_diskann:needs_consolidation(Index0)),
+
+        %% Delete 5 vectors (5% < 10% threshold)
+        Index1 = lists:foldl(
+            fun(I, AccIndex) ->
+                {ok, NewIndex} = barrel_vectordb_diskann:delete(AccIndex, integer_to_binary(I)),
+                NewIndex
+            end,
+            Index0,
+            lists:seq(1, 5)
+        ),
+        ?assertEqual(false, barrel_vectordb_diskann:needs_consolidation(Index1)),
+
+        %% Delete 6 more vectors (11 total > 10% of 89 active = 8.9)
+        Index2 = lists:foldl(
+            fun(I, AccIndex) ->
+                {ok, NewIndex} = barrel_vectordb_diskann:delete(AccIndex, integer_to_binary(I)),
+                NewIndex
+            end,
+            Index1,
+            lists:seq(6, 11)
+        ),
+        ?assertEqual(true, barrel_vectordb_diskann:needs_consolidation(Index2)),
+
+        ok = barrel_vectordb_diskann:close(Index2)
     after
         cleanup_disk(TmpDir)
     end.
