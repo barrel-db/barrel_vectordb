@@ -32,19 +32,25 @@ diskann_test_() ->
     }.
 
 %% Disk mode tests
+%% Now uses standalone RocksDB when barrel_vectordb_store is not running
+%% Each test manages its own setup/cleanup to ensure proper RocksDB lifecycle
 diskann_disk_test_() ->
-    {foreach,
-     fun setup_disk/0,
-     fun cleanup_disk/1,
-     [
+    [
+        {"serialization roundtrip (memory mode)", fun test_serialization/0},
         {"disk mode build and search", fun test_disk_build_search/0},
         {"disk mode persistence", fun test_disk_persistence/0},
         {"disk mode insert", fun test_disk_insert/0},
         {"lru cache eviction", fun test_lru_cache_eviction/0},
-        {"cache warming persists", fun test_cache_warming_persists/0},
-        {"serialization roundtrip", fun test_serialization/0}
-     ]
-    }.
+        {"cache warming persists", fun test_cache_warming_persists/0}
+    ].
+
+%% V2 format tests with RocksDB ID mapping
+diskann_v2_test_() ->
+    [
+        {"v2 format lazy graph loading", fun test_v2_lazy_graph_loading/0},
+        {"v2 format fast open", fun test_v2_fast_open/0},
+        {"v2 format rocksdb id mapping", fun test_v2_rocksdb_id_mapping/0}
+    ].
 
 %%====================================================================
 %% Setup/Teardown
@@ -65,6 +71,8 @@ setup_disk() ->
     TmpDir.
 
 cleanup_disk(TmpDir) ->
+    %% Close any open standalone RocksDB databases (handles test failures)
+    barrel_vectordb_diskann:close_all_standalone_dbs(),
     %% Remove temp directory
     os:cmd("rm -rf " ++ TmpDir),
     ok.
@@ -613,6 +621,151 @@ test_assume_normalized() ->
     RecallNorm = measure_recall(IndexNorm, Query, Vectors, 10),
     ?assert(RecallDefault >= 0.8),
     ?assert(RecallNorm >= 0.8).
+
+%%====================================================================
+%% V2 Format Tests (Integer IDs + RocksDB + Lazy Loading)
+%%====================================================================
+
+test_v2_lazy_graph_loading() ->
+    %% Test that V2 format uses lazy graph loading (build and search in single session)
+    TmpDir = filename:join(["/tmp", "diskann_v2_test_" ++ integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    try
+        rand:seed(exsss, {123, 456, 789}),
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 100)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 20,
+            l_search => 20,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => true,
+            pq_m => 2,
+            pq_k => 16
+        },
+
+        %% Build index (creates V2 format with RocksDB)
+        {ok, Index1} = barrel_vectordb_diskann:build(Config, Vectors),
+        100 = barrel_vectordb_diskann:size(Index1),
+
+        %% Verify RocksDB ID mapping directory exists
+        IdDbPath = filename:join(TmpDir, "diskann_ids"),
+        true = filelib:is_dir(IdDbPath),
+
+        %% Search should work with lazy loading
+        Query = random_vector(16),
+        Results = barrel_vectordb_diskann:search(Index1, Query, 5),
+        5 = length(Results),
+
+        %% Verify results have valid string IDs
+        lists:foreach(
+            fun({Id, _Dist}) ->
+                true = is_binary(Id)
+            end,
+            Results
+        ),
+
+        ok = barrel_vectordb_diskann:close(Index1),
+        ok
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_v2_fast_open() ->
+    %% Test that V2 format produces correct file structure (no legacy diskann.index)
+    TmpDir = filename:join(["/tmp", "diskann_v2_open_" ++ integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    try
+        rand:seed(exsss, {234, 567, 890}),
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 50)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 20,
+            l_search => 20,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => true,
+            pq_m => 2,
+            pq_k => 16
+        },
+
+        %% Build index
+        {ok, Index1} = barrel_vectordb_diskann:build(Config, Vectors),
+
+        %% Search should work
+        Query = random_vector(16),
+        Results = barrel_vectordb_diskann:search(Index1, Query, 5),
+        5 = length(Results),
+
+        %% Close index
+        ok = barrel_vectordb_diskann:close(Index1),
+
+        %% Verify diskann.index legacy file does NOT exist (V2 doesn't use it)
+        LegacyPath = filename:join(TmpDir, "diskann.index"),
+        false = filelib:is_file(LegacyPath),
+
+        %% Verify V2 format files exist
+        IdDbPath = filename:join(TmpDir, "diskann_ids"),
+        true = filelib:is_dir(IdDbPath),
+        GraphPath = filename:join(TmpDir, "diskann.graph"),
+        true = filelib:is_file(GraphPath),
+        VectorPath = filename:join(TmpDir, "diskann.vectors"),
+        true = filelib:is_file(VectorPath),
+        ok
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_v2_rocksdb_id_mapping() ->
+    %% Test that RocksDB ID mapping returns correct string IDs
+    TmpDir = filename:join(["/tmp", "diskann_v2_id_" ++ integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    try
+        rand:seed(exsss, {345, 678, 901}),
+        Vectors = [{<<"vec_", (integer_to_binary(I))/binary>>, random_vector(16)}
+                   || I <- lists:seq(1, 50)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 20,
+            l_search => 20,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => true,
+            pq_m => 2,
+            pq_k => 16
+        },
+
+        %% Build index
+        {ok, Index1} = barrel_vectordb_diskann:build(Config, Vectors),
+
+        %% Search should return string IDs (not integer IDs)
+        Query = random_vector(16),
+        Results = barrel_vectordb_diskann:search(Index1, Query, 5),
+
+        %% Verify all result IDs are string IDs starting with "vec_"
+        lists:foreach(
+            fun({Id, _Dist}) ->
+                true = is_binary(Id),
+                <<"vec_">> = binary:part(Id, 0, 4)
+            end,
+            Results
+        ),
+
+        %% Get vector by ID should work
+        {Id, _} = hd(Results),
+        {ok, Vec} = barrel_vectordb_diskann:get_vector(Index1, Id),
+        16 = length(Vec),
+
+        ok = barrel_vectordb_diskann:close(Index1),
+        ok
+    after
+        cleanup_disk(TmpDir)
+    end.
 
 %%====================================================================
 %% Helpers

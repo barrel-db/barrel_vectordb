@@ -44,7 +44,8 @@
 -export([
     greedy_search/5,
     robust_prune/5,
-    find_medoid/2
+    find_medoid/2,
+    close_all_standalone_dbs/0
 ]).
 
 -record(diskann_config, {
@@ -60,22 +61,37 @@
 -record(diskann_index, {
     config :: #diskann_config{},
     size = 0 :: non_neg_integer(),
-    medoid_id :: binary() | undefined,    %% Entry point (centroid)
+    medoid_id :: binary() | undefined,    %% Entry point (string ID, for memory mode/API)
+    medoid_int_id :: non_neg_integer() | undefined,  %% Entry point (integer ID, for disk mode)
 
-    %% In RAM (small footprint) - graph structure
+    %% In RAM (small footprint) - graph structure (memory mode only)
+    %% In disk mode, nodes are lazily loaded from disk into graph_cache_table
     nodes = #{} :: #{binary() => diskann_node()},
 
-    %% ID <-> disk index mapping (for disk mode)
+    %% Integer ID graph structure (disk mode) - maps IntId -> [NeighborIntIds]
+    %% Only populated in memory mode; disk mode uses lazy loading
+    nodes_int = #{} :: #{non_neg_integer() => [non_neg_integer()]},
+
+    %% ID <-> disk index mapping (for disk mode, fallback when no RocksDB)
     id_to_idx = #{} :: #{binary() => non_neg_integer()},
     idx_to_id = #{} :: #{non_neg_integer() => binary()},
+
+    %% RocksDB for ID mapping (disk mode only) - replaces maps for large indexes
+    id_db :: rocksdb:db_handle() | undefined,
+    id_cf_fwd :: rocksdb:cf_handle() | undefined,  %% string -> int
+    id_cf_rev :: rocksdb:cf_handle() | undefined,  %% int -> string
+    id_db_standalone = false :: boolean(),  %% true if we opened standalone DB (not from store)
+    next_int_id = 0 :: non_neg_integer(),
 
     %% PQ compression (always in RAM)
     pq_state :: term() | undefined,       %% Trained PQ for compression
     pq_codes = #{} :: #{binary() => binary()},  %% Id -> PQ code (M bytes)
+    pq_codes_int = #{} :: #{non_neg_integer() => binary()},  %% IntId -> PQ code
     use_pq = false :: boolean(),          %% Whether to use PQ for search
 
     %% Deletion tracking
     deleted_set = sets:new() :: sets:set(binary()),
+    deleted_int_set = sets:new() :: sets:set(non_neg_integer()),
 
     %% Storage mode: memory | disk
     storage_mode = memory :: memory | disk,
@@ -89,7 +105,11 @@
 
     %% ETS-based vector cache for disk mode (persists across calls)
     cache_table :: ets:tid() | undefined,
-    cache_max_size = 10000 :: pos_integer()
+    cache_max_size = 10000 :: pos_integer(),
+
+    %% ETS-based graph cache for disk mode (lazy loading of neighbor lists)
+    graph_cache_table :: ets:tid() | undefined,
+    graph_cache_max_size = 100000 :: pos_integer()
 }).
 
 -record(diskann_node, {
@@ -147,18 +167,19 @@ new(Options) ->
                         distance_fn = DistanceFn,
                         assume_normalized = AssumeNormalized
                     },
-                    %% Create ETS cache table for disk mode
-                    CacheTable = case StorageMode of
-                        disk -> create_cache_table();
-                        memory -> undefined
-                    end,
-                    {ok, #diskann_index{
-                        config = Config,
-                        storage_mode = StorageMode,
-                        base_path = to_binary_or_undefined(BasePath),
-                        cache_max_size = CacheMaxSize,
-                        cache_table = CacheTable
-                    }};
+                    case StorageMode of
+                        memory ->
+                            {ok, #diskann_index{
+                                config = Config,
+                                storage_mode = memory,
+                                base_path = undefined,
+                                cache_max_size = CacheMaxSize,
+                                cache_table = undefined
+                            }};
+                        disk ->
+                            %% V2 format: Set up RocksDB and disk files
+                            new_disk_mode(Config, BasePath, CacheMaxSize)
+                    end;
                 {error, _} = Error ->
                     Error
             end;
@@ -170,6 +191,45 @@ validate_storage_options(disk, undefined) ->
     {error, {disk_mode_requires_base_path}};
 validate_storage_options(_, _) ->
     ok.
+
+%% Create new disk mode index (V2 format with RocksDB)
+new_disk_mode(Config, BasePath, CacheMaxSize) ->
+    BasePathBin = to_binary_or_undefined(BasePath),
+    %% Open RocksDB for ID mapping
+    case open_id_db(BasePathBin) of
+        {ok, IdDb, CfFwd, CfRev, Standalone} ->
+            %% Create disk files
+            FileConfig = #{
+                dimension => Config#diskann_config.dimension,
+                r => Config#diskann_config.r,
+                distance_fn => Config#diskann_config.distance_fn
+            },
+            case barrel_vectordb_diskann_file:create(BasePathBin, FileConfig) of
+                {ok, FileHandle} ->
+                    %% Create ETS caches
+                    CacheTable = create_cache_table(),
+                    GraphCacheTable = create_graph_cache_table(),
+                    {ok, #diskann_index{
+                        config = Config,
+                        storage_mode = disk,
+                        base_path = BasePathBin,
+                        id_db_standalone = Standalone,
+                        cache_max_size = CacheMaxSize,
+                        cache_table = CacheTable,
+                        graph_cache_table = GraphCacheTable,
+                        file_handle = FileHandle,
+                        id_db = IdDb,
+                        id_cf_fwd = CfFwd,
+                        id_cf_rev = CfRev,
+                        next_int_id = 0
+                    }};
+                {error, Reason} ->
+                    close_id_db(IdDb, Standalone),
+                    {error, {disk_file_create_failed, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {id_db_open_failed, Reason}}
+    end.
 
 to_binary_or_undefined(undefined) -> undefined;
 to_binary_or_undefined(Path) when is_list(Path) -> list_to_binary(Path);
@@ -240,113 +300,122 @@ build_memory_mode(Index0, Options, Vectors) ->
     {ok, Index6}.
 
 %% Build index in disk mode (vectors stored on SSD)
+%% Uses integer IDs internally and RocksDB for ID mapping
+%% Note: Index0 already has RocksDB handles and file_handle from new_disk_mode
 build_disk_mode(Index0, Options, Vectors) ->
-    BasePath = Index0#diskann_index.base_path,
+    %% RocksDB handles are already in Index0 from new_disk_mode
+    %% file_handle is also already created from new_disk_mode
+    FileHandle0 = Index0#diskann_index.file_handle,
+    build_disk_mode_internal(Index0, Options, Vectors, FileHandle0).
+
+build_disk_mode_internal(Index0, Options, Vectors, FileHandle0) ->
     Config = Index0#diskann_index.config,
     Dimension = Config#diskann_config.dimension,
 
-    %% Create disk files
-    FileConfig = #{
-        dimension => Dimension,
-        r => Config#diskann_config.r,
-        distance_fn => Config#diskann_config.distance_fn
-    },
-    case barrel_vectordb_diskann_file:create(BasePath, FileConfig) of
-        {ok, FileHandle0} ->
-            %% Build id to idx mappings and write vectors to disk
-            {IdToIdx, IdxToId, FileHandle1} = write_vectors_to_disk(Vectors, FileHandle0),
-
-            %% Update header with entry point (will be set after finding medoid)
-            {ok, FileHandle2} = barrel_vectordb_diskann_file:write_header(
-                FileHandle1,
-                #{
-                    dimension => Dimension,
-                    r => Config#diskann_config.r,
-                    node_count => length(Vectors),
-                    distance_fn => Config#diskann_config.distance_fn,
-                    entry_point => undefined
-                }
-            ),
-
-            %% During build, we need vectors in cache for distance calculations
-            VectorMap = maps:from_list(Vectors),
-            %% Populate ETS cache with all vectors for build phase
-            populate_cache_for_build(Index0#diskann_index.cache_table, VectorMap),
-            Index1 = Index0#diskann_index{
-                file_handle = FileHandle2,
-                id_to_idx = IdToIdx,
-                idx_to_id = IdxToId,
-                size = length(Vectors)
-            },
-
-            %% Find medoid
-            MedoidId = find_medoid(Vectors, Config),
-            Index2 = Index1#diskann_index{medoid_id = MedoidId},
-
-            %% Initialize random graph
-            Index3 = init_random_graph(Index2, maps:keys(VectorMap)),
-
-            %% Two-pass Vamana construction
-            R = Config#diskann_config.r,
-            L = Config#diskann_config.l_build,
-            Alpha = Config#diskann_config.alpha,
-
-            Index4 = vamana_pass(Index3, 1.0, L, R),
-            Index5 = vamana_pass(Index4, Alpha, L, R),
-
-            %% Train and apply PQ (required for efficient disk-based search)
-            UsePQ = maps:get(use_pq, Options, true),  %% Default to true for disk mode
-            PQK = maps:get(pq_k, Options, 256),
-            Index6 = case UsePQ andalso length(Vectors) >= min(PQK, 16) of
-                true ->
-                    train_and_apply_pq(Index5, Options, Vectors);
-                false ->
-                    Index5
-            end,
-
-            %% Update header with medoid
-            {ok, FileHandle3} = barrel_vectordb_diskann_file:write_header(
-                Index6#diskann_index.file_handle,
-                #{
-                    dimension => Dimension,
-                    r => Config#diskann_config.r,
-                    node_count => length(Vectors),
-                    distance_fn => Config#diskann_config.distance_fn,
-                    entry_point => MedoidId
-                }
-            ),
-
-            %% Clear the build cache, keep only limited cache for search
-            CacheMaxSize = Index6#diskann_index.cache_max_size,
-            clear_cache_table(Index6#diskann_index.cache_table),
-            Index7 = Index6#diskann_index{
-                file_handle = FileHandle3,
-                vectors = #{}  %% Clear vectors from memory
-            },
-
-            %% Pre-warm cache with medoid neighbors
-            prewarm_cache(Index7, MedoidId, CacheMaxSize),
-
-            {ok, Index7};
-
-        {error, Reason} ->
-            {error, {disk_file_create_failed, Reason}}
-    end.
-
-%% Write all vectors to disk and build mappings
-write_vectors_to_disk(Vectors, FileHandle) ->
-    {IdToIdx, IdxToId, FinalHandle} = lists:foldl(
-        fun({Id, Vec}, {AccIdToIdx, AccIdxToId, AccHandle}) ->
-            Idx = maps:size(AccIdToIdx),
-            ok = barrel_vectordb_diskann_file:write_vector(AccHandle, Idx, Vec),
-            {AccIdToIdx#{Id => Idx}, AccIdxToId#{Idx => Id}, AccHandle}
+    %% Assign integer IDs to all vectors and write vectors to disk
+    {Index1, FileHandle1, IntIdVectors} = lists:foldl(
+        fun({StringId, Vec}, {AccIndex, AccFH, AccIntVecs}) ->
+            {IntId, NewIndex} = get_or_create_int_id(AccIndex, StringId),
+            ok = barrel_vectordb_diskann_file:write_vector(AccFH, IntId, Vec),
+            {NewIndex, AccFH, [{IntId, Vec, StringId} | AccIntVecs]}
         end,
-        {#{}, #{}, FileHandle},
+        {Index0, FileHandle0, []},
         Vectors
     ),
-    {IdToIdx, IdxToId, FinalHandle}.
+    IntIdVectors2 = lists:reverse(IntIdVectors),
 
-%% Build id <-> idx mappings from vector list
+    %% Create graph cache table
+    GraphCacheTable = create_graph_cache_table(),
+
+    %% Update header with initial info
+    {ok, FileHandle2} = barrel_vectordb_diskann_file:write_header(
+        FileHandle1,
+        #{
+            dimension => Dimension,
+            r => Config#diskann_config.r,
+            node_count => length(Vectors),
+            distance_fn => Config#diskann_config.distance_fn,
+            entry_point => undefined,
+            entry_point_int => 0,
+            next_int_id => Index1#diskann_index.next_int_id
+        }
+    ),
+
+    %% During build, we need vectors in cache for distance calculations
+    %% For disk mode build, use the vector cache keyed by integer ID
+    CacheTable = Index0#diskann_index.cache_table,
+    populate_cache_for_build_int(CacheTable, IntIdVectors2),
+
+    Index2 = Index1#diskann_index{
+        file_handle = FileHandle2,
+        graph_cache_table = GraphCacheTable,
+        size = length(Vectors)
+    },
+
+    %% Find medoid using integer IDs
+    VectorsForMedoid = [{StringId, Vec} || {_IntId, Vec, StringId} <- IntIdVectors2],
+    MedoidStringId = find_medoid(VectorsForMedoid, Config),
+    {ok, MedoidIntId} = string_id_to_int(Index2, MedoidStringId),
+    Index3 = Index2#diskann_index{medoid_id = MedoidStringId, medoid_int_id = MedoidIntId},
+
+    %% Initialize random graph using integer IDs
+    IntIds = [IntId || {IntId, _, _} <- IntIdVectors2],
+    Index4 = init_random_graph_int(Index3, IntIds),
+
+    %% Two-pass Vamana construction using integer IDs
+    R = Config#diskann_config.r,
+    L = Config#diskann_config.l_build,
+    Alpha = Config#diskann_config.alpha,
+
+    Index5 = vamana_pass_int(Index4, 1.0, L, R),
+    Index6 = vamana_pass_int(Index5, Alpha, L, R),
+
+    %% Write graph nodes to disk
+    Index7 = write_graph_nodes_to_disk(Index6, IntIds),
+
+    %% Train and apply PQ (required for efficient disk-based search)
+    UsePQ = maps:get(use_pq, Options, true),
+    PQK = maps:get(pq_k, Options, 256),
+    Index8 = case UsePQ andalso length(Vectors) >= min(PQK, 16) of
+        true ->
+            train_and_apply_pq_int(Index7, Options, IntIdVectors2);
+        false ->
+            Index7
+    end,
+
+    %% Update header with medoid
+    {ok, FileHandle3} = barrel_vectordb_diskann_file:write_header(
+        Index8#diskann_index.file_handle,
+        #{
+            dimension => Dimension,
+            r => Config#diskann_config.r,
+            node_count => length(Vectors),
+            distance_fn => Config#diskann_config.distance_fn,
+            entry_point => MedoidStringId,
+            entry_point_int => MedoidIntId,
+            next_int_id => Index8#diskann_index.next_int_id
+        }
+    ),
+
+    %% Clear the build cache, keep only limited cache for search
+    CacheMaxSize = Index8#diskann_index.cache_max_size,
+    clear_cache_table(Index8#diskann_index.cache_table),
+    %% Clear in-memory graph (it's now on disk)
+    clear_graph_cache(Index8#diskann_index.graph_cache_table),
+
+    Index9 = Index8#diskann_index{
+        file_handle = FileHandle3,
+        vectors = #{},  %% Clear vectors from memory
+        nodes = #{},    %% Clear string ID graph
+        nodes_int = #{} %% Clear in-memory integer graph (now on disk)
+    },
+
+    %% Pre-warm caches with medoid neighbors
+    prewarm_caches(Index9, MedoidIntId, CacheMaxSize),
+
+    {ok, Index9}.
+
+%% Build id <-> idx mappings from vector list (for memory mode)
 build_id_mappings(Vectors) ->
     {IdToIdx, IdxToId, _} = lists:foldl(
         fun({Id, _Vec}, {AccIdToIdx, AccIdxToId, Idx}) ->
@@ -357,67 +426,61 @@ build_id_mappings(Vectors) ->
     ),
     {IdToIdx, IdxToId}.
 
-%% Pre-warm cache with vectors near the medoid
-prewarm_cache(Index, MedoidId, MaxSize) ->
-    %% Get medoid neighbors
-    Neighbors = get_neighbors(Index, MedoidId),
-    %% Load medoid and its neighbors into cache
-    ToLoad = lists:sublist([MedoidId | Neighbors], MaxSize),
-    lists:foreach(
-        fun(Id) ->
-            %% get_vector_cached will add to ETS cache as side effect
-            _ = get_vector_cached(Index, Id)
-        end,
-        ToLoad
-    ),
-    ok.
-
 %% @doc Insert a new vector (FreshVamana algorithm)
 -spec insert(diskann_index(), binary(), [float()]) -> {ok, diskann_index()} | {error, term()}.
-insert(#diskann_index{medoid_id = undefined, config = Config} = Index, Id, Vector) ->
-    %% First insertion
+insert(#diskann_index{medoid_id = undefined, config = Config,
+                      storage_mode = memory} = Index, Id, Vector) ->
+    %% First insertion - memory mode
     Dim = Config#diskann_config.dimension,
     case length(Vector) of
         Dim ->
-            case Index#diskann_index.storage_mode of
-                memory ->
-                    %% Memory mode: store vector in RAM
-                    NewIndex = Index#diskann_index{
-                        medoid_id = Id,
-                        nodes = #{Id => #diskann_node{id = Id, neighbors = []}},
-                        vectors = #{Id => Vector},
-                        id_to_idx = #{Id => 0},
-                        idx_to_id = #{0 => Id},
-                        size = 1
-                    },
-                    {ok, NewIndex};
-                disk ->
-                    %% Disk mode: write to disk and cache
-                    case ensure_disk_files(Index) of
-                        {ok, Index1} ->
-                            Idx = 0,
-                            ok = barrel_vectordb_diskann_file:write_vector(
-                                Index1#diskann_index.file_handle, Idx, Vector),
-                            %% Add to ETS cache
-                            cache_put(Index1#diskann_index.cache_table, Id, Vector),
-                            NewIndex = Index1#diskann_index{
-                                medoid_id = Id,
-                                nodes = #{Id => #diskann_node{id = Id, neighbors = []}},
-                                id_to_idx = #{Id => Idx},
-                                idx_to_id = #{Idx => Id},
-                                size = 1
-                            },
-                            {ok, NewIndex};
-                        {error, _} = Error ->
-                            Error
-                    end
-            end;
+            NewIndex = Index#diskann_index{
+                medoid_id = Id,
+                nodes = #{Id => #diskann_node{id = Id, neighbors = []}},
+                vectors = #{Id => Vector},
+                id_to_idx = #{Id => 0},
+                idx_to_id = #{0 => Id},
+                size = 1
+            },
+            {ok, NewIndex};
+        Other ->
+            {error, {dimension_mismatch, Dim, Other}}
+    end;
+insert(#diskann_index{medoid_id = undefined, medoid_int_id = undefined, config = Config,
+                      storage_mode = disk} = Index, Id, Vector) ->
+    %% First insertion - disk mode V2 (with RocksDB)
+    Dim = Config#diskann_config.dimension,
+    R = Config#diskann_config.r,
+    case length(Vector) of
+        Dim ->
+            %% Get integer ID for this string ID
+            {IntId, Index1} = get_or_create_int_id(Index, Id),
+            %% Write vector to disk
+            ok = barrel_vectordb_diskann_file:write_vector(
+                Index1#diskann_index.file_handle, IntId, Vector),
+            %% Write node to disk (empty neighbors)
+            ok = barrel_vectordb_diskann_file:write_node_int(
+                Index1#diskann_index.file_handle, IntId, [], R),
+            %% Add to ETS cache (keyed by integer ID)
+            cache_put_with_eviction_by_key(Index1#diskann_index.cache_table, IntId, Vector,
+                                           Index1#diskann_index.cache_max_size),
+            %% Update graph cache
+            graph_cache_put_with_eviction(Index1#diskann_index.graph_cache_table, IntId, [],
+                                          Index1#diskann_index.graph_cache_max_size),
+            NewIndex = Index1#diskann_index{
+                medoid_id = Id,
+                medoid_int_id = IntId,
+                nodes_int = #{IntId => []},
+                size = 1
+            },
+            {ok, NewIndex};
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end;
 insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
                       pq_state = PQState, pq_codes = PQCodes,
-                      storage_mode = StorageMode} = Index, Id, Vector) ->
+                      storage_mode = memory} = Index, Id, Vector) ->
+    %% Subsequent insertions - memory mode
     Dim = Config#diskann_config.dimension,
     case length(Vector) of
         Dim ->
@@ -432,35 +495,17 @@ insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
                     PQCodes
             end,
 
-            %% Add vector to storage (memory or disk)
-            Index1 = case StorageMode of
-                memory ->
-                    Index#diskann_index{
-                        vectors = maps:put(Id, Vector, Index#diskann_index.vectors),
-                        nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
-                                         Index#diskann_index.nodes),
-                        id_to_idx = maps:put(Id, Index#diskann_index.size,
-                                             Index#diskann_index.id_to_idx),
-                        idx_to_id = maps:put(Index#diskann_index.size, Id,
-                                             Index#diskann_index.idx_to_id),
-                        pq_codes = NewPQCodes,
-                        size = Index#diskann_index.size + 1
-                    };
-                disk ->
-                    Idx = Index#diskann_index.size,
-                    ok = barrel_vectordb_diskann_file:write_vector(
-                        Index#diskann_index.file_handle, Idx, Vector),
-                    %% Add to ETS cache for the insert operation
-                    cache_put(Index#diskann_index.cache_table, Id, Vector),
-                    Index#diskann_index{
-                        nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
-                                         Index#diskann_index.nodes),
-                        id_to_idx = maps:put(Id, Idx, Index#diskann_index.id_to_idx),
-                        idx_to_id = maps:put(Idx, Id, Index#diskann_index.idx_to_id),
-                        pq_codes = NewPQCodes,
-                        size = Index#diskann_index.size + 1
-                    }
-            end,
+            Index1 = Index#diskann_index{
+                vectors = maps:put(Id, Vector, Index#diskann_index.vectors),
+                nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
+                                 Index#diskann_index.nodes),
+                id_to_idx = maps:put(Id, Index#diskann_index.size,
+                                     Index#diskann_index.id_to_idx),
+                idx_to_id = maps:put(Index#diskann_index.size, Id,
+                                     Index#diskann_index.idx_to_id),
+                pq_codes = NewPQCodes,
+                size = Index#diskann_index.size + 1
+            },
 
             %% Search to find candidate neighbors
             {_Results, Visited} = greedy_search(Index1, S, Vector, 1, L),
@@ -469,13 +514,12 @@ insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
             Index2 = robust_prune(Index1, Id, sets:to_list(Visited), Alpha, R),
             Neighbors = get_neighbors(Index2, Id),
 
-            %% Add backward edges (critical for navigability)
+            %% Add backward edges
             Index3 = lists:foldl(
                 fun(J, AccIndex) ->
                     JNeighbors = get_neighbors(AccIndex, J),
                     case length(JNeighbors) + 1 > R of
                         true ->
-                            %% Prune if degree exceeded
                             robust_prune(AccIndex, J, [Id | JNeighbors], Alpha, R);
                         false ->
                             add_neighbor(AccIndex, J, Id)
@@ -484,38 +528,79 @@ insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
                 Index2,
                 Neighbors
             ),
+            {ok, Index3};
+        Other ->
+            {error, {dimension_mismatch, Dim, Other}}
+    end;
+insert(#diskann_index{config = Config, medoid_int_id = MedoidIntId,
+                      use_pq = UsePQ, pq_state = PQState, pq_codes_int = PQCodesInt,
+                      storage_mode = disk} = Index, Id, Vector) ->
+    %% Subsequent insertions - disk mode V2 (with integer IDs)
+    Dim = Config#diskann_config.dimension,
+    case length(Vector) of
+        Dim ->
+            #diskann_config{l_build = L, alpha = Alpha, r = R} = Config,
+
+            %% Get integer ID for this string ID
+            {IntId, Index0} = get_or_create_int_id(Index, Id),
+
+            %% Encode with PQ if enabled
+            NewPQCodesInt = case UsePQ andalso PQState =/= undefined of
+                true ->
+                    Code = barrel_vectordb_pq:encode(PQState, Vector),
+                    maps:put(IntId, Code, PQCodesInt);
+                false ->
+                    PQCodesInt
+            end,
+
+            %% Write vector to disk
+            ok = barrel_vectordb_diskann_file:write_vector(
+                Index0#diskann_index.file_handle, IntId, Vector),
+
+            %% Add to ETS cache (keyed by integer ID)
+            cache_put_with_eviction_by_key(Index0#diskann_index.cache_table, IntId, Vector,
+                                           Index0#diskann_index.cache_max_size),
+
+            %% Initialize node with empty neighbors in cache
+            graph_cache_put_with_eviction(Index0#diskann_index.graph_cache_table, IntId, [],
+                                          Index0#diskann_index.graph_cache_max_size),
+
+            Index1 = Index0#diskann_index{
+                nodes_int = maps:put(IntId, [], Index0#diskann_index.nodes_int),
+                pq_codes_int = NewPQCodesInt,
+                size = Index0#diskann_index.size + 1
+            },
+
+            %% Search to find candidate neighbors using integer IDs
+            {_Results, Visited} = greedy_search_int(Index1, MedoidIntId, Vector, 1, L),
+
+            %% Prune to select R out-neighbors
+            Index2 = robust_prune_int(Index1, IntId, sets:to_list(Visited), Alpha, R),
+            Neighbors = get_neighbors_int(Index2, IntId),
+
+            %% Add backward edges
+            Index3 = lists:foldl(
+                fun(J, AccIndex) ->
+                    JNeighbors = get_neighbors_int(AccIndex, J),
+                    case length(JNeighbors) + 1 > R of
+                        true ->
+                            robust_prune_int(AccIndex, J, [IntId | JNeighbors], Alpha, R);
+                        false ->
+                            add_neighbor_int(AccIndex, J, IntId)
+                    end
+                end,
+                Index2,
+                Neighbors
+            ),
+
+            %% Write updated node to disk
+            ok = barrel_vectordb_diskann_file:write_node_int(
+                Index3#diskann_index.file_handle, IntId, get_neighbors_int(Index3, IntId), R),
 
             {ok, Index3};
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end.
-
-%% Ensure disk files are created (for incremental insert in disk mode)
-ensure_disk_files(#diskann_index{file_handle = undefined, base_path = BasePath,
-                                  config = Config, cache_table = CacheTable0} = Index) when BasePath =/= undefined ->
-    FileConfig = #{
-        dimension => Config#diskann_config.dimension,
-        r => Config#diskann_config.r,
-        distance_fn => Config#diskann_config.distance_fn
-    },
-    case barrel_vectordb_diskann_file:create(BasePath, FileConfig) of
-        {ok, FileHandle} ->
-            %% Create ETS cache table if needed
-            CacheTable = case CacheTable0 of
-                undefined -> create_cache_table();
-                _ -> CacheTable0
-            end,
-            {ok, Index#diskann_index{file_handle = FileHandle, cache_table = CacheTable}};
-        {error, _} = Error ->
-            Error
-    end;
-ensure_disk_files(#diskann_index{file_handle = Handle, cache_table = undefined} = Index) when Handle =/= undefined ->
-    %% File handle exists but no cache table - create one
-    {ok, Index#diskann_index{cache_table = create_cache_table()}};
-ensure_disk_files(#diskann_index{file_handle = Handle} = Index) when Handle =/= undefined ->
-    {ok, Index};
-ensure_disk_files(_Index) ->
-    {error, disk_mode_requires_base_path}.
 
 %% @doc Lazy delete - marks node as deleted
 -spec delete(diskann_index(), binary()) -> {ok, diskann_index()}.
@@ -533,13 +618,64 @@ search(Index, Query, K) ->
 %%   - l_search: Search beam width (default: from config)
 %%   - rerank_factor: Multiplier for rerank candidates (default: 4)
 -spec search(diskann_index(), [float()], pos_integer(), map()) -> [{binary(), float()}].
-search(#diskann_index{medoid_id = undefined}, _Query, _K, _Opts) ->
+search(#diskann_index{medoid_id = undefined, medoid_int_id = undefined}, _Query, _K, _Opts) ->
     [];
-search(#diskann_index{medoid_id = S, config = Config, deleted_set = DeletedSet,
-                      use_pq = UsePQ, pq_state = PQState} = Index,
-       Query, K, Opts) ->
+search(#diskann_index{medoid_id = undefined, medoid_int_id = 0}, _Query, _K, _Opts) ->
+    [];
+search(#diskann_index{storage_mode = disk} = Index, Query, K, Opts) ->
+    %% Disk mode: use integer IDs internally
+    search_disk_mode(Index, Query, K, Opts);
+search(#diskann_index{storage_mode = memory} = Index, Query, K, Opts) ->
+    %% Memory mode: use string IDs
+    search_memory_mode(Index, Query, K, Opts).
+
+%% Search using integer IDs for disk mode (lazy graph loading)
+search_disk_mode(#diskann_index{medoid_int_id = MedoidIntId, config = Config,
+                                 deleted_int_set = DeletedIntSet,
+                                 use_pq = UsePQ, pq_state = PQState,
+                                 pq_codes_int = PQCodesInt} = Index,
+                  Query, K, Opts) ->
     L = maps:get(l_search, Opts, Config#diskann_config.l_search),
-    %% Increased rerank factor for better recall (was K*2, now K*4)
+    RerankFactor = maps:get(rerank_factor, Opts, 4),
+    RerankK = K * RerankFactor,
+
+    %% Use PQ-based beam search if PQ is available
+    IntResults = case UsePQ andalso PQState =/= undefined of
+        true ->
+            %% Precompute distance tables for this query
+            DistTables = barrel_vectordb_pq:precompute_tables(PQState, Query),
+            beam_search_pq_int(Index, MedoidIntId, Query, DistTables, PQCodesInt, RerankK, L);
+        false ->
+            %% Standard greedy search with integer IDs
+            {Res, _Visited} = greedy_search_int(Index, MedoidIntId, Query, RerankK, L),
+            Res
+    end,
+
+    %% Filter deleted nodes and convert integer IDs to string IDs
+    Filtered = lists:filtermap(
+        fun({D, IntId}) ->
+            case sets:is_element(IntId, DeletedIntSet) of
+                true -> false;
+                false ->
+                    case int_id_to_string(Index, IntId) of
+                        {ok, StringId} -> {true, {D, StringId}};
+                        not_found -> false
+                    end
+            end
+        end,
+        IntResults
+    ),
+
+    %% Return top K
+    TopK = lists:sublist(Filtered, K),
+    [{Id, D} || {D, Id} <- TopK].
+
+%% Search using string IDs for memory mode
+search_memory_mode(#diskann_index{medoid_id = S, config = Config,
+                                   deleted_set = DeletedSet,
+                                   use_pq = UsePQ, pq_state = PQState} = Index,
+                    Query, K, Opts) ->
+    L = maps:get(l_search, Opts, Config#diskann_config.l_search),
     RerankFactor = maps:get(rerank_factor, Opts, 4),
     RerankK = K * RerankFactor,
 
@@ -562,6 +698,98 @@ search(#diskann_index{medoid_id = S, config = Config, deleted_set = DeletedSet,
     %% Return top K
     TopK = lists:sublist(Filtered, K),
     [{Id, D} || {D, Id} <- TopK].
+
+%% Beam search with PQ using integer IDs (for disk mode)
+beam_search_pq_int(Index, StartIntId, Query, DistTables, PQCodesInt, K, L) ->
+    %% Get PQ distance to start node
+    StartDist = case maps:find(StartIntId, PQCodesInt) of
+        {ok, Code} -> barrel_vectordb_pq:distance(DistTables, Code);
+        error -> infinity
+    end,
+
+    Candidates = gb_trees:from_orddict([{{StartDist, StartIntId}, true}]),
+    Results = gb_trees:from_orddict([{{StartDist, StartIntId}, true}]),
+    Visited = sets:from_list([StartIntId]),
+    FurthestDist = StartDist,
+
+    %% Run beam search with PQ distances
+    PQResults = beam_search_pq_loop_int(Index, DistTables, PQCodesInt, Candidates,
+                                         Results, Visited, FurthestDist, K, L),
+
+    %% Rerank top results with full vectors for accuracy
+    rerank_with_full_vectors_int(PQResults, Query, Index, K).
+
+beam_search_pq_loop_int(_Index, _DistTables, _PQCodesInt, {0, nil}, Results, _Visited, _FurthestDist, K, _L) ->
+    ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+    lists:sublist(ResultList, K);
+beam_search_pq_loop_int(Index, DistTables, PQCodesInt, Candidates, Results, Visited, FurthestDist, K, L) ->
+    {{CurrentDist, CurrentIntId}, _, RestCandidates} = gb_trees:take_smallest(Candidates),
+
+    case CurrentDist > FurthestDist of
+        true ->
+            ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+            lists:sublist(ResultList, K);
+        false ->
+            Neighbors = get_neighbors_int(Index, CurrentIntId),
+            {NewCandidates, NewResults, NewVisited, NewFurthestDist} = lists:foldl(
+                fun(N, {CandAcc, ResAcc, VisAcc, FurthAcc}) ->
+                    case sets:is_element(N, VisAcc) of
+                        true ->
+                            {CandAcc, ResAcc, VisAcc, FurthAcc};
+                        false ->
+                            NewVisAcc = sets:add_element(N, VisAcc),
+                            D = case maps:find(N, PQCodesInt) of
+                                {ok, Code} -> barrel_vectordb_pq:distance(DistTables, Code);
+                                error -> infinity
+                            end,
+                            ResSize = gb_trees:size(ResAcc),
+                            ShouldAdd = D < FurthAcc orelse ResSize < L,
+                            case ShouldAdd of
+                                true ->
+                                    NewCandAcc = gb_trees:insert({D, N}, true, CandAcc),
+                                    NewResAcc0 = gb_trees:insert({D, N}, true, ResAcc),
+                                    NewResSize = gb_trees:size(NewResAcc0),
+                                    {NewResAcc, NewFurthAcc} = case NewResSize > L of
+                                        true ->
+                                            {_, _, Trimmed} = gb_trees:take_largest(NewResAcc0),
+                                            {{LastD, _}, _} = gb_trees:largest(Trimmed),
+                                            {Trimmed, LastD};
+                                        false ->
+                                            {{MaxD, _}, _} = gb_trees:largest(NewResAcc0),
+                                            {NewResAcc0, MaxD}
+                                    end,
+                                    {NewCandAcc, NewResAcc, NewVisAcc, NewFurthAcc};
+                                false ->
+                                    {CandAcc, ResAcc, NewVisAcc, FurthAcc}
+                            end
+                    end
+                end,
+                {RestCandidates, Results, Visited, FurthestDist},
+                Neighbors
+            ),
+
+            beam_search_pq_loop_int(Index, DistTables, PQCodesInt, NewCandidates,
+                                     NewResults, NewVisited, NewFurthestDist, K, L)
+    end.
+
+%% Rerank top candidates using full vectors (integer IDs)
+rerank_with_full_vectors_int(PQResults, Query, Index, K) ->
+    Config = Index#diskann_index.config,
+    Reranked = lists:map(
+        fun({_PQDist, IntId}) ->
+            Vec = get_vector_by_int_id(Index, IntId),
+            case Vec of
+                undefined ->
+                    {infinity, IntId};
+                _ ->
+                    ExactDist = distance_vec(Config, Query, Vec),
+                    {ExactDist, IntId}
+            end
+        end,
+        PQResults
+    ),
+    Sorted = lists:sort(Reranked),
+    lists:sublist(Sorted, K).
 
 %% @doc Get index size (excluding deleted)
 -spec size(diskann_index()) -> non_neg_integer().
@@ -628,11 +856,31 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
 
 %% @doc Get vector by ID (uses cache for disk mode)
 -spec get_vector(diskann_index(), binary()) -> {ok, [float()]} | not_found.
-get_vector(Index, Id) ->
+get_vector(#diskann_index{storage_mode = memory} = Index, Id) ->
+    %% Memory mode: use string ID directly
     {Vec, _UpdatedIndex} = get_vector_or_cached(Index, Id),
     case Vec of
         undefined -> not_found;
         _ -> {ok, Vec}
+    end;
+get_vector(#diskann_index{storage_mode = disk, id_db = undefined} = Index, Id) ->
+    %% Disk mode without RocksDB (legacy V1 fallback)
+    {Vec, _UpdatedIndex} = get_vector_or_cached(Index, Id),
+    case Vec of
+        undefined -> not_found;
+        _ -> {ok, Vec}
+    end;
+get_vector(#diskann_index{storage_mode = disk} = Index, StringId) ->
+    %% Disk mode with RocksDB (V2 format): convert string ID to integer ID
+    case string_id_to_int(Index, StringId) of
+        {ok, IntId} ->
+            Vec = get_vector_by_int_id(Index, IntId),
+            case Vec of
+                undefined -> not_found;
+                _ -> {ok, Vec}
+            end;
+        not_found ->
+            not_found
     end.
 
 %% @doc Consolidate deleted nodes (batch cleanup)
@@ -721,104 +969,376 @@ consolidate_deletes_impl(Index, DeletedSet, Config, Nodes, Vectors) ->
 %%====================================================================
 
 %% @doc Open an existing DiskANN index from disk
-%% Reconstructs in-memory structures (graph, PQ codes) from disk files
+%% For V2 format: O(1) startup with lazy graph loading
+%% For V1 format: Migrates to V2 or loads from diskann.index
 -spec open(binary() | string()) -> {ok, diskann_index()} | {error, term()}.
 open(BasePath) ->
     BasePathBin = to_binary_or_undefined(BasePath),
-    case barrel_vectordb_diskann_file:open(BasePathBin) of
+    IdDbPath = filename:join(BasePathBin, "diskann_ids"),
+    case filelib:is_dir(IdDbPath) of
+        true ->
+            %% V2 format with RocksDB ID mapping - fast O(1) open
+            open_v2(BasePathBin);
+        false ->
+            %% V1 format - try to migrate or use legacy open
+            open_v1_with_migration(BasePathBin)
+    end.
+
+%% Open V2 format index (O(1) startup)
+open_v2(BasePath) ->
+    %% 1. Open binary files (O(1))
+    case barrel_vectordb_diskann_file:open(BasePath) of
         {ok, FileHandle} ->
-            Header = barrel_vectordb_diskann_file:read_header(FileHandle),
-            rebuild_index_from_disk(FileHandle, Header, BasePathBin);
+            %% 2. Read header from binary file
+            case barrel_vectordb_diskann_file:read_header_from_file(FileHandle) of
+                {ok, Header} ->
+                    open_v2_with_header(BasePath, FileHandle, Header);
+                {error, _} ->
+                    %% Fallback to meta file header
+                    Header = barrel_vectordb_diskann_file:read_header(FileHandle),
+                    open_v2_with_header(BasePath, FileHandle, Header)
+            end;
         {error, _} = Error ->
             Error
     end.
 
-%% Rebuild the in-memory index from disk files
-rebuild_index_from_disk(FileHandle, Header, BasePath) ->
-    Dimension = maps:get(dimension, Header, 128),
-    R = maps:get(r, Header, 64),
-    NodeCount = maps:get(node_count, Header, 0),
-    MedoidId = maps:get(entry_point, Header, undefined),
-    DistFn = maps:get(distance_fn, Header, cosine),
+open_v2_with_header(BasePath, FileHandle, Header) ->
+    %% 3. Open RocksDB for ID mapping (O(1))
+    case open_id_db(BasePath) of
+        {ok, IdDb, CfFwd, CfRev, Standalone} ->
+            Dimension = maps:get(dimension, Header, 128),
+            R = maps:get(r, Header, 64),
+            NodeCount = maps:get(node_count, Header, 0),
+            DistFn = maps:get(distance_fn, Header, cosine),
 
-    Config = #diskann_config{
-        dimension = Dimension,
-        r = R,
-        distance_fn = DistFn
-    },
+            %% Get integer medoid ID (V2) or string medoid (V1)
+            MedoidIntId = maps:get(entry_point_int, Header, 0),
+            MedoidId = maps:get(entry_point, Header, undefined),
+            NextIntId = maps:get(next_int_id, Header, NodeCount),
 
-    %% Create ETS cache table for this index
-    CacheTable = create_cache_table(),
+            Config = #diskann_config{
+                dimension = Dimension,
+                r = R,
+                distance_fn = DistFn
+            },
 
-    %% Read graph from disk (would need to implement graph reading in diskann_file)
-    %% For now, we rebuild from the metadata file if available
-    MetaPath = filename:join(BasePath, "diskann.index"),
-    Index0 = case file:read_file(MetaPath) of
-        {ok, MetaBin} ->
-            %% Load serialized index state
-            try binary_to_term(MetaBin) of
-                SerializedIndex ->
-                    SerializedIndex#diskann_index{
-                        file_handle = FileHandle,
-                        base_path = BasePath,
-                        storage_mode = disk,
-                        cache_table = CacheTable
-                    }
+            %% 4. Create ETS caches (empty - lazy load)
+            CacheTable = create_cache_table(),
+            GraphCacheTable = create_graph_cache_table(),
+
+            %% 5. Load PQ state if available
+            {PQState, PQCodesInt} = load_pq_state(BasePath),
+
+            Index = #diskann_index{
+                config = Config,
+                file_handle = FileHandle,
+                base_path = BasePath,
+                storage_mode = disk,
+                medoid_id = MedoidId,
+                medoid_int_id = MedoidIntId,
+                size = NodeCount,
+                nodes = #{},  %% Empty - lazy load from disk
+                nodes_int = #{},
+                id_db = IdDb,
+                id_cf_fwd = CfFwd,
+                id_cf_rev = CfRev,
+                id_db_standalone = Standalone,
+                next_int_id = NextIntId,
+                cache_table = CacheTable,
+                graph_cache_table = GraphCacheTable,
+                pq_state = PQState,
+                pq_codes_int = PQCodesInt,
+                use_pq = PQState =/= undefined
+            },
+
+            %% 6. Pre-warm caches with medoid + neighbors (optional, for better first-query latency)
+            prewarm_caches(Index, MedoidIntId, min(100, Index#diskann_index.cache_max_size)),
+
+            {ok, Index};
+
+        {error, Reason} ->
+            barrel_vectordb_diskann_file:close(FileHandle),
+            {error, {id_db_open_failed, Reason}}
+    end.
+
+%% Open V1 format or migrate to V2
+open_v1_with_migration(BasePath) ->
+    case barrel_vectordb_diskann_file:open(BasePath) of
+        {ok, FileHandle} ->
+            Header = barrel_vectordb_diskann_file:read_header(FileHandle),
+            %% Try to load from legacy diskann.index file
+            MetaPath = filename:join(BasePath, "diskann.index"),
+            case file:read_file(MetaPath) of
+                {ok, MetaBin} ->
+                    try binary_to_term(MetaBin) of
+                        SerializedIndex ->
+                            %% Legacy V1 index loaded - migrate to V2
+                            migrate_v1_to_v2(SerializedIndex, FileHandle, BasePath)
+                    catch
+                        _:_ ->
+                            %% Invalid binary, create empty V2 index
+                            create_empty_v2_index(FileHandle, Header, BasePath)
+                    end;
+                {error, _} ->
+                    %% No legacy file, create empty V2 index
+                    create_empty_v2_index(FileHandle, Header, BasePath)
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% Migrate V1 index to V2 format
+migrate_v1_to_v2(V1Index, FileHandle, BasePath) ->
+    %% Open RocksDB for new ID mapping
+    case open_id_db(BasePath) of
+        {ok, IdDb, CfFwd, CfRev, Standalone} ->
+            Config = V1Index#diskann_index.config,
+            Nodes = V1Index#diskann_index.nodes,
+            MedoidId = V1Index#diskann_index.medoid_id,
+
+            %% Assign integer IDs to all existing nodes
+            {Index1, IntIdMap} = maps:fold(
+                fun(StringId, _Node, {AccIndex, AccMap}) ->
+                    {IntId, NewIndex} = get_or_create_int_id(AccIndex, StringId),
+                    {NewIndex, AccMap#{StringId => IntId}}
+                end,
+                {#diskann_index{
+                    id_db = IdDb,
+                    id_cf_fwd = CfFwd,
+                    id_cf_rev = CfRev,
+                    id_db_standalone = Standalone,
+                    next_int_id = 0
+                }, #{}},
+                Nodes
+            ),
+
+            %% Get medoid integer ID
+            MedoidIntId = maps:get(MedoidId, IntIdMap, 0),
+
+            %% Convert graph to integer IDs and write to disk
+            R = Config#diskann_config.r,
+            maps:foreach(
+                fun(StringId, #diskann_node{neighbors = Neighbors}) ->
+                    IntId = maps:get(StringId, IntIdMap),
+                    NeighborIntIds = [maps:get(N, IntIdMap, 0) || N <- Neighbors],
+                    ok = barrel_vectordb_diskann_file:write_node_int(FileHandle, IntId, NeighborIntIds, R)
+                end,
+                Nodes
+            ),
+
+            %% Update header to V2 format
+            NodeCount = maps:size(Nodes),
+            {ok, FileHandle2} = barrel_vectordb_diskann_file:write_header(
+                FileHandle,
+                #{
+                    dimension => Config#diskann_config.dimension,
+                    r => R,
+                    node_count => NodeCount,
+                    distance_fn => Config#diskann_config.distance_fn,
+                    entry_point => MedoidId,
+                    entry_point_int => MedoidIntId,
+                    next_int_id => Index1#diskann_index.next_int_id
+                }
+            ),
+
+            %% Create caches
+            CacheTable = create_cache_table(),
+            GraphCacheTable = create_graph_cache_table(),
+
+            %% Convert PQ codes to integer IDs
+            PQCodesInt = case V1Index#diskann_index.use_pq of
+                true ->
+                    maps:fold(
+                        fun(StringId, Code, Acc) ->
+                            case maps:find(StringId, IntIdMap) of
+                                {ok, IntId} -> Acc#{IntId => Code};
+                                error -> Acc
+                            end
+                        end,
+                        #{},
+                        V1Index#diskann_index.pq_codes
+                    );
+                false ->
+                    #{}
+            end,
+
+            Index2 = #diskann_index{
+                config = Config,
+                file_handle = FileHandle2,
+                base_path = BasePath,
+                storage_mode = disk,
+                medoid_id = MedoidId,
+                medoid_int_id = MedoidIntId,
+                size = NodeCount,
+                nodes = #{},  %% Clear - now on disk
+                nodes_int = #{},
+                id_db = IdDb,
+                id_cf_fwd = CfFwd,
+                id_cf_rev = CfRev,
+                id_db_standalone = Standalone,
+                next_int_id = Index1#diskann_index.next_int_id,
+                cache_table = CacheTable,
+                graph_cache_table = GraphCacheTable,
+                pq_state = V1Index#diskann_index.pq_state,
+                pq_codes_int = PQCodesInt,
+                use_pq = V1Index#diskann_index.use_pq,
+                deleted_set = V1Index#diskann_index.deleted_set
+            },
+
+            %% Delete legacy diskann.index file
+            MetaPath = filename:join(BasePath, "diskann.index"),
+            file:delete(MetaPath),
+
+            %% Pre-warm caches
+            prewarm_caches(Index2, MedoidIntId, min(100, Index2#diskann_index.cache_max_size)),
+
+            {ok, Index2};
+
+        {error, Reason} ->
+            barrel_vectordb_diskann_file:close(FileHandle),
+            {error, {migration_failed, Reason}}
+    end.
+
+%% Create empty V2 index
+create_empty_v2_index(FileHandle, Header, BasePath) ->
+    case open_id_db(BasePath) of
+        {ok, IdDb, CfFwd, CfRev, Standalone} ->
+            Dimension = maps:get(dimension, Header, 128),
+            R = maps:get(r, Header, 64),
+            NodeCount = maps:get(node_count, Header, 0),
+            MedoidId = maps:get(entry_point, Header, undefined),
+            DistFn = maps:get(distance_fn, Header, cosine),
+
+            Config = #diskann_config{
+                dimension = Dimension,
+                r = R,
+                distance_fn = DistFn
+            },
+
+            CacheTable = create_cache_table(),
+            GraphCacheTable = create_graph_cache_table(),
+
+            {ok, #diskann_index{
+                config = Config,
+                file_handle = FileHandle,
+                base_path = BasePath,
+                storage_mode = disk,
+                medoid_id = MedoidId,
+                medoid_int_id = 0,
+                size = NodeCount,
+                nodes = #{},
+                nodes_int = #{},
+                id_db = IdDb,
+                id_cf_fwd = CfFwd,
+                id_cf_rev = CfRev,
+                id_db_standalone = Standalone,
+                next_int_id = NodeCount,
+                cache_table = CacheTable,
+                graph_cache_table = GraphCacheTable
+            }};
+        {error, Reason} ->
+            barrel_vectordb_diskann_file:close(FileHandle),
+            {error, {id_db_open_failed, Reason}}
+    end.
+
+%% Load PQ state from disk
+load_pq_state(BasePath) ->
+    PqStatePath = filename:join(BasePath, "diskann.pq_state"),
+    case file:read_file(PqStatePath) of
+        {ok, Bin} ->
+            try binary_to_term(Bin) of
+                {PQState, PQCodesInt} -> {PQState, PQCodesInt};
+                PQState -> {PQState, #{}}  %% Legacy format
             catch
-                _:_ ->
-                    %% Fallback to empty index with header info
-                    create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount, CacheTable)
+                _:_ -> {undefined, #{}}
             end;
         {error, _} ->
-            %% No serialized state, create basic index
-            create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount, CacheTable)
-    end,
+            {undefined, #{}}
+    end.
 
-    {ok, Index0}.
-
-create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount, CacheTable) ->
-    #diskann_index{
-        config = Config,
-        file_handle = FileHandle,
-        base_path = BasePath,
-        storage_mode = disk,
-        medoid_id = MedoidId,
-        size = NodeCount,
-        nodes = #{},
-        id_to_idx = #{},
-        idx_to_id = #{},
-        cache_table = CacheTable
-    }.
+%% Save PQ state to disk
+save_pq_state(_BasePath, undefined, _PQCodesInt) -> ok;
+save_pq_state(BasePath, PQState, PQCodesInt) ->
+    PqStatePath = filename:join(BasePath, "diskann.pq_state"),
+    file:write_file(PqStatePath, term_to_binary({PQState, PQCodesInt})).
 
 %% @doc Close the index and flush to disk
+%% For V2 format: writes header and PQ state, closes RocksDB
+%% Does NOT use term_to_binary for the entire index
 -spec close(diskann_index()) -> ok.
-close(#diskann_index{file_handle = undefined, cache_table = undefined}) ->
+close(#diskann_index{file_handle = undefined, cache_table = undefined,
+                     graph_cache_table = undefined, id_db = undefined}) ->
     ok;
-close(#diskann_index{file_handle = FileHandle, base_path = BasePath,
-                     cache_table = CacheTable, storage_mode = disk} = Index) ->
-    %% Save index metadata
-    save_index_metadata(Index),
-    %% Close file handles
+close(#diskann_index{storage_mode = disk} = Index) ->
+    #diskann_index{
+        file_handle = FileHandle,
+        base_path = BasePath,
+        cache_table = CacheTable,
+        graph_cache_table = GraphCacheTable,
+        id_db = IdDb,
+        id_db_standalone = Standalone,
+        config = Config,
+        size = Size,
+        medoid_id = MedoidId,
+        medoid_int_id = MedoidIntId,
+        next_int_id = NextIntId,
+        pq_state = PQState,
+        pq_codes_int = PQCodesInt
+    } = Index,
+
+    %% 1. Write final header to binary file (V2 format)
     case FileHandle of
         undefined -> ok;
-        _ -> barrel_vectordb_diskann_file:close(FileHandle)
+        _ ->
+            {ok, _} = barrel_vectordb_diskann_file:write_header(
+                FileHandle,
+                #{
+                    dimension => Config#diskann_config.dimension,
+                    r => Config#diskann_config.r,
+                    node_count => Size,
+                    distance_fn => Config#diskann_config.distance_fn,
+                    entry_point => MedoidId,
+                    entry_point_int => MedoidIntId,
+                    next_int_id => NextIntId
+                }
+            )
     end,
-    %% Delete ETS cache table
+
+    %% 2. Save PQ state separately (small, uses term_to_binary only for PQ)
+    save_pq_state(BasePath, PQState, PQCodesInt),
+
+    %% 3. Sync binary files
+    case FileHandle of
+        undefined -> ok;
+        _ ->
+            barrel_vectordb_diskann_file:sync(FileHandle),
+            barrel_vectordb_diskann_file:close(FileHandle)
+    end,
+
+    %% 4. Close RocksDB (only if standalone)
+    close_id_db(IdDb, Standalone),
+
+    %% 5. Delete ETS tables
     case CacheTable of
         undefined -> ok;
         _ -> ets:delete(CacheTable)
     end,
-    %% Clear base_path reference
-    case BasePath of
+    case GraphCacheTable of
         undefined -> ok;
-        _ -> ok
+        _ -> ets:delete(GraphCacheTable)
     end,
+
     ok;
-close(#diskann_index{cache_table = CacheTable}) ->
-    %% Memory mode - just clean up ETS table if any
+close(#diskann_index{storage_mode = memory, cache_table = CacheTable,
+                     graph_cache_table = GraphCacheTable}) ->
+    %% Memory mode - just clean up ETS tables if any
     case CacheTable of
         undefined -> ok;
         _ -> ets:delete(CacheTable)
+    end,
+    case GraphCacheTable of
+        undefined -> ok;
+        _ -> ets:delete(GraphCacheTable)
     end,
     ok.
 
@@ -826,22 +1346,32 @@ close(#diskann_index{cache_table = CacheTable}) ->
 -spec sync(diskann_index()) -> ok.
 sync(#diskann_index{file_handle = undefined}) ->
     ok;
-sync(#diskann_index{file_handle = FileHandle} = Index) ->
-    save_index_metadata(Index),
+sync(#diskann_index{storage_mode = disk, file_handle = FileHandle,
+                    base_path = BasePath, config = Config,
+                    size = Size, medoid_id = MedoidId,
+                    medoid_int_id = MedoidIntId, next_int_id = NextIntId,
+                    pq_state = PQState, pq_codes_int = PQCodesInt}) ->
+    %% Write header
+    {ok, _} = barrel_vectordb_diskann_file:write_header(
+        FileHandle,
+        #{
+            dimension => Config#diskann_config.dimension,
+            r => Config#diskann_config.r,
+            node_count => Size,
+            distance_fn => Config#diskann_config.distance_fn,
+            entry_point => MedoidId,
+            entry_point_int => MedoidIntId,
+            next_int_id => NextIntId
+        }
+    ),
+    %% Save PQ state
+    save_pq_state(BasePath, PQState, PQCodesInt),
+    %% Sync files
     barrel_vectordb_diskann_file:sync(FileHandle),
-    ok.
-
-%% Save index metadata (graph, PQ state, mappings) to disk
-save_index_metadata(#diskann_index{base_path = undefined}) ->
     ok;
-save_index_metadata(#diskann_index{base_path = BasePath} = Index) ->
-    MetaPath = filename:join(BasePath, "diskann.index"),
-    %% Clear file handle and cache table before serializing (can't serialize)
-    IndexToSave = Index#diskann_index{
-        file_handle = undefined,
-        cache_table = undefined  %% ETS table not serializable
-    },
-    file:write_file(MetaPath, term_to_binary(IndexToSave)).
+sync(#diskann_index{storage_mode = memory}) ->
+    %% Nothing to sync for memory mode
+    ok.
 
 %% @doc Serialize index to binary (for barrel_vectordb_index behaviour)
 -spec serialize(diskann_index()) -> binary().
@@ -1034,6 +1564,270 @@ vamana_pass(#diskann_index{medoid_id = S, nodes = Nodes} = Index,
         Index,
         Sigma
     ).
+
+%%====================================================================
+%% Internal: Vamana Build with Integer IDs (for disk mode)
+%%====================================================================
+
+%% Initialize random R-regular graph using integer IDs
+init_random_graph_int(#diskann_index{config = Config} = Index, IntIds) ->
+    R = Config#diskann_config.r,
+    N = length(IntIds),
+    IdsArray = list_to_tuple(IntIds),
+
+    NodesInt = lists:foldl(
+        fun(IntId, Acc) ->
+            %% Pick R random neighbors (excluding self)
+            Neighbors = random_neighbors_int(IntId, IdsArray, N, R),
+            Acc#{IntId => Neighbors}
+        end,
+        #{},
+        IntIds
+    ),
+    Index#diskann_index{nodes_int = NodesInt}.
+
+random_neighbors_int(IntId, IdsArray, N, R) ->
+    NumNeighbors = min(R, N - 1),
+    random_neighbors_int(IntId, IdsArray, N, NumNeighbors, []).
+
+random_neighbors_int(_IntId, _IdsArray, _N, 0, Acc) ->
+    Acc;
+random_neighbors_int(IntId, IdsArray, N, Remaining, Acc) ->
+    Idx = rand:uniform(N),
+    Neighbor = element(Idx, IdsArray),
+    case Neighbor =:= IntId orelse lists:member(Neighbor, Acc) of
+        true ->
+            random_neighbors_int(IntId, IdsArray, N, Remaining, Acc);
+        false ->
+            random_neighbors_int(IntId, IdsArray, N, Remaining - 1, [Neighbor | Acc])
+    end.
+
+%% Single pass of Vamana construction using integer IDs
+vamana_pass_int(#diskann_index{medoid_int_id = S, nodes_int = NodesInt} = Index,
+                Alpha, L, R) ->
+    %% Random permutation of all node integer IDs
+    IntIds = maps:keys(NodesInt),
+    Sigma = shuffle(IntIds),
+
+    lists:foldl(
+        fun(IntId, AccIndex) ->
+            %% Get vector by integer ID
+            Vec = get_vector_by_int_id(AccIndex, IntId),
+
+            %% Search to find candidates
+            {_Results, Visited} = greedy_search_int(AccIndex, S, Vec, 1, L),
+
+            %% Prune to select R out-neighbors
+            AccIndex2 = robust_prune_int(AccIndex, IntId, sets:to_list(Visited), Alpha, R),
+            Neighbors = get_neighbors_int(AccIndex2, IntId),
+
+            %% Add backward edges (bidirectional)
+            lists:foldl(
+                fun(J, AccInner) ->
+                    JNeighbors = get_neighbors_int(AccInner, J),
+                    case length(JNeighbors) + 1 > R of
+                        true ->
+                            robust_prune_int(AccInner, J, [IntId | JNeighbors], Alpha, R);
+                        false ->
+                            add_neighbor_int(AccInner, J, IntId)
+                    end
+                end,
+                AccIndex2,
+                Neighbors
+            )
+        end,
+        Index,
+        Sigma
+    ).
+
+%% Greedy search using integer IDs
+greedy_search_int(Index, StartIntId, Query, K, L) ->
+    StartDist = distance_int(Index, StartIntId, Query),
+    Candidates = gb_trees:from_orddict([{{StartDist, StartIntId}, true}]),
+    Results = gb_trees:from_orddict([{{StartDist, StartIntId}, true}]),
+    Visited = sets:from_list([StartIntId]),
+    FurthestDist = StartDist,
+
+    greedy_loop_int(Index, Query, Candidates, Results, Visited, FurthestDist, K, L).
+
+greedy_loop_int(_Index, _Query, {0, nil}, Results, Visited, _FurthestDist, K, _L) ->
+    ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+    TopK = lists:sublist(ResultList, K),
+    {TopK, Visited};
+greedy_loop_int(Index, Query, Candidates, Results, Visited, FurthestDist, K, L) ->
+    {{CurrentDist, CurrentIntId}, _, RestCandidates} = gb_trees:take_smallest(Candidates),
+
+    case CurrentDist > FurthestDist of
+        true ->
+            ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+            TopK = lists:sublist(ResultList, K),
+            {TopK, Visited};
+        false ->
+            Neighbors = get_neighbors_int(Index, CurrentIntId),
+            {NewCandidates, NewResults, NewVisited, NewFurthestDist} = lists:foldl(
+                fun(N, {CandAcc, ResAcc, VisAcc, FurthAcc}) ->
+                    case sets:is_element(N, VisAcc) of
+                        true ->
+                            {CandAcc, ResAcc, VisAcc, FurthAcc};
+                        false ->
+                            NewVisAcc = sets:add_element(N, VisAcc),
+                            D = distance_int(Index, N, Query),
+                            ResSize = gb_trees:size(ResAcc),
+                            ShouldAdd = D < FurthAcc orelse ResSize < L,
+                            case ShouldAdd of
+                                true ->
+                                    NewCandAcc = gb_trees:insert({D, N}, true, CandAcc),
+                                    NewResAcc0 = gb_trees:insert({D, N}, true, ResAcc),
+                                    NewResSize = gb_trees:size(NewResAcc0),
+                                    {NewResAcc, NewFurthAcc} = case NewResSize > L of
+                                        true ->
+                                            {_, _, Trimmed} = gb_trees:take_largest(NewResAcc0),
+                                            {{LastD, _}, _} = gb_trees:largest(Trimmed),
+                                            {Trimmed, LastD};
+                                        false ->
+                                            {{MaxD, _}, _} = gb_trees:largest(NewResAcc0),
+                                            {NewResAcc0, MaxD}
+                                    end,
+                                    {NewCandAcc, NewResAcc, NewVisAcc, NewFurthAcc};
+                                false ->
+                                    {CandAcc, ResAcc, NewVisAcc, FurthAcc}
+                            end
+                    end
+                end,
+                {RestCandidates, Results, Visited, FurthestDist},
+                Neighbors
+            ),
+
+            greedy_loop_int(Index, Query, NewCandidates, NewResults, NewVisited, NewFurthestDist, K, L)
+    end.
+
+%% RobustPrune using integer IDs
+robust_prune_int(Index, P, V, Alpha, R) ->
+    CurrentNeighbors = get_neighbors_int(Index, P),
+    Candidates = lists:usort(V ++ CurrentNeighbors) -- [P],
+
+    PVec = get_vector_by_int_id(Index, P),
+    Config = Index#diskann_index.config,
+
+    %% Build list with cached distances: [{Dist, IntId, Vec}]
+    CandidatesWithDist = lists:filtermap(
+        fun(C) ->
+            CVec = get_vector_by_int_id(Index, C),
+            case CVec of
+                undefined -> false;
+                _ -> {true, {distance_vec(Config, PVec, CVec), C, CVec}}
+            end
+        end,
+        Candidates
+    ),
+
+    %% Sort by distance to P
+    SortedCandidates = lists:sort(fun({D1, _, _}, {D2, _, _}) -> D1 =< D2 end, CandidatesWithDist),
+
+    %% Prune with cached data
+    NewNeighbors = prune_loop_cached_int(Config, PVec, SortedCandidates, Alpha, R, []),
+
+    %% Update node
+    set_neighbors_int(Index, P, NewNeighbors).
+
+prune_loop_cached_int(_Config, _PVec, [], _Alpha, _R, Acc) ->
+    lists:reverse(Acc);
+prune_loop_cached_int(_Config, _PVec, _Candidates, _Alpha, R, Acc) when length(Acc) >= R ->
+    lists:reverse(Acc);
+prune_loop_cached_int(Config, PVec, [{_Dist, PStar, PStarVec} | Rest], Alpha, R, Acc) ->
+    NewAcc = [PStar | Acc],
+    FilteredRest = lists:filter(
+        fun({DistP_PPrime, _PPrime, PPrimeVec}) ->
+            DistPStar_PPrime = distance_vec(Config, PStarVec, PPrimeVec),
+            Alpha * DistPStar_PPrime > DistP_PPrime
+        end,
+        Rest
+    ),
+    prune_loop_cached_int(Config, PVec, FilteredRest, Alpha, R, NewAcc).
+
+%% Write all graph nodes to disk
+write_graph_nodes_to_disk(#diskann_index{nodes_int = NodesInt, file_handle = FH,
+                                          config = Config} = Index, IntIds) ->
+    R = Config#diskann_config.r,
+    lists:foreach(
+        fun(IntId) ->
+            Neighbors = maps:get(IntId, NodesInt, []),
+            ok = barrel_vectordb_diskann_file:write_node_int(FH, IntId, Neighbors, R)
+        end,
+        IntIds
+    ),
+    Index.
+
+%% Populate cache for build with integer IDs
+populate_cache_for_build_int(CacheTable, IntIdVectors) when CacheTable =/= undefined ->
+    Now = erlang:monotonic_time(),
+    lists:foreach(
+        fun({IntId, Vec, _StringId}) ->
+            ets:insert(CacheTable, {IntId, Vec, Now})
+        end,
+        IntIdVectors
+    );
+populate_cache_for_build_int(_, _) ->
+    ok.
+
+%% Clear graph cache
+clear_graph_cache(undefined) -> ok;
+clear_graph_cache(CacheTable) ->
+    ets:delete_all_objects(CacheTable).
+
+%% Pre-warm both vector and graph caches with medoid neighbors
+prewarm_caches(Index, MedoidIntId, MaxSize) ->
+    %% Get medoid neighbors
+    Neighbors = get_neighbors_int(Index, MedoidIntId),
+    %% Load medoid and its neighbors into caches
+    ToLoad = lists:sublist([MedoidIntId | Neighbors], MaxSize),
+    lists:foreach(
+        fun(IntId) ->
+            %% Load vector into cache
+            _ = get_vector_by_int_id(Index, IntId),
+            %% Neighbors are loaded on-demand, but we can pre-load them
+            _ = get_neighbors_int(Index, IntId)
+        end,
+        ToLoad
+    ),
+    ok.
+
+%% Train and apply PQ with integer IDs
+train_and_apply_pq_int(Index, Options, IntIdVectors) ->
+    Dim = (Index#diskann_index.config)#diskann_config.dimension,
+    M = maps:get(pq_m, Options, 8),
+    K = maps:get(pq_k, Options, 256),
+
+    case Dim rem M of
+        0 ->
+            {ok, PQConfig} = barrel_vectordb_pq:new(#{
+                m => M,
+                k => K,
+                dimension => Dim
+            }),
+            VecList = [Vec || {_, Vec, _} <- IntIdVectors],
+            {ok, TrainedPQ} = barrel_vectordb_pq:train(PQConfig, VecList),
+
+            %% Encode all vectors to PQ codes with integer IDs
+            PQCodesInt = maps:from_list([
+                {IntId, barrel_vectordb_pq:encode(TrainedPQ, Vec)}
+                || {IntId, Vec, _} <- IntIdVectors
+            ]),
+            %% Also keep string ID version for compatibility
+            PQCodes = maps:from_list([
+                {StringId, barrel_vectordb_pq:encode(TrainedPQ, Vec)}
+                || {_, Vec, StringId} <- IntIdVectors
+            ]),
+
+            Index#diskann_index{
+                pq_state = TrainedPQ,
+                pq_codes = PQCodes,
+                pq_codes_int = PQCodesInt,
+                use_pq = true
+            };
+        _ ->
+            Index
+    end.
 
 shuffle(List) ->
     [X || {_, X} <- lists:sort([{rand:uniform(), N} || N <- List])].
@@ -1309,18 +2103,6 @@ prune_neighbors(Index, P, Candidates, Alpha, R) ->
 create_cache_table() ->
     ets:new(diskann_vector_cache, [set, public, {read_concurrency, true}]).
 
-%% Populate cache with all vectors during build phase
-populate_cache_for_build(CacheTable, VectorMap) when CacheTable =/= undefined ->
-    Now = erlang:monotonic_time(),
-    maps:foreach(
-        fun(Id, Vec) ->
-            ets:insert(CacheTable, {Id, Vec, Now})
-        end,
-        VectorMap
-    );
-populate_cache_for_build(_, _) ->
-    ok.
-
 %% Clear all entries from cache table
 clear_cache_table(undefined) -> ok;
 clear_cache_table(CacheTable) ->
@@ -1372,13 +2154,6 @@ cache_get(CacheTable, Id) ->
         [{Id, Vec, _Timestamp}] -> {ok, Vec};
         [] -> not_found
     end.
-
-%% Put into ETS cache (simple, no eviction)
-cache_put(undefined, _Id, _Vec) -> ok;
-cache_put(CacheTable, Id, Vec) ->
-    Now = erlang:monotonic_time(),
-    ets:insert(CacheTable, {Id, Vec, Now}),
-    ok.
 
 %% Touch cache entry (update timestamp for LRU)
 cache_touch(undefined, _Id) -> ok;
@@ -1529,3 +2304,287 @@ add_neighbor(#diskann_index{nodes = Nodes} = Index, NodeId, NewNeighborId) ->
         error ->
             Index
     end.
+
+%%====================================================================
+%% Internal: RocksDB ID Mapping (for billion-scale disk mode)
+%%====================================================================
+
+%% Open or get RocksDB for ID mapping
+%% First tries to get handles from barrel_vectordb_store (shared RocksDB)
+%% Falls back to opening a standalone database if store is not running
+%% Returns {ok, Db, CfFwd, CfRev, Standalone} where Standalone is true if we opened our own DB
+-spec open_id_db(binary()) -> {ok, rocksdb:db_handle(), rocksdb:cf_handle(), rocksdb:cf_handle(), boolean()} | {error, term()}.
+open_id_db(BasePath) ->
+    %% Try to get handles from the shared barrel_vectordb_store first
+    case catch barrel_vectordb_store:get_diskann_db() of
+        {ok, {Db, CfFwd, CfRev}} ->
+            {ok, Db, CfFwd, CfRev, false};  %% Not standalone - managed by store
+        _ ->
+            %% Store not running, open standalone database for testing/standalone use
+            case open_standalone_id_db(BasePath) of
+                {ok, Db, CfFwd, CfRev} ->
+                    {ok, Db, CfFwd, CfRev, true};  %% Standalone - we manage it
+                {error, _} = Err ->
+                    Err
+            end
+    end.
+
+%% Open standalone RocksDB for ID mapping (for tests or standalone mode)
+%% Also tracks open databases in process dictionary for cleanup
+open_standalone_id_db(BasePath) ->
+    DbPath = filename:join(BasePath, "diskann_ids"),
+    ok = filelib:ensure_dir(filename:join(DbPath, "dummy")),
+    CfNames = ["default", "ids_fwd", "ids_rev"],
+    DbOpts = [{create_if_missing, true}, {create_missing_column_families, true}],
+    CfOpts = [],
+    case rocksdb:open_with_cf(binary_to_list(DbPath), DbOpts,
+                              [{Name, CfOpts} || Name <- CfNames]) of
+        {ok, Db, [_Default, CfFwd, CfRev]} ->
+            %% Track open database for cleanup
+            register_standalone_db(Db),
+            {ok, Db, CfFwd, CfRev};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Track open standalone databases in process dictionary
+register_standalone_db(Db) ->
+    OpenDbs = case get(diskann_open_standalone_dbs) of
+        undefined -> [];
+        List -> List
+    end,
+    put(diskann_open_standalone_dbs, [Db | OpenDbs]).
+
+unregister_standalone_db(Db) ->
+    case get(diskann_open_standalone_dbs) of
+        undefined -> ok;
+        List -> put(diskann_open_standalone_dbs, lists:delete(Db, List))
+    end.
+
+%% Close all open standalone databases (for test cleanup)
+-spec close_all_standalone_dbs() -> ok.
+close_all_standalone_dbs() ->
+    case get(diskann_open_standalone_dbs) of
+        undefined -> ok;
+        List ->
+            lists:foreach(fun(Db) ->
+                catch rocksdb:close(Db)
+            end, List),
+            put(diskann_open_standalone_dbs, [])
+    end,
+    ok.
+
+%% Get or create integer ID for string ID
+%% Returns {IntId, UpdatedIndex}
+-spec get_or_create_int_id(diskann_index(), binary()) -> {non_neg_integer(), diskann_index()}.
+get_or_create_int_id(#diskann_index{id_db = undefined} = Index, StringId) ->
+    %% Fallback to in-memory maps when RocksDB not available
+    case maps:find(StringId, Index#diskann_index.id_to_idx) of
+        {ok, IntId} ->
+            {IntId, Index};
+        error ->
+            IntId = Index#diskann_index.next_int_id,
+            NewIdToIdx = maps:put(StringId, IntId, Index#diskann_index.id_to_idx),
+            NewIdxToId = maps:put(IntId, StringId, Index#diskann_index.idx_to_id),
+            {IntId, Index#diskann_index{
+                id_to_idx = NewIdToIdx,
+                idx_to_id = NewIdxToId,
+                next_int_id = IntId + 1
+            }}
+    end;
+get_or_create_int_id(#diskann_index{id_db = Db, id_cf_fwd = CfFwd, id_cf_rev = CfRev,
+                                     next_int_id = NextId} = Index, StringId) ->
+    case rocksdb:get(Db, CfFwd, StringId, []) of
+        {ok, <<IntId:64/little>>} ->
+            {IntId, Index};
+        not_found ->
+            IntId = NextId,
+            ok = rocksdb:put(Db, CfFwd, StringId, <<IntId:64/little>>, []),
+            ok = rocksdb:put(Db, CfRev, <<IntId:64/little>>, StringId, []),
+            {IntId, Index#diskann_index{next_int_id = NextId + 1}};
+        {error, Reason} ->
+            error({rocksdb_error, Reason})
+    end.
+
+%% Lookup string ID from integer ID
+-spec int_id_to_string(diskann_index(), non_neg_integer()) -> {ok, binary()} | not_found.
+int_id_to_string(#diskann_index{id_db = undefined} = Index, IntId) ->
+    %% Fallback to in-memory maps
+    case maps:find(IntId, Index#diskann_index.idx_to_id) of
+        {ok, StringId} -> {ok, StringId};
+        error -> not_found
+    end;
+int_id_to_string(#diskann_index{id_db = Db, id_cf_rev = CfRev}, IntId) ->
+    case rocksdb:get(Db, CfRev, <<IntId:64/little>>, []) of
+        {ok, StringId} -> {ok, StringId};
+        not_found -> not_found;
+        {error, Reason} -> error({rocksdb_error, Reason})
+    end.
+
+%% Lookup integer ID from string ID
+-spec string_id_to_int(diskann_index(), binary()) -> {ok, non_neg_integer()} | not_found.
+string_id_to_int(#diskann_index{id_db = undefined} = Index, StringId) ->
+    %% Fallback to in-memory maps
+    case maps:find(StringId, Index#diskann_index.id_to_idx) of
+        {ok, IntId} -> {ok, IntId};
+        error -> not_found
+    end;
+string_id_to_int(#diskann_index{id_db = Db, id_cf_fwd = CfFwd}, StringId) ->
+    case rocksdb:get(Db, CfFwd, StringId, []) of
+        {ok, <<IntId:64/little>>} -> {ok, IntId};
+        not_found -> not_found;
+        {error, Reason} -> error({rocksdb_error, Reason})
+    end.
+
+%% Close RocksDB ID mapping (only close if standalone)
+close_id_db(undefined, _) -> ok;
+close_id_db(_, false) -> ok;  %% Not standalone - shared with barrel_vectordb_store
+close_id_db(Db, true) ->
+    unregister_standalone_db(Db),
+    case rocksdb:close(Db) of
+        ok -> ok;
+        {error, Reason} ->
+            error_logger:warning_msg("Failed to close RocksDB: ~p~n", [Reason]),
+            ok
+    end.
+
+%%====================================================================
+%% Internal: Graph Cache for Lazy Loading (disk mode)
+%%====================================================================
+
+%% Create ETS table for graph cache (IntId -> [NeighborIntIds])
+create_graph_cache_table() ->
+    ets:new(diskann_graph_cache, [set, public, {read_concurrency, true}]).
+
+%% Get neighbors from graph cache
+graph_cache_get(undefined, _IntId) -> not_found;
+graph_cache_get(CacheTable, IntId) ->
+    case ets:lookup(CacheTable, IntId) of
+        [{IntId, Neighbors, _Timestamp}] -> {ok, Neighbors};
+        [] -> not_found
+    end.
+
+%% Touch graph cache entry (update LRU timestamp)
+graph_cache_touch(undefined, _IntId) -> ok;
+graph_cache_touch(CacheTable, IntId) ->
+    Now = erlang:monotonic_time(),
+    ets:update_element(CacheTable, IntId, {3, Now}),
+    ok.
+
+%% Put into graph cache with LRU eviction
+graph_cache_put_with_eviction(CacheTable, IntId, Neighbors, MaxSize) ->
+    case CacheTable of
+        undefined -> ok;
+        _ ->
+            Now = erlang:monotonic_time(),
+            Size = ets:info(CacheTable, size),
+            case Size >= MaxSize of
+                true ->
+                    %% Evict oldest entries (batch evict ~10%)
+                    evict_oldest(CacheTable, max(1, MaxSize div 10));
+                false ->
+                    ok
+            end,
+            ets:insert(CacheTable, {IntId, Neighbors, Now}),
+            ok
+    end.
+
+%% Get neighbors using integer IDs (lazy loading from disk)
+get_neighbors_int(#diskann_index{storage_mode = memory, nodes_int = NodesInt}, IntId) ->
+    maps:get(IntId, NodesInt, []);
+get_neighbors_int(#diskann_index{storage_mode = disk, graph_cache_table = Cache,
+                                  file_handle = FH, graph_cache_max_size = MaxSize,
+                                  config = Config} = _Index, IntId) ->
+    case graph_cache_get(Cache, IntId) of
+        {ok, Neighbors} ->
+            graph_cache_touch(Cache, IntId),
+            Neighbors;
+        not_found ->
+            %% Load from disk: Node offset = header + IntId * sector_size
+            R = Config#diskann_config.r,
+            case barrel_vectordb_diskann_file:read_node_by_int_id(FH, IntId, R) of
+                {ok, {_IntId, Neighbors}} ->
+                    graph_cache_put_with_eviction(Cache, IntId, Neighbors, MaxSize),
+                    Neighbors;
+                {error, _} ->
+                    []
+            end
+    end.
+
+%% Set neighbors using integer IDs
+set_neighbors_int(#diskann_index{storage_mode = memory, nodes_int = NodesInt} = Index, IntId, Neighbors) ->
+    Index#diskann_index{nodes_int = NodesInt#{IntId => Neighbors}};
+set_neighbors_int(#diskann_index{storage_mode = disk, graph_cache_table = Cache,
+                                  file_handle = FH, config = Config} = Index, IntId, Neighbors) ->
+    %% Write to disk and update cache
+    R = Config#diskann_config.r,
+    ok = barrel_vectordb_diskann_file:write_node_int(FH, IntId, Neighbors, R),
+    %% Update cache
+    Now = erlang:monotonic_time(),
+    case Cache of
+        undefined -> ok;
+        _ -> ets:insert(Cache, {IntId, Neighbors, Now})
+    end,
+    Index.
+
+%% Add neighbor using integer IDs
+add_neighbor_int(Index, NodeIntId, NewNeighborIntId) ->
+    Neighbors = get_neighbors_int(Index, NodeIntId),
+    case lists:member(NewNeighborIntId, Neighbors) of
+        true -> Index;
+        false -> set_neighbors_int(Index, NodeIntId, [NewNeighborIntId | Neighbors])
+    end.
+
+%%====================================================================
+%% Internal: Distance with Integer IDs
+%%====================================================================
+
+%% Distance using integer ID for node lookup
+distance_int(Index, IntId, QueryVec) ->
+    Vec = get_vector_by_int_id(Index, IntId),
+    case Vec of
+        undefined -> infinity;
+        _ -> distance_vec(Index#diskann_index.config, QueryVec, Vec)
+    end.
+
+%% Get vector by integer ID (uses ETS cache for disk mode)
+get_vector_by_int_id(#diskann_index{storage_mode = memory, idx_to_id = IdxToId} = Index, IntId) ->
+    case maps:find(IntId, IdxToId) of
+        {ok, StringId} ->
+            case maps:find(StringId, Index#diskann_index.vectors) of
+                {ok, Vec} -> Vec;
+                error -> undefined
+            end;
+        error -> undefined
+    end;
+get_vector_by_int_id(#diskann_index{storage_mode = disk, cache_table = CacheTable,
+                                     file_handle = FH, cache_max_size = MaxSize} = _Index, IntId) ->
+    %% Check ETS cache first (keyed by IntId for disk mode)
+    case cache_get(CacheTable, IntId) of
+        {ok, Vec} ->
+            cache_touch(CacheTable, IntId),
+            Vec;
+        not_found ->
+            %% Load from disk
+            case barrel_vectordb_diskann_file:read_vector(FH, IntId) of
+                {ok, Vec} ->
+                    cache_put_with_eviction_by_key(CacheTable, IntId, Vec, MaxSize),
+                    Vec;
+                {error, _} ->
+                    undefined
+            end
+    end.
+
+%% Put into cache with LRU eviction by key (for integer IDs)
+cache_put_with_eviction_by_key(undefined, _Key, _Vec, _MaxSize) -> ok;
+cache_put_with_eviction_by_key(CacheTable, Key, Vec, MaxSize) ->
+    Now = erlang:monotonic_time(),
+    Size = ets:info(CacheTable, size),
+    case Size >= MaxSize of
+        true ->
+            evict_oldest(CacheTable, max(1, MaxSize div 10));
+        false ->
+            ok
+    end,
+    ets:insert(CacheTable, {Key, Vec, Now}),
+    ok.

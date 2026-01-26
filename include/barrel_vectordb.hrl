@@ -104,6 +104,9 @@
 -define(CF_METADATA, "metadata").
 -define(CF_TEXT, "text").
 -define(CF_HNSW, "hnsw_graph").
+%% DiskANN ID mapping column families
+-define(CF_DISKANN_IDS_FWD, "diskann_ids_fwd").  %% string ID -> integer ID
+-define(CF_DISKANN_IDS_REV, "diskann_ids_rev").  %% integer ID -> string ID
 
 %% HNSW persistence keys
 -define(HNSW_META_KEY, <<"__hnsw_meta__">>).

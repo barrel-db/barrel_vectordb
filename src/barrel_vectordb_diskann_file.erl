@@ -24,6 +24,7 @@
     close/1,
     write_header/2,
     read_header/1,
+    read_header_from_file/1,
     write_node/3,
     read_node/2,
     read_nodes_batch/2,
@@ -32,12 +33,17 @@
     write_pq_codes/3,
     read_pq_codes/2,
     sync/1,
-    get_path/1
+    get_path/1,
+    %% Integer ID functions for lazy graph loading
+    write_node_int/4,
+    read_node_by_int_id/3,
+    read_nodes_batch_int/3
 ]).
 
 -define(SECTOR_SIZE, 4096).
 -define(MAGIC, <<"DISKANN\0">>).
 -define(VERSION, 1).
+-define(VERSION_V2, 2).  %% Version 2: Integer IDs + lazy loading
 
 -record(diskann_file, {
     path :: binary(),
@@ -140,10 +146,73 @@ write_header(#diskann_file{graph_fd = Fd, path = Path} = File, Header) ->
     ok = file:write_file(MetaPath, term_to_binary(Header)),
     {ok, File#diskann_file{header = Header}}.
 
-%% @doc Read index header
+%% @doc Read index header (returns cached header)
 -spec read_header(diskann_file()) -> map().
 read_header(#diskann_file{header = Header}) ->
     Header.
+
+%% @doc Read header directly from graph file
+%% Supports both V1 (string entry point) and V2 (integer entry point) formats
+-spec read_header_from_file(diskann_file()) -> {ok, map()} | {error, term()}.
+read_header_from_file(#diskann_file{graph_fd = Fd}) ->
+    case file:pread(Fd, 0, ?SECTOR_SIZE) of
+        {ok, Data} ->
+            parse_header(Data);
+        {error, _} = Error ->
+            Error
+    end.
+
+%% Parse header binary data
+parse_header(<<Magic:8/binary, Version:32/little, NodeCount:32/little,
+               Dimension:16/little, R:16/little, DistFn:8, Rest/binary>>) ->
+    case Magic of
+        ?MAGIC ->
+            case Version of
+                ?VERSION ->
+                    %% V1 format: variable length string entry point
+                    EntryPoint = case Rest of
+                        <<0:16, _/binary>> -> undefined;
+                        <<Len:16/little, EP:Len/binary, _/binary>> -> EP
+                    end,
+                    {ok, #{
+                        magic => Magic,
+                        version => Version,
+                        node_count => NodeCount,
+                        dimension => Dimension,
+                        r => R,
+                        distance_fn => int_to_distance_fn(DistFn),
+                        entry_point => EntryPoint
+                    }};
+                ?VERSION_V2 ->
+                    %% V2 format: 64-bit integer entry point + next_int_id
+                    <<EntryPointInt:64/little, NextIntId:64/little, StrRest/binary>> = Rest,
+                    EntryPoint = case StrRest of
+                        <<0:16, _/binary>> -> undefined;
+                        <<Len:16/little, EP:Len/binary, _/binary>> -> EP
+                    end,
+                    {ok, #{
+                        magic => Magic,
+                        version => Version,
+                        node_count => NodeCount,
+                        dimension => Dimension,
+                        r => R,
+                        distance_fn => int_to_distance_fn(DistFn),
+                        entry_point => EntryPoint,
+                        entry_point_int => EntryPointInt,
+                        next_int_id => NextIntId
+                    }};
+                _ ->
+                    {error, {unsupported_version, Version}}
+            end;
+        _ ->
+            {error, invalid_magic}
+    end;
+parse_header(_) ->
+    {error, invalid_header}.
+
+int_to_distance_fn(0) -> cosine;
+int_to_distance_fn(1) -> euclidean;
+int_to_distance_fn(_) -> cosine.
 
 %% @doc Write a node to the graph file (sector-aligned)
 %% Returns {ok, Offset} where Offset is the byte offset
@@ -296,32 +365,61 @@ sync_if_open(undefined) -> ok;
 sync_if_open(Fd) -> file:sync(Fd).
 
 write_header_internal(Fd, Header) ->
+    %% Determine version based on whether we have entry_point_int
+    Version = case maps:get(entry_point_int, Header, undefined) of
+        undefined -> ?VERSION;
+        _ -> ?VERSION_V2
+    end,
+
     %% Header takes first sector
     Magic = ?MAGIC,
-    Version = ?VERSION,
     NodeCount = maps:get(node_count, Header, 0),
     Dimension = maps:get(dimension, Header, 128),
     R = maps:get(r, Header, 64),
     DistFn = distance_fn_to_int(maps:get(distance_fn, Header, cosine)),
 
-    %% Entry point ID (variable length)
-    EntryPointBin = case maps:get(entry_point, Header, undefined) of
-        undefined -> <<0:16>>;
-        EP when is_binary(EP) -> <<(byte_size(EP)):16, EP/binary>>
-    end,
+    case Version of
+        ?VERSION ->
+            %% V1: Entry point ID (variable length binary)
+            EntryPointBin = case maps:get(entry_point, Header, undefined) of
+                undefined -> <<0:16>>;
+                EP when is_binary(EP) -> <<(byte_size(EP)):16, EP/binary>>
+            end,
+            HeaderData = <<
+                Magic/binary,
+                Version:32/little,
+                NodeCount:32/little,
+                Dimension:16/little,
+                R:16/little,
+                DistFn:8,
+                EntryPointBin/binary
+            >>,
+            PaddedHeader = pad_to_sector(HeaderData),
+            file:pwrite(Fd, 0, PaddedHeader);
 
-    HeaderData = <<
-        Magic/binary,
-        Version:32/little,
-        NodeCount:32/little,
-        Dimension:16/little,
-        R:16/little,
-        DistFn:8,
-        EntryPointBin/binary
-    >>,
-
-    PaddedHeader = pad_to_sector(HeaderData),
-    file:pwrite(Fd, 0, PaddedHeader).
+        ?VERSION_V2 ->
+            %% V2: Entry point as 64-bit integer ID + next_int_id
+            EntryPointInt = maps:get(entry_point_int, Header, 0),
+            NextIntId = maps:get(next_int_id, Header, NodeCount),
+            %% Also store string entry point for compatibility
+            EntryPointStrBin = case maps:get(entry_point, Header, undefined) of
+                undefined -> <<0:16>>;
+                EP when is_binary(EP) -> <<(byte_size(EP)):16, EP/binary>>
+            end,
+            HeaderData = <<
+                Magic/binary,
+                ?VERSION_V2:32/little,
+                NodeCount:32/little,
+                Dimension:16/little,
+                R:16/little,
+                DistFn:8,
+                EntryPointInt:64/little,
+                NextIntId:64/little,
+                EntryPointStrBin/binary
+            >>,
+            PaddedHeader = pad_to_sector(HeaderData),
+            file:pwrite(Fd, 0, PaddedHeader)
+    end.
 
 pad_to_sector(Bin) ->
     Size = byte_size(Bin),
@@ -368,3 +466,79 @@ decode_node(Data, MaxR) ->
 
 distance_fn_to_int(cosine) -> 0;
 distance_fn_to_int(euclidean) -> 1.
+
+%%====================================================================
+%% Integer ID Node Functions (for lazy graph loading)
+%%====================================================================
+
+%% @doc Write a node to the graph file using integer ID
+%% Node format: [IntId:64/little][NeighborCount:16/little][Neighbor1:64/little]...[NeighborR:64/little][padding]
+%% Each node is stored at offset: SECTOR_SIZE + (IntId * SECTOR_SIZE)
+-spec write_node_int(diskann_file(), non_neg_integer(), [non_neg_integer()], pos_integer()) ->
+    ok | {error, term()}.
+write_node_int(#diskann_file{graph_fd = Fd}, IntId, Neighbors, MaxR) ->
+    %% Offset: header (1 sector) + IntId * sector_size
+    Offset = ?SECTOR_SIZE + (IntId * ?SECTOR_SIZE),
+    NodeBin = encode_node_int(IntId, Neighbors, MaxR),
+    PaddedBin = pad_to_sector(NodeBin),
+    file:pwrite(Fd, Offset, PaddedBin).
+
+%% @doc Read a node from the graph file by integer ID
+%% Returns {ok, {IntId, [NeighborIntIds]}} or {error, term()}
+-spec read_node_by_int_id(diskann_file(), non_neg_integer(), pos_integer()) ->
+    {ok, {non_neg_integer(), [non_neg_integer()]}} | {error, term()}.
+read_node_by_int_id(#diskann_file{graph_fd = Fd}, IntId, MaxR) ->
+    %% Offset: header (1 sector) + IntId * sector_size
+    Offset = ?SECTOR_SIZE + (IntId * ?SECTOR_SIZE),
+    case file:pread(Fd, Offset, ?SECTOR_SIZE) of
+        {ok, Data} ->
+            decode_node_int(Data, MaxR);
+        eof ->
+            {error, eof};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Batch read multiple nodes by integer IDs
+-spec read_nodes_batch_int(diskann_file(), [non_neg_integer()], pos_integer()) ->
+    [{ok, {non_neg_integer(), [non_neg_integer()]}} | {error, term()}].
+read_nodes_batch_int(#diskann_file{graph_fd = Fd}, IntIds, MaxR) ->
+    lists:map(
+        fun(IntId) ->
+            Offset = ?SECTOR_SIZE + (IntId * ?SECTOR_SIZE),
+            case file:pread(Fd, Offset, ?SECTOR_SIZE) of
+                {ok, Data} -> decode_node_int(Data, MaxR);
+                eof -> {error, eof};
+                {error, _} = Error -> Error
+            end
+        end,
+        IntIds
+    ).
+
+%% Encode node with integer ID
+%% Format: [IntId:64/little][NeighborCount:16/little][Neighbors:64/little each][padding]
+encode_node_int(IntId, Neighbors, MaxR) ->
+    NeighborCount = min(length(Neighbors), MaxR),
+    %% Encode neighbors as 64-bit integers
+    NeighborBin = << <<N:64/little>> || N <- lists:sublist(Neighbors, MaxR) >>,
+    %% Pad to MaxR neighbors
+    PaddingCount = MaxR - NeighborCount,
+    NeighborPadding = << <<0:64>> || _ <- lists:seq(1, PaddingCount) >>,
+    <<IntId:64/little, NeighborCount:16/little, NeighborBin/binary, NeighborPadding/binary>>.
+
+%% Decode node with integer ID
+%% Returns {ok, {IntId, [NeighborIntIds]}}
+decode_node_int(Data, MaxR) ->
+    try
+        <<IntId:64/little, NeighborCount:16/little, Rest/binary>> = Data,
+        %% Read neighbor integer IDs
+        NeighborBytes = MaxR * 8,
+        <<NeighborData:NeighborBytes/binary, _/binary>> = Rest,
+        %% Extract non-zero neighbors (0 indicates empty slot)
+        AllNeighbors = [N || <<N:64/little>> <= NeighborData],
+        %% Filter out padding zeros and take NeighborCount
+        ValidNeighbors = lists:sublist([N || N <- AllNeighbors, N > 0], NeighborCount),
+        {ok, {IntId, ValidNeighbors}}
+    catch
+        _:_ -> {error, invalid_node_format}
+    end.

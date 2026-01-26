@@ -196,7 +196,14 @@ init({Name, Config}) ->
     %% Get backend-specific configuration
     IndexConfig = case Backend of
         hnsw -> maps:get(hnsw, Config, #{});
-        faiss -> maps:get(faiss, Config, #{})
+        faiss -> maps:get(faiss, Config, #{});
+        diskann ->
+            DiskAnnConfig = maps:get(diskann, Config, #{}),
+            %% Set default base_path relative to db_path if not specified
+            case maps:is_key(base_path, DiskAnnConfig) of
+                true -> DiskAnnConfig;
+                false -> DiskAnnConfig#{base_path => filename:join(DbPath, "diskann")}
+            end
     end,
 
     %% Initialize embedder
@@ -573,14 +580,32 @@ init_rocksdb(DbPath) ->
 
 %% Load existing index or create new one
 load_or_create_index(Db, CfHandles, Dimension, IndexConfig, IndexModule) ->
-    CfHnsw = maps:get(hnsw, CfHandles),
-    CfVectors = maps:get(vectors, CfHandles),
+    case IndexModule of
+        barrel_vectordb_diskann ->
+            %% DiskANN manages its own persistence - use open/new directly
+            load_or_create_diskann(IndexConfig, Dimension);
+        _ ->
+            %% HNSW/FAISS - rebuild from vectors stored in RocksDB
+            CfHnsw = maps:get(hnsw, CfHandles),
+            CfVectors = maps:get(vectors, CfHandles),
+            case load_index_meta(Db, CfHnsw) of
+                {ok, _IndexMeta} ->
+                    rebuild_from_vectors(Db, CfVectors, Dimension, IndexConfig, IndexModule);
+                not_found ->
+                    IndexModule:new(IndexConfig#{dimension => Dimension})
+            end
+    end.
 
-    case load_index_meta(Db, CfHnsw) of
-        {ok, _IndexMeta} ->
-            rebuild_from_vectors(Db, CfVectors, Dimension, IndexConfig, IndexModule);
-        not_found ->
-            IndexModule:new(IndexConfig#{dimension => Dimension})
+%% DiskANN-specific loading: try open existing, else create new
+load_or_create_diskann(Config, Dimension) ->
+    BasePath = maps:get(base_path, Config),
+    ok = filelib:ensure_dir(filename:join(BasePath, "dummy")),
+    case barrel_vectordb_diskann:open(BasePath) of
+        {ok, Index} ->
+            {ok, Index};
+        {error, _} ->
+            %% No existing index or failed to open - create new
+            barrel_vectordb_diskann:new(Config#{dimension => Dimension, storage_mode => disk})
     end.
 
 %% Load index metadata from storage
