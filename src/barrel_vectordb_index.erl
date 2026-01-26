@@ -45,8 +45,9 @@
 -type index() :: term().
 %% Opaque index type. Implementation depends on the backend.
 
--type backend() :: hnsw | faiss | hybrid | diskann.
+-type backend() :: hnsw | faiss | diskann.
 %% Available backend types.
+%% Note: hybrid backend has been removed in favor of pure DiskANN
 
 %%====================================================================
 %% Behaviour Callbacks
@@ -108,15 +109,12 @@
 -spec backend_module(backend()) -> module().
 backend_module(hnsw) -> barrel_vectordb_index_hnsw;
 backend_module(faiss) -> barrel_vectordb_index_faiss;
-backend_module(hybrid) -> barrel_vectordb_index_hybrid;
 backend_module(diskann) -> barrel_vectordb_diskann.
 
 %% @doc Check if a backend is available.
-%% HNSW, hybrid, and diskann are always available. FAISS requires barrel_faiss NIF.
+%% HNSW and diskann are always available. FAISS requires barrel_faiss NIF.
 -spec is_available(backend()) -> boolean().
 is_available(hnsw) ->
-    true;
-is_available(hybrid) ->
     true;
 is_available(diskann) ->
     true;

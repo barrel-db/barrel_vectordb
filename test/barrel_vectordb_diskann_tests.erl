@@ -30,6 +30,20 @@ diskann_test_() ->
      ]
     }.
 
+%% Disk mode tests
+diskann_disk_test_() ->
+    {foreach,
+     fun setup_disk/0,
+     fun cleanup_disk/1,
+     [
+        {"disk mode build and search", fun test_disk_build_search/0},
+        {"disk mode persistence", fun test_disk_persistence/0},
+        {"disk mode insert", fun test_disk_insert/0},
+        {"lru cache eviction", fun test_lru_cache_eviction/0},
+        {"serialization roundtrip", fun test_serialization/0}
+     ]
+    }.
+
 %%====================================================================
 %% Setup/Teardown
 %%====================================================================
@@ -39,6 +53,18 @@ setup() ->
     ok.
 
 cleanup(_) ->
+    ok.
+
+setup_disk() ->
+    rand:seed(exsss, {42, 42, 42}),
+    %% Create temp directory for disk tests
+    TmpDir = filename:join(["/tmp", "diskann_test_" ++ integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    TmpDir.
+
+cleanup_disk(TmpDir) ->
+    %% Remove temp directory
+    os:cmd("rm -rf " ++ TmpDir),
     ok.
 
 %%====================================================================
@@ -312,6 +338,181 @@ test_pq_insert() ->
     %% Search should still work
     Results = barrel_vectordb_diskann:search(Index2, random_vector(16), 5),
     ?assertEqual(5, length(Results)).
+
+%%====================================================================
+%% Disk Mode Tests
+%%====================================================================
+
+test_disk_build_search() ->
+    %% Build index in disk mode
+    TmpDir = setup_disk(),
+    try
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 50)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 20,
+            l_search => 20,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => true,
+            pq_m => 2,
+            pq_k => 16
+        },
+        {ok, Index} = barrel_vectordb_diskann:build(Config, Vectors),
+
+        %% Verify disk mode is active
+        Info = barrel_vectordb_diskann:info(Index),
+        StorageInfo = maps:get(storage, Info),
+        ?assertEqual(disk, maps:get(mode, StorageInfo)),
+
+        %% Search should work
+        Query = random_vector(16),
+        Results = barrel_vectordb_diskann:search(Index, Query, 5),
+        ?assertEqual(5, length(Results)),
+
+        %% Close index
+        ok = barrel_vectordb_diskann:close(Index)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_disk_persistence() ->
+    %% Build index, close, reopen, and search
+    TmpDir = setup_disk(),
+    try
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 50)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 20,
+            l_search => 20,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => true,
+            pq_m => 2,
+            pq_k => 16
+        },
+
+        %% Build and close
+        {ok, Index1} = barrel_vectordb_diskann:build(Config, Vectors),
+        Query = random_vector(16),
+        Results1 = barrel_vectordb_diskann:search(Index1, Query, 5),
+        ok = barrel_vectordb_diskann:close(Index1),
+
+        %% Reopen and search
+        {ok, Index2} = barrel_vectordb_diskann:open(TmpDir),
+        ?assertEqual(50, barrel_vectordb_diskann:size(Index2)),
+
+        %% Search should return similar results
+        Results2 = barrel_vectordb_diskann:search(Index2, Query, 5),
+        ?assertEqual(5, length(Results2)),
+
+        %% First result should be the same
+        {Id1, _} = hd(Results1),
+        {Id2, _} = hd(Results2),
+        ?assertEqual(Id1, Id2),
+
+        ok = barrel_vectordb_diskann:close(Index2)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_disk_insert() ->
+    %% Test incremental insert in disk mode
+    TmpDir = setup_disk(),
+    try
+        %% Start with empty index
+        {ok, Index0} = barrel_vectordb_diskann:new(#{
+            dimension => 8,
+            r => 4,
+            storage_mode => disk,
+            base_path => TmpDir
+        }),
+
+        %% Insert vectors one by one
+        {ok, Index1} = barrel_vectordb_diskann:insert(Index0, <<"v1">>, random_vector(8)),
+        {ok, Index2} = barrel_vectordb_diskann:insert(Index1, <<"v2">>, random_vector(8)),
+        {ok, Index3} = barrel_vectordb_diskann:insert(Index2, <<"v3">>, random_vector(8)),
+
+        ?assertEqual(3, barrel_vectordb_diskann:size(Index3)),
+
+        %% Search should work
+        Results = barrel_vectordb_diskann:search(Index3, random_vector(8), 3),
+        ?assert(length(Results) >= 1),
+
+        ok = barrel_vectordb_diskann:close(Index3)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_lru_cache_eviction() ->
+    %% Test LRU cache with small size
+    TmpDir = setup_disk(),
+    try
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 30)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 20,
+            l_search => 20,
+            storage_mode => disk,
+            base_path => TmpDir,
+            cache_max_size => 5,  %% Small cache
+            use_pq => true,
+            pq_m => 2,
+            pq_k => 16
+        },
+        {ok, Index} = barrel_vectordb_diskann:build(Config, Vectors),
+
+        %% Verify cache size is limited
+        Info = barrel_vectordb_diskann:info(Index),
+        StorageInfo = maps:get(storage, Info),
+        CacheSize = maps:get(cache_size, StorageInfo),
+        ?assert(CacheSize =< 5),
+
+        %% Search should still work (will load from disk)
+        Query = random_vector(16),
+        Results = barrel_vectordb_diskann:search(Index, Query, 5),
+        ?assertEqual(5, length(Results)),
+
+        ok = barrel_vectordb_diskann:close(Index)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_serialization() ->
+    %% Test memory mode serialization roundtrip
+    Vectors = [{integer_to_binary(I), random_vector(16)}
+               || I <- lists:seq(1, 50)],
+    Config = #{
+        dimension => 16,
+        r => 8,
+        l_build => 20,
+        l_search => 20,
+        storage_mode => memory,
+        use_pq => true,
+        pq_m => 2,
+        pq_k => 16
+    },
+    {ok, Index1} = barrel_vectordb_diskann:build(Config, Vectors),
+
+    %% Serialize
+    Bin = barrel_vectordb_diskann:serialize(Index1),
+    ?assert(is_binary(Bin)),
+
+    %% Deserialize
+    {ok, Index2} = barrel_vectordb_diskann:deserialize(Bin),
+    ?assertEqual(50, barrel_vectordb_diskann:size(Index2)),
+
+    %% Search should return same results
+    Query = random_vector(16),
+    Results1 = barrel_vectordb_diskann:search(Index1, Query, 5),
+    Results2 = barrel_vectordb_diskann:search(Index2, Query, 5),
+    ?assertEqual(Results1, Results2).
 
 %%====================================================================
 %% Helpers

@@ -30,7 +30,14 @@
     size/1,
     info/1,
     get_vector/2,
-    consolidate_deletes/1
+    consolidate_deletes/1,
+    %% Persistence API
+    open/1,
+    close/1,
+    sync/1,
+    %% Serialization (for barrel_vectordb_index behaviour)
+    serialize/1,
+    deserialize/1
 ]).
 
 %% Internal exports for testing
@@ -53,12 +60,36 @@
     config :: #diskann_config{},
     size = 0 :: non_neg_integer(),
     medoid_id :: binary() | undefined,    %% Entry point (centroid)
+
+    %% In RAM (small footprint) - graph structure
     nodes = #{} :: #{binary() => diskann_node()},
-    vectors = #{} :: #{binary() => [float()]},
-    deleted_set = sets:new() :: sets:set(binary()),
+
+    %% ID <-> disk index mapping (for disk mode)
+    id_to_idx = #{} :: #{binary() => non_neg_integer()},
+    idx_to_id = #{} :: #{non_neg_integer() => binary()},
+
+    %% PQ compression (always in RAM)
     pq_state :: term() | undefined,       %% Trained PQ for compression
     pq_codes = #{} :: #{binary() => binary()},  %% Id -> PQ code (M bytes)
-    use_pq = false :: boolean()           %% Whether to use PQ for search
+    use_pq = false :: boolean(),          %% Whether to use PQ for search
+
+    %% Deletion tracking
+    deleted_set = sets:new() :: sets:set(binary()),
+
+    %% Storage mode: memory | disk
+    storage_mode = memory :: memory | disk,
+
+    %% In-memory vectors (used only in memory mode)
+    vectors = #{} :: #{binary() => [float()]},
+
+    %% Disk file handle and path (used only in disk mode)
+    file_handle :: term() | undefined,
+    base_path :: binary() | undefined,
+
+    %% Vector cache for disk mode (LRU eviction)
+    vector_cache = #{} :: #{binary() => [float()]},
+    cache_max_size = 10000 :: pos_integer(),
+    cache_lru = [] :: [binary()]
 }).
 
 -record(diskann_node, {
@@ -77,6 +108,16 @@
 %%====================================================================
 
 %% @doc Create a new empty DiskANN index
+%% Options:
+%%   - dimension: Vector dimension (required)
+%%   - r: Max out-degree (default: 64)
+%%   - l_build: Build search width (default: 100)
+%%   - l_search: Query search width (default: 100)
+%%   - alpha: Pruning factor (default: 1.2)
+%%   - distance_fn: cosine | euclidean (default: cosine)
+%%   - storage_mode: memory | disk (default: memory)
+%%   - base_path: Path for disk storage (required if storage_mode=disk)
+%%   - cache_max_size: Max vectors in LRU cache (default: 10000)
 -spec new(map()) -> {ok, diskann_index()} | {error, term()}.
 new(Options) ->
     R = maps:get(r, Options, 64),
@@ -85,92 +126,290 @@ new(Options) ->
     Alpha = maps:get(alpha, Options, 1.2),
     Dimension = maps:get(dimension, Options, undefined),
     DistanceFn = maps:get(distance_fn, Options, cosine),
+    StorageMode = maps:get(storage_mode, Options, memory),
+    BasePath = maps:get(base_path, Options, undefined),
+    CacheMaxSize = maps:get(cache_max_size, Options, 10000),
 
     case Dimension of
         undefined ->
             {error, dimension_required};
         _ when Dimension > 0 ->
-            Config = #diskann_config{
-                r = R,
-                l_build = LBuild,
-                l_search = LSearch,
-                alpha = Alpha,
-                dimension = Dimension,
-                distance_fn = DistanceFn
-            },
-            {ok, #diskann_index{config = Config}};
+            case validate_storage_options(StorageMode, BasePath) of
+                ok ->
+                    Config = #diskann_config{
+                        r = R,
+                        l_build = LBuild,
+                        l_search = LSearch,
+                        alpha = Alpha,
+                        dimension = Dimension,
+                        distance_fn = DistanceFn
+                    },
+                    {ok, #diskann_index{
+                        config = Config,
+                        storage_mode = StorageMode,
+                        base_path = to_binary_or_undefined(BasePath),
+                        cache_max_size = CacheMaxSize
+                    }};
+                {error, _} = Error ->
+                    Error
+            end;
         _ ->
             {error, {invalid_dimension, Dimension}}
     end.
+
+validate_storage_options(disk, undefined) ->
+    {error, {disk_mode_requires_base_path}};
+validate_storage_options(_, _) ->
+    ok.
+
+to_binary_or_undefined(undefined) -> undefined;
+to_binary_or_undefined(Path) when is_list(Path) -> list_to_binary(Path);
+to_binary_or_undefined(Path) when is_binary(Path) -> Path.
 
 %% @doc Build index from a list of {Id, Vector} pairs using two-pass Vamana
 -spec build(map(), [{binary(), [float()]}]) -> {ok, diskann_index()} | {error, term()}.
 build(Options, Vectors) when length(Vectors) > 0 ->
     case new(Options) of
         {ok, Index0} ->
-            %% Store all vectors
-            VectorMap = maps:from_list(Vectors),
-            Index1 = Index0#diskann_index{
-                vectors = VectorMap,
-                size = length(Vectors)
-            },
-
-            %% Find medoid (centroid) as entry point
-            MedoidId = find_medoid(Vectors, Index1#diskann_index.config),
-            Index2 = Index1#diskann_index{medoid_id = MedoidId},
-
-            %% Initialize random graph
-            Index3 = init_random_graph(Index2, maps:keys(VectorMap)),
-
-            %% Two-pass Vamana construction
-            Config = Index3#diskann_index.config,
-            R = Config#diskann_config.r,
-            L = Config#diskann_config.l_build,
-            Alpha = Config#diskann_config.alpha,
-
-            %% Pass 1: alpha = 1.0 (finds good short edges)
-            Index4 = vamana_pass(Index3, 1.0, L, R),
-
-            %% Pass 2: alpha > 1.0 (adds long-range edges for fast convergence)
-            Index5 = vamana_pass(Index4, Alpha, L, R),
-
-            %% Train and apply PQ if enabled and enough vectors
-            UsePQ = maps:get(use_pq, Options, false),
-            PQK = maps:get(pq_k, Options, 256),
-            Index6 = case UsePQ andalso length(Vectors) >= PQK of
-                true ->
-                    train_and_apply_pq(Index5, Options, Vectors);
-                false ->
-                    Index5
-            end,
-
-            {ok, Index6};
+            case Index0#diskann_index.storage_mode of
+                memory ->
+                    build_memory_mode(Index0, Options, Vectors);
+                disk ->
+                    build_disk_mode(Index0, Options, Vectors)
+            end;
         {error, _} = Error ->
             Error
     end;
 build(_, []) ->
     {error, empty_vectors}.
 
+%% Build index in memory mode (original behavior)
+build_memory_mode(Index0, Options, Vectors) ->
+    %% Store all vectors in memory
+    VectorMap = maps:from_list(Vectors),
+    Index1 = Index0#diskann_index{
+        vectors = VectorMap,
+        size = length(Vectors)
+    },
+
+    %% Build id to idx mappings (for consistency with disk mode)
+    {IdToIdx, IdxToId} = build_id_mappings(Vectors),
+    Index1b = Index1#diskann_index{
+        id_to_idx = IdToIdx,
+        idx_to_id = IdxToId
+    },
+
+    %% Find medoid (centroid) as entry point
+    MedoidId = find_medoid(Vectors, Index1b#diskann_index.config),
+    Index2 = Index1b#diskann_index{medoid_id = MedoidId},
+
+    %% Initialize random graph
+    Index3 = init_random_graph(Index2, maps:keys(VectorMap)),
+
+    %% Two-pass Vamana construction
+    Config = Index3#diskann_index.config,
+    R = Config#diskann_config.r,
+    L = Config#diskann_config.l_build,
+    Alpha = Config#diskann_config.alpha,
+
+    %% Pass 1: alpha = 1.0 (finds good short edges)
+    Index4 = vamana_pass(Index3, 1.0, L, R),
+
+    %% Pass 2: alpha > 1.0 (adds long-range edges for fast convergence)
+    Index5 = vamana_pass(Index4, Alpha, L, R),
+
+    %% Train and apply PQ if enabled and enough vectors
+    UsePQ = maps:get(use_pq, Options, false),
+    PQK = maps:get(pq_k, Options, 256),
+    Index6 = case UsePQ andalso length(Vectors) >= PQK of
+        true ->
+            train_and_apply_pq(Index5, Options, Vectors);
+        false ->
+            Index5
+    end,
+
+    {ok, Index6}.
+
+%% Build index in disk mode (vectors stored on SSD)
+build_disk_mode(Index0, Options, Vectors) ->
+    BasePath = Index0#diskann_index.base_path,
+    Config = Index0#diskann_index.config,
+    Dimension = Config#diskann_config.dimension,
+
+    %% Create disk files
+    FileConfig = #{
+        dimension => Dimension,
+        r => Config#diskann_config.r,
+        distance_fn => Config#diskann_config.distance_fn
+    },
+    case barrel_vectordb_diskann_file:create(BasePath, FileConfig) of
+        {ok, FileHandle0} ->
+            %% Build id to idx mappings and write vectors to disk
+            {IdToIdx, IdxToId, FileHandle1} = write_vectors_to_disk(Vectors, FileHandle0),
+
+            %% Update header with entry point (will be set after finding medoid)
+            {ok, FileHandle2} = barrel_vectordb_diskann_file:write_header(
+                FileHandle1,
+                #{
+                    dimension => Dimension,
+                    r => Config#diskann_config.r,
+                    node_count => length(Vectors),
+                    distance_fn => Config#diskann_config.distance_fn,
+                    entry_point => undefined
+                }
+            ),
+
+            %% During build, we need vectors in cache for distance calculations
+            VectorMap = maps:from_list(Vectors),
+            Index1 = Index0#diskann_index{
+                file_handle = FileHandle2,
+                id_to_idx = IdToIdx,
+                idx_to_id = IdxToId,
+                size = length(Vectors),
+                %% Temporarily put all vectors in cache for build
+                vector_cache = VectorMap,
+                cache_lru = maps:keys(VectorMap)
+            },
+
+            %% Find medoid
+            MedoidId = find_medoid(Vectors, Config),
+            Index2 = Index1#diskann_index{medoid_id = MedoidId},
+
+            %% Initialize random graph
+            Index3 = init_random_graph(Index2, maps:keys(VectorMap)),
+
+            %% Two-pass Vamana construction
+            R = Config#diskann_config.r,
+            L = Config#diskann_config.l_build,
+            Alpha = Config#diskann_config.alpha,
+
+            Index4 = vamana_pass(Index3, 1.0, L, R),
+            Index5 = vamana_pass(Index4, Alpha, L, R),
+
+            %% Train and apply PQ (required for efficient disk-based search)
+            UsePQ = maps:get(use_pq, Options, true),  %% Default to true for disk mode
+            PQK = maps:get(pq_k, Options, 256),
+            Index6 = case UsePQ andalso length(Vectors) >= min(PQK, 16) of
+                true ->
+                    train_and_apply_pq(Index5, Options, Vectors);
+                false ->
+                    Index5
+            end,
+
+            %% Update header with medoid
+            {ok, FileHandle3} = barrel_vectordb_diskann_file:write_header(
+                Index6#diskann_index.file_handle,
+                #{
+                    dimension => Dimension,
+                    r => Config#diskann_config.r,
+                    node_count => length(Vectors),
+                    distance_fn => Config#diskann_config.distance_fn,
+                    entry_point => MedoidId
+                }
+            ),
+
+            %% Clear the build cache, keep only limited cache for search
+            CacheMaxSize = Index6#diskann_index.cache_max_size,
+            Index7 = Index6#diskann_index{
+                file_handle = FileHandle3,
+                vectors = #{},  %% Clear vectors from memory
+                vector_cache = #{},  %% Clear build cache
+                cache_lru = []
+            },
+
+            %% Pre-warm cache with medoid neighbors
+            Index8 = prewarm_cache(Index7, MedoidId, CacheMaxSize),
+
+            {ok, Index8};
+
+        {error, Reason} ->
+            {error, {disk_file_create_failed, Reason}}
+    end.
+
+%% Write all vectors to disk and build mappings
+write_vectors_to_disk(Vectors, FileHandle) ->
+    {IdToIdx, IdxToId, FinalHandle} = lists:foldl(
+        fun({Id, Vec}, {AccIdToIdx, AccIdxToId, AccHandle}) ->
+            Idx = maps:size(AccIdToIdx),
+            ok = barrel_vectordb_diskann_file:write_vector(AccHandle, Idx, Vec),
+            {AccIdToIdx#{Id => Idx}, AccIdxToId#{Idx => Id}, AccHandle}
+        end,
+        {#{}, #{}, FileHandle},
+        Vectors
+    ),
+    {IdToIdx, IdxToId, FinalHandle}.
+
+%% Build id <-> idx mappings from vector list
+build_id_mappings(Vectors) ->
+    {IdToIdx, IdxToId, _} = lists:foldl(
+        fun({Id, _Vec}, {AccIdToIdx, AccIdxToId, Idx}) ->
+            {AccIdToIdx#{Id => Idx}, AccIdxToId#{Idx => Id}, Idx + 1}
+        end,
+        {#{}, #{}, 0},
+        Vectors
+    ),
+    {IdToIdx, IdxToId}.
+
+%% Pre-warm cache with vectors near the medoid
+prewarm_cache(Index, MedoidId, MaxSize) ->
+    %% Get medoid neighbors
+    Neighbors = get_neighbors(Index, MedoidId),
+    %% Load medoid and its neighbors into cache
+    ToLoad = lists:sublist([MedoidId | Neighbors], MaxSize),
+    lists:foldl(
+        fun(Id, AccIndex) ->
+            {_Vec, NewIndex} = get_vector_cached(AccIndex, Id),
+            NewIndex
+        end,
+        Index,
+        ToLoad
+    ).
+
 %% @doc Insert a new vector (FreshVamana algorithm)
 -spec insert(diskann_index(), binary(), [float()]) -> {ok, diskann_index()} | {error, term()}.
-insert(#diskann_index{medoid_id = undefined} = Index, Id, Vector) ->
+insert(#diskann_index{medoid_id = undefined, config = Config} = Index, Id, Vector) ->
     %% First insertion
-    Config = Index#diskann_index.config,
     Dim = Config#diskann_config.dimension,
     case length(Vector) of
         Dim ->
-            NewIndex = Index#diskann_index{
-                medoid_id = Id,
-                nodes = #{Id => #diskann_node{id = Id, neighbors = []}},
-                vectors = #{Id => Vector},
-                size = 1
-            },
-            {ok, NewIndex};
+            case Index#diskann_index.storage_mode of
+                memory ->
+                    %% Memory mode: store vector in RAM
+                    NewIndex = Index#diskann_index{
+                        medoid_id = Id,
+                        nodes = #{Id => #diskann_node{id = Id, neighbors = []}},
+                        vectors = #{Id => Vector},
+                        id_to_idx = #{Id => 0},
+                        idx_to_id = #{0 => Id},
+                        size = 1
+                    },
+                    {ok, NewIndex};
+                disk ->
+                    %% Disk mode: write to disk and cache
+                    case ensure_disk_files(Index) of
+                        {ok, Index1} ->
+                            Idx = 0,
+                            ok = barrel_vectordb_diskann_file:write_vector(
+                                Index1#diskann_index.file_handle, Idx, Vector),
+                            Index2 = add_to_cache(Index1, Id, Vector),
+                            NewIndex = Index2#diskann_index{
+                                medoid_id = Id,
+                                nodes = #{Id => #diskann_node{id = Id, neighbors = []}},
+                                id_to_idx = #{Id => Idx},
+                                idx_to_id = #{Idx => Id},
+                                size = 1
+                            },
+                            {ok, NewIndex};
+                        {error, _} = Error ->
+                            Error
+                    end
+            end;
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end;
 insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
-                      pq_state = PQState, pq_codes = PQCodes} = Index, Id, Vector) ->
+                      pq_state = PQState, pq_codes = PQCodes,
+                      storage_mode = StorageMode} = Index, Id, Vector) ->
     Dim = Config#diskann_config.dimension,
     case length(Vector) of
         Dim ->
@@ -185,14 +424,35 @@ insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
                     PQCodes
             end,
 
-            %% Add vector to index
-            Index1 = Index#diskann_index{
-                vectors = maps:put(Id, Vector, Index#diskann_index.vectors),
-                nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
-                                 Index#diskann_index.nodes),
-                pq_codes = NewPQCodes,
-                size = Index#diskann_index.size + 1
-            },
+            %% Add vector to storage (memory or disk)
+            Index1 = case StorageMode of
+                memory ->
+                    Index#diskann_index{
+                        vectors = maps:put(Id, Vector, Index#diskann_index.vectors),
+                        nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
+                                         Index#diskann_index.nodes),
+                        id_to_idx = maps:put(Id, Index#diskann_index.size,
+                                             Index#diskann_index.id_to_idx),
+                        idx_to_id = maps:put(Index#diskann_index.size, Id,
+                                             Index#diskann_index.idx_to_id),
+                        pq_codes = NewPQCodes,
+                        size = Index#diskann_index.size + 1
+                    };
+                disk ->
+                    Idx = Index#diskann_index.size,
+                    ok = barrel_vectordb_diskann_file:write_vector(
+                        Index#diskann_index.file_handle, Idx, Vector),
+                    %% Add to cache for the insert operation
+                    Index0 = add_to_cache(Index, Id, Vector),
+                    Index0#diskann_index{
+                        nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
+                                         Index0#diskann_index.nodes),
+                        id_to_idx = maps:put(Id, Idx, Index0#diskann_index.id_to_idx),
+                        idx_to_id = maps:put(Idx, Id, Index0#diskann_index.idx_to_id),
+                        pq_codes = NewPQCodes,
+                        size = Index0#diskann_index.size + 1
+                    }
+            end,
 
             %% Search to find candidate neighbors
             {_Results, Visited} = greedy_search(Index1, S, Vector, 1, L),
@@ -221,6 +481,25 @@ insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end.
+
+%% Ensure disk files are created (for incremental insert in disk mode)
+ensure_disk_files(#diskann_index{file_handle = undefined, base_path = BasePath,
+                                  config = Config} = Index) when BasePath =/= undefined ->
+    FileConfig = #{
+        dimension => Config#diskann_config.dimension,
+        r => Config#diskann_config.r,
+        distance_fn => Config#diskann_config.distance_fn
+    },
+    case barrel_vectordb_diskann_file:create(BasePath, FileConfig) of
+        {ok, FileHandle} ->
+            {ok, Index#diskann_index{file_handle = FileHandle}};
+        {error, _} = Error ->
+            Error
+    end;
+ensure_disk_files(#diskann_index{file_handle = Handle} = Index) when Handle =/= undefined ->
+    {ok, Index};
+ensure_disk_files(_Index) ->
+    {error, disk_mode_requires_base_path}.
 
 %% @doc Lazy delete - marks node as deleted
 -spec delete(diskann_index(), binary()) -> {ok, diskann_index()}.
@@ -271,7 +550,9 @@ size(#diskann_index{size = Size, deleted_set = Deleted}) ->
 -spec info(diskann_index()) -> map().
 info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
                     deleted_set = Deleted, nodes = Nodes, use_pq = UsePQ,
-                    pq_state = PQState, pq_codes = PQCodes}) ->
+                    pq_state = PQState, pq_codes = PQCodes,
+                    storage_mode = StorageMode, base_path = BasePath,
+                    vector_cache = VectorCache, cache_max_size = CacheMaxSize}) ->
     AvgDegree = case maps:size(Nodes) of
         0 -> 0.0;
         N ->
@@ -294,6 +575,12 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
         false ->
             #{enabled => false}
     end,
+    StorageInfo = #{
+        mode => StorageMode,
+        base_path => BasePath,
+        cache_size => maps:size(VectorCache),
+        cache_max_size => CacheMaxSize
+    },
     #{
         size => Size,
         active_size => Size - sets:size(Deleted),
@@ -301,6 +588,7 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
         medoid => Medoid,
         avg_degree => AvgDegree,
         pq => PQInfo,
+        storage => StorageInfo,
         config => #{
             r => Config#diskann_config.r,
             l_build => Config#diskann_config.l_build,
@@ -311,12 +599,13 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
         }
     }.
 
-%% @doc Get vector by ID
+%% @doc Get vector by ID (uses cache for disk mode)
 -spec get_vector(diskann_index(), binary()) -> {ok, [float()]} | not_found.
-get_vector(#diskann_index{vectors = Vectors}, Id) ->
-    case maps:find(Id, Vectors) of
-        {ok, Vec} -> {ok, Vec};
-        error -> not_found
+get_vector(Index, Id) ->
+    {Vec, _UpdatedIndex} = get_vector_or_cached(Index, Id),
+    case Vec of
+        undefined -> not_found;
+        _ -> {ok, Vec}
     end.
 
 %% @doc Consolidate deleted nodes (batch cleanup)
@@ -399,6 +688,164 @@ consolidate_deletes_impl(Index, DeletedSet, Config, Nodes, Vectors) ->
         size = NewSize,
         medoid_id = NewMedoid
     }}.
+
+%%====================================================================
+%% Persistence API
+%%====================================================================
+
+%% @doc Open an existing DiskANN index from disk
+%% Reconstructs in-memory structures (graph, PQ codes) from disk files
+-spec open(binary() | string()) -> {ok, diskann_index()} | {error, term()}.
+open(BasePath) ->
+    BasePathBin = to_binary_or_undefined(BasePath),
+    case barrel_vectordb_diskann_file:open(BasePathBin) of
+        {ok, FileHandle} ->
+            Header = barrel_vectordb_diskann_file:read_header(FileHandle),
+            rebuild_index_from_disk(FileHandle, Header, BasePathBin);
+        {error, _} = Error ->
+            Error
+    end.
+
+%% Rebuild the in-memory index from disk files
+rebuild_index_from_disk(FileHandle, Header, BasePath) ->
+    Dimension = maps:get(dimension, Header, 128),
+    R = maps:get(r, Header, 64),
+    NodeCount = maps:get(node_count, Header, 0),
+    MedoidId = maps:get(entry_point, Header, undefined),
+    DistFn = maps:get(distance_fn, Header, cosine),
+
+    Config = #diskann_config{
+        dimension = Dimension,
+        r = R,
+        distance_fn = DistFn
+    },
+
+    %% Read graph from disk (would need to implement graph reading in diskann_file)
+    %% For now, we rebuild from the metadata file if available
+    MetaPath = filename:join(BasePath, "diskann.index"),
+    Index0 = case file:read_file(MetaPath) of
+        {ok, MetaBin} ->
+            %% Load serialized index state
+            try binary_to_term(MetaBin) of
+                SerializedIndex ->
+                    SerializedIndex#diskann_index{
+                        file_handle = FileHandle,
+                        base_path = BasePath,
+                        storage_mode = disk
+                    }
+            catch
+                _:_ ->
+                    %% Fallback to empty index with header info
+                    create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount)
+            end;
+        {error, _} ->
+            %% No serialized state, create basic index
+            create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount)
+    end,
+
+    {ok, Index0}.
+
+create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount) ->
+    #diskann_index{
+        config = Config,
+        file_handle = FileHandle,
+        base_path = BasePath,
+        storage_mode = disk,
+        medoid_id = MedoidId,
+        size = NodeCount,
+        nodes = #{},
+        id_to_idx = #{},
+        idx_to_id = #{}
+    }.
+
+%% @doc Close the index and flush to disk
+-spec close(diskann_index()) -> ok.
+close(#diskann_index{file_handle = undefined}) ->
+    ok;
+close(#diskann_index{file_handle = FileHandle, base_path = BasePath,
+                     storage_mode = disk} = Index) ->
+    %% Save index metadata
+    save_index_metadata(Index),
+    %% Close file handles
+    barrel_vectordb_diskann_file:close(FileHandle),
+    %% Clear base_path reference
+    case BasePath of
+        undefined -> ok;
+        _ -> ok
+    end,
+    ok;
+close(_Index) ->
+    ok.
+
+%% @doc Force sync to disk
+-spec sync(diskann_index()) -> ok.
+sync(#diskann_index{file_handle = undefined}) ->
+    ok;
+sync(#diskann_index{file_handle = FileHandle} = Index) ->
+    save_index_metadata(Index),
+    barrel_vectordb_diskann_file:sync(FileHandle),
+    ok.
+
+%% Save index metadata (graph, PQ state, mappings) to disk
+save_index_metadata(#diskann_index{base_path = undefined}) ->
+    ok;
+save_index_metadata(#diskann_index{base_path = BasePath} = Index) ->
+    MetaPath = filename:join(BasePath, "diskann.index"),
+    %% Clear file handle before serializing (can't serialize file handles)
+    IndexToSave = Index#diskann_index{
+        file_handle = undefined,
+        vector_cache = #{},  %% Don't persist cache
+        cache_lru = []
+    },
+    file:write_file(MetaPath, term_to_binary(IndexToSave)).
+
+%% @doc Serialize index to binary (for barrel_vectordb_index behaviour)
+-spec serialize(diskann_index()) -> binary().
+serialize(#diskann_index{storage_mode = memory} = Index) ->
+    %% Memory mode: serialize entire index including vectors
+    term_to_binary(Index);
+serialize(#diskann_index{storage_mode = disk} = Index) ->
+    %% Disk mode: serialize only in-memory structures (no vectors, no cache)
+    IndexToSave = Index#diskann_index{
+        file_handle = undefined,
+        vectors = #{},
+        vector_cache = #{},
+        cache_lru = []
+    },
+    term_to_binary(IndexToSave).
+
+%% @doc Deserialize index from binary
+-spec deserialize(binary()) -> {ok, diskann_index()} | {error, term()}.
+deserialize(Binary) ->
+    try
+        case binary_to_term(Binary) of
+            #diskann_index{} = Index ->
+                %% Re-open disk files if in disk mode
+                case Index#diskann_index.storage_mode of
+                    disk ->
+                        BasePath = Index#diskann_index.base_path,
+                        case BasePath of
+                            undefined ->
+                                {ok, Index};
+                            _ ->
+                                case barrel_vectordb_diskann_file:open(BasePath) of
+                                    {ok, FileHandle} ->
+                                        {ok, Index#diskann_index{file_handle = FileHandle}};
+                                    {error, _} ->
+                                        %% Files might not exist yet
+                                        {ok, Index}
+                                end
+                        end;
+                    memory ->
+                        {ok, Index}
+                end;
+            _ ->
+                {error, invalid_format}
+        end
+    catch
+        _:_ ->
+            {error, invalid_binary}
+    end.
 
 %%====================================================================
 %% Internal: PQ Training and Encoding
@@ -511,7 +958,8 @@ vamana_pass(#diskann_index{medoid_id = S, nodes = Nodes} = Index,
 
     lists:foldl(
         fun(Id, AccIndex) ->
-            Vec = maps:get(Id, AccIndex#diskann_index.vectors),
+            %% Use get_vector_or_cached to support both memory and disk modes
+            {Vec, _} = get_vector_or_cached(AccIndex, Id),
 
             %% Search to find candidates
             {_Results, Visited} = greedy_search(AccIndex, S, Vec, 1, L),
@@ -625,7 +1073,7 @@ greedy_loop(Index, Query, Candidates, Results, Visited, FurthestDist, K, L) ->
 %% Beam search using PQ distance tables for fast approximate distance
 %% Returns sorted results [{Distance, Id}]
 beam_search_pq(Index, StartId, Query, DistTables, K, L) ->
-    #diskann_index{pq_codes = PQCodes, vectors = Vectors} = Index,
+    #diskann_index{pq_codes = PQCodes} = Index,
 
     %% Get PQ distance to start node
     StartDist = case maps:find(StartId, PQCodes) of
@@ -645,8 +1093,8 @@ beam_search_pq(Index, StartId, Query, DistTables, K, L) ->
     PQResults = beam_search_pq_loop(Index, DistTables, PQCodes, Candidates,
                                      Results, Visited, FurthestDist, K, L),
 
-    %% Rerank top results with full vectors for accuracy
-    rerank_with_full_vectors(PQResults, Query, Vectors, Index#diskann_index.config, K).
+    %% Rerank top results with full vectors for accuracy (using lazy disk loading)
+    rerank_with_full_vectors(PQResults, Query, Index, K).
 
 beam_search_pq_loop(_Index, _DistTables, _PQCodes, {0, nil}, Results, _Visited, _FurthestDist, K, _L) ->
     %% No more candidates
@@ -708,16 +1156,19 @@ beam_search_pq_loop(Index, DistTables, PQCodes, Candidates, Results, Visited, Fu
     end.
 
 %% Rerank top candidates using full vectors for accuracy
-rerank_with_full_vectors(PQResults, Query, Vectors, Config, K) ->
+%% Now uses Index for lazy vector loading from disk
+rerank_with_full_vectors(PQResults, Query, Index, K) ->
+    Config = Index#diskann_index.config,
     %% Compute exact distances for top candidates
     Reranked = lists:map(
         fun({_PQDist, Id}) ->
-            case maps:find(Id, Vectors) of
-                {ok, Vec} ->
+            {Vec, _} = get_vector_or_cached(Index, Id),
+            case Vec of
+                undefined ->
+                    {infinity, Id};
+                _ ->
                     ExactDist = distance_vec(Config, Query, Vec),
-                    {ExactDist, Id};
-                error ->
-                    {infinity, Id}
+                    {ExactDist, Id}
             end
         end,
         PQResults
@@ -740,13 +1191,20 @@ robust_prune(Index, P, V, Alpha, R) ->
     Candidates = lists:usort(V ++ CurrentNeighbors) -- [P],
 
     %% Pre-compute distances from P to all candidates (cache)
-    PVec = maps:get(P, Index#diskann_index.vectors),
+    {PVec, _} = get_vector_or_cached(Index, P),
     Config = Index#diskann_index.config,
-    Vectors = Index#diskann_index.vectors,
 
     %% Build list with cached distances: [{Dist, Id, Vec}]
-    CandidatesWithDist = [{distance_vec(Config, PVec, maps:get(C, Vectors)), C, maps:get(C, Vectors)}
-                          || C <- Candidates],
+    CandidatesWithDist = lists:filtermap(
+        fun(C) ->
+            {CVec, _} = get_vector_or_cached(Index, C),
+            case CVec of
+                undefined -> false;
+                _ -> {true, {distance_vec(Config, PVec, CVec), C, CVec}}
+            end
+        end,
+        Candidates
+    ),
 
     %% Sort by distance to P
     SortedCandidates = lists:sort(fun({D1, _, _}, {D2, _, _}) -> D1 =< D2 end, CandidatesWithDist),
@@ -780,24 +1238,122 @@ prune_loop_cached(Config, PVec, [{_Dist, PStar, PStarVec} | Rest], Alpha, R, Acc
 
 %% Original prune_neighbors kept for compatibility with consolidate_deletes
 prune_neighbors(Index, P, Candidates, Alpha, R) ->
-    PVec = maps:get(P, Index#diskann_index.vectors),
+    {PVec, _} = get_vector_or_cached(Index, P),
     Config = Index#diskann_index.config,
-    Vectors = Index#diskann_index.vectors,
-    CandidatesWithDist = [{distance_vec(Config, PVec, maps:get(C, Vectors)), C, maps:get(C, Vectors)}
-                          || C <- Candidates],
+    CandidatesWithDist = lists:filtermap(
+        fun(C) ->
+            {CVec, _} = get_vector_or_cached(Index, C),
+            case CVec of
+                undefined -> false;
+                _ -> {true, {distance_vec(Config, PVec, CVec), C, CVec}}
+            end
+        end,
+        Candidates
+    ),
     SortedCandidates = lists:sort(fun({D1, _, _}, {D2, _, _}) -> D1 =< D2 end, CandidatesWithDist),
     prune_loop_cached(Config, PVec, SortedCandidates, Alpha, R, []).
+
+%%====================================================================
+%% Internal: Vector Cache (LRU) - for disk mode
+%%====================================================================
+
+%% Get vector: check cache/memory first, load from disk if needed
+get_vector_cached(#diskann_index{storage_mode = memory, vectors = Vectors} = Index, Id) ->
+    %% Memory mode: vectors are in the vectors map
+    case maps:find(Id, Vectors) of
+        {ok, Vec} -> {Vec, Index};
+        error -> {undefined, Index}
+    end;
+get_vector_cached(#diskann_index{storage_mode = disk} = Index, Id) ->
+    %% Disk mode: check cache first
+    case maps:find(Id, Index#diskann_index.vector_cache) of
+        {ok, Vec} ->
+            %% Cache hit - touch to update LRU
+            {Vec, touch_cache(Index, Id)};
+        error ->
+            %% Cache miss - load from disk
+            load_and_cache_vector(Index, Id)
+    end.
+
+%% Load vector from disk and add to cache
+load_and_cache_vector(#diskann_index{file_handle = undefined} = Index, _Id) ->
+    %% No file handle - can't load
+    {undefined, Index};
+load_and_cache_vector(Index, Id) ->
+    case maps:find(Id, Index#diskann_index.id_to_idx) of
+        {ok, Idx} ->
+            case barrel_vectordb_diskann_file:read_vector(
+                    Index#diskann_index.file_handle, Idx) of
+                {ok, Vec} ->
+                    Index2 = add_to_cache(Index, Id, Vec),
+                    {Vec, Index2};
+                {error, _} ->
+                    {undefined, Index}
+            end;
+        error ->
+            {undefined, Index}
+    end.
+
+%% Add vector to LRU cache with eviction if full
+add_to_cache(#diskann_index{vector_cache = Cache, cache_lru = LRU,
+                            cache_max_size = MaxSize} = Index, Id, Vec) ->
+    %% Check if already in cache
+    case maps:is_key(Id, Cache) of
+        true ->
+            %% Already cached, just update LRU order
+            touch_cache(Index#diskann_index{vector_cache = Cache#{Id => Vec}}, Id);
+        false ->
+            %% Need to add new entry
+            {NewCache, NewLRU} = case maps:size(Cache) >= MaxSize of
+                true ->
+                    %% Evict oldest entry
+                    case lists:reverse(LRU) of
+                        [] ->
+                            {Cache, []};
+                        [Oldest | RestReversed] ->
+                            {maps:remove(Oldest, Cache), lists:reverse(RestReversed)}
+                    end;
+                false ->
+                    {Cache, LRU}
+            end,
+            Index#diskann_index{
+                vector_cache = NewCache#{Id => Vec},
+                cache_lru = [Id | NewLRU]
+            }
+    end.
+
+%% Touch cache entry to mark as recently used
+touch_cache(#diskann_index{cache_lru = LRU} = Index, Id) ->
+    NewLRU = [Id | lists:delete(Id, LRU)],
+    Index#diskann_index{cache_lru = NewLRU}.
+
+%% Get vector with fallback (for internal use during build/pruning)
+get_vector_or_cached(Index, Id) ->
+    case Index#diskann_index.storage_mode of
+        memory ->
+            case maps:find(Id, Index#diskann_index.vectors) of
+                {ok, Vec} -> {Vec, Index};
+                error ->
+                    %% Fallback to cache (during transition)
+                    case maps:find(Id, Index#diskann_index.vector_cache) of
+                        {ok, Vec} -> {Vec, Index};
+                        error -> {undefined, Index}
+                    end
+            end;
+        disk ->
+            get_vector_cached(Index, Id)
+    end.
 
 %%====================================================================
 %% Internal: Distance Functions
 %%====================================================================
 
-distance(#diskann_index{vectors = Vectors, config = Config}, Id, QueryVec) ->
-    case maps:find(Id, Vectors) of
-        {ok, NodeVec} ->
-            distance_vec(Config, QueryVec, NodeVec);
-        error ->
-            infinity
+%% Distance using lazy vector loading
+distance(Index, Id, QueryVec) ->
+    {NodeVec, _Index2} = get_vector_or_cached(Index, Id),
+    case NodeVec of
+        undefined -> infinity;
+        _ -> distance_vec(Index#diskann_index.config, QueryVec, NodeVec)
     end.
 
 distance_vec(#diskann_config{distance_fn = cosine}, Vec1, Vec2) ->
