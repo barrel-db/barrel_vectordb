@@ -139,14 +139,19 @@ search(#hybrid_index{hot_layer = Hot, cold_layer = Cold,
 -spec delete(hybrid_index(), binary()) -> {ok, hybrid_index()} | {error, term()}.
 delete(#hybrid_index{hot_layer = Hot, hot_timestamps = Timestamps,
                      pending_deletes = Deletes, cold_layer = Cold} = Index, Id) ->
+    %% Check if vector is in hot layer
+    InHot = maps:is_key(Id, Timestamps),
+
     %% Remove from hot layer if present
     NewHot = barrel_vectordb_hnsw:delete(Hot, Id),
     NewTimestamps = maps:remove(Id, Timestamps),
 
-    %% Add to pending deletes for cold layer filtering
-    NewDeletes = case Cold of
-        undefined -> Deletes;
-        _ -> sets:add_element(Id, Deletes)
+    %% Add to pending deletes ONLY if not in hot layer and cold layer exists
+    %% (i.e., the vector must be in the cold layer)
+    NewDeletes = case {InHot, Cold} of
+        {true, _} -> Deletes;      %% Was in hot, don't add to pending
+        {false, undefined} -> Deletes;  %% No cold layer
+        {false, _} -> sets:add_element(Id, Deletes)  %% Must be in cold
     end,
 
     {ok, Index#hybrid_index{
