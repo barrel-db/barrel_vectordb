@@ -24,6 +24,7 @@
     new/1,
     build/2,
     insert/3,
+    insert_batch/3,
     delete/2,
     search/3,
     search/4,
@@ -601,6 +602,216 @@ insert(#diskann_index{config = Config, medoid_int_id = MedoidIntId,
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end.
+
+%% @doc Batch insert multiple vectors efficiently
+%% Inserts all vectors first, then builds graph edges in one pass.
+%% Much more efficient than calling insert/3 repeatedly.
+-spec insert_batch(diskann_index(), [{binary(), [float()]}], map()) ->
+    {ok, diskann_index()} | {error, term()}.
+insert_batch(Index, [], _Opts) ->
+    {ok, Index};
+insert_batch(Index, Vectors, Opts) ->
+    %% Validate dimensions first
+    Dim = (Index#diskann_index.config)#diskann_config.dimension,
+    case validate_batch_dimensions(Vectors, Dim) of
+        ok ->
+            insert_batch_validated(Index, Vectors, Opts);
+        {error, _} = Err ->
+            Err
+    end.
+
+validate_batch_dimensions([], _Dim) -> ok;
+validate_batch_dimensions([{_Id, Vec} | Rest], Dim) ->
+    case length(Vec) of
+        Dim -> validate_batch_dimensions(Rest, Dim);
+        Other -> {error, {dimension_mismatch, Dim, Other}}
+    end.
+
+insert_batch_validated(#diskann_index{storage_mode = disk} = Index, Vectors, Opts) ->
+    insert_batch_disk(Index, Vectors, Opts);
+insert_batch_validated(#diskann_index{storage_mode = memory} = Index, Vectors, Opts) ->
+    insert_batch_memory(Index, Vectors, Opts).
+
+%% Batch insert for disk mode - optimized for throughput
+insert_batch_disk(Index0, Vectors, _Opts) ->
+    Config = Index0#diskann_index.config,
+    #diskann_config{l_build = L, alpha = Alpha, r = R} = Config,
+
+    %% Phase 1: Assign integer IDs, write vectors and empty nodes to disk
+    {IntIdVecs, Index1} = lists:mapfoldl(
+        fun({Id, Vec}, AccIdx) ->
+            {IntId, Idx1} = get_or_create_int_id(AccIdx, Id),
+            %% Write vector to disk
+            ok = barrel_vectordb_diskann_file:write_vector(
+                Idx1#diskann_index.file_handle, IntId, Vec),
+            %% Write empty node to disk
+            ok = barrel_vectordb_diskann_file:write_node_int(
+                Idx1#diskann_index.file_handle, IntId, [], R),
+            %% Cache the vector
+            cache_put_with_eviction_by_key(Idx1#diskann_index.cache_table, IntId, Vec,
+                                           Idx1#diskann_index.cache_max_size),
+            %% Initialize node with empty neighbors in graph cache
+            graph_cache_put_with_eviction(Idx1#diskann_index.graph_cache_table, IntId, [],
+                                          Idx1#diskann_index.graph_cache_max_size),
+            %% Initialize in nodes_int map
+            Idx2 = Idx1#diskann_index{
+                nodes_int = maps:put(IntId, [], Idx1#diskann_index.nodes_int)
+            },
+            {{IntId, Vec}, Idx2}
+        end,
+        Index0,
+        Vectors
+    ),
+
+    %% Handle first insert (set medoid) - nodes already written to disk in Phase 1
+    {Index2, NewIntIds} = case Index1#diskann_index.medoid_int_id of
+        undefined ->
+            {FirstIntId, _} = hd(IntIdVecs),
+            %% Lookup string ID for medoid
+            {ok, FirstStringId} = int_id_to_string(Index1, FirstIntId),
+            %% First vector becomes medoid, skip it in graph building
+            {Index1#diskann_index{
+                medoid_id = FirstStringId,
+                medoid_int_id = FirstIntId,
+                size = 1
+            }, tl([IntId || {IntId, _} <- IntIdVecs])};
+        _ ->
+            %% Already have medoid, process all new vectors
+            {Index1, [IntId || {IntId, _} <- IntIdVecs]}
+    end,
+
+    %% Phase 2: Build graph edges for all new nodes
+    %% Process in batches to balance memory and efficiency
+    BatchSize = maps:get(batch_size, _Opts, 50),
+    Index3 = insert_batch_build_graph(Index2, NewIntIds, IntIdVecs, L, Alpha, R, BatchSize),
+
+    %% Update size
+    NewSize = Index3#diskann_index.size + length(NewIntIds),
+    {ok, Index3#diskann_index{size = NewSize}}.
+
+%% Build graph edges for batch of new nodes
+insert_batch_build_graph(Index, [], _IntIdVecs, _L, _Alpha, _R, _BatchSize) ->
+    Index;
+insert_batch_build_graph(Index, IntIds, IntIdVecs, L, Alpha, R, BatchSize) ->
+    %% Process in batches
+    {Batch, Rest} = safe_split(BatchSize, IntIds),
+
+    %% Build edges for this batch
+    Index1 = lists:foldl(
+        fun(IntId, AccIdx) ->
+            Vec = proplists:get_value(IntId, IntIdVecs),
+            insert_single_node_disk(AccIdx, IntId, Vec, L, Alpha, R)
+        end,
+        Index,
+        Batch
+    ),
+
+    insert_batch_build_graph(Index1, Rest, IntIdVecs, L, Alpha, R, BatchSize).
+
+%% Insert single node into graph (disk mode) - extracted from insert/3
+insert_single_node_disk(Index, IntId, Vec, L, Alpha, R) ->
+    MedoidIntId = Index#diskann_index.medoid_int_id,
+
+    %% Greedy search returns {Results, Visited} where Visited is a set of IntIds
+    {_Results, Visited} = greedy_search_int(Index, MedoidIntId, Vec, 1, L),
+
+    %% Robust prune uses the visited set (list of IntIds)
+    Index1 = robust_prune_int(Index, IntId, sets:to_list(Visited), Alpha, R),
+
+    %% Write node to disk
+    Neighbors = get_neighbors_int(Index1, IntId),
+    ok = barrel_vectordb_diskann_file:write_node_int(
+        Index1#diskann_index.file_handle, IntId, Neighbors, R),
+
+    %% Add backward edges
+    lists:foldl(
+        fun(J, AccIndex) ->
+            JNeighbors = get_neighbors_int(AccIndex, J),
+            case length(JNeighbors) + 1 > R of
+                true ->
+                    robust_prune_int(AccIndex, J, [IntId | JNeighbors], Alpha, R);
+                false ->
+                    add_neighbor_int(AccIndex, J, IntId)
+            end
+        end,
+        Index1,
+        Neighbors
+    ).
+
+%% Batch insert for memory mode
+insert_batch_memory(Index0, Vectors, _Opts) ->
+    Config = Index0#diskann_index.config,
+    #diskann_config{l_build = L, alpha = Alpha, r = R} = Config,
+
+    %% Handle empty index - set first as medoid
+    Index1 = case Index0#diskann_index.medoid_id of
+        undefined ->
+            {FirstId, FirstVec} = hd(Vectors),
+            Index0#diskann_index{
+                medoid_id = FirstId,
+                nodes = #{FirstId => #diskann_node{id = FirstId, neighbors = []}},
+                vectors = #{FirstId => FirstVec},
+                size = 1
+            };
+        _ ->
+            Index0
+    end,
+
+    %% Get vectors to insert (skip first if it was medoid)
+    ToInsert = case Index0#diskann_index.medoid_id of
+        undefined -> tl(Vectors);
+        _ -> Vectors
+    end,
+
+    %% Phase 1: Add all vectors to storage
+    Index2 = lists:foldl(
+        fun({Id, Vec}, AccIdx) ->
+            AccIdx#diskann_index{
+                vectors = maps:put(Id, Vec, AccIdx#diskann_index.vectors),
+                nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
+                                AccIdx#diskann_index.nodes)
+            }
+        end,
+        Index1,
+        ToInsert
+    ),
+
+    %% Phase 2: Build graph edges
+    Index3 = lists:foldl(
+        fun({Id, Vec}, AccIdx) ->
+            MedoidId = AccIdx#diskann_index.medoid_id,
+            %% greedy_search returns {Results, Visited} where Visited is a set
+            {_Results, Visited} = greedy_search(AccIdx, MedoidId, Vec, 1, L),
+
+            %% Robust prune uses the visited set (list of Ids)
+            AccIdx1 = robust_prune(AccIdx, Id, sets:to_list(Visited), Alpha, R),
+
+            %% Add backward edges
+            Neighbors = get_neighbors(AccIdx1, Id),
+            lists:foldl(
+                fun(J, AccIdx2) ->
+                    JNeighbors = get_neighbors(AccIdx2, J),
+                    case length(JNeighbors) + 1 > R of
+                        true ->
+                            robust_prune(AccIdx2, J, [Id | JNeighbors], Alpha, R);
+                        false ->
+                            add_neighbor(AccIdx2, J, Id)
+                    end
+                end,
+                AccIdx1,
+                Neighbors
+            )
+        end,
+        Index2,
+        ToInsert
+    ),
+
+    NewSize = Index3#diskann_index.size + length(ToInsert),
+    {ok, Index3#diskann_index{size = NewSize}}.
+
+%% Safe split that handles lists shorter than N
+safe_split(N, List) when length(List) =< N -> {List, []};
+safe_split(N, List) -> lists:split(N, List).
 
 %% @doc Lazy delete - marks node as deleted
 -spec delete(diskann_index(), binary()) -> {ok, diskann_index()}.

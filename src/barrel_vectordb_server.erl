@@ -404,7 +404,7 @@ process_single_op({call, From, _Unknown}, State) ->
 process_writes_atomic([], State) ->
     {[], State};
 process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
-                                      cf_text = CfT, cf_hnsw = CfH,
+                                      cf_text = CfT,
                                       index = Index, index_module = Mod, dimension = Dim} = State) ->
     {ok, Batch} = rocksdb:batch(),
 
@@ -412,24 +412,43 @@ process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = Cf
     %% partial writes on embedding failures)
     case prepare_writes(Writes, State) of
         {ok, PreparedWrites} ->
-            %% Now apply all writes to the batch
-            {NewIndex, Replies} = lists:foldl(fun({From, WriteOp, PreparedData}, {AccIndex, AccReplies}) ->
-                case apply_write_to_batch(WriteOp, PreparedData, Batch, CfV, CfM, CfT, CfH, AccIndex, Mod, Dim) of
-                    {ok, UpdatedIndex, Reply} ->
-                        {UpdatedIndex, [{reply, From, Reply} | AccReplies]};
-                    {error, Reason} ->
-                        {AccIndex, [{reply, From, {error, Reason}} | AccReplies]}
-                end
-            end, {Index, []}, PreparedWrites),
+            %% Check if module supports batch insert (e.g., DiskANN)
+            SupportsBatchInsert = erlang:function_exported(Mod, insert_batch, 3),
 
-            %% Commit the batch atomically
-            case rocksdb:write_batch(Db, Batch, []) of
-                ok ->
-                    {Replies, State#state{index = NewIndex}};
+            %% Apply writes to RocksDB batch and collect vectors for index
+            {VectorsForIndex, Replies0} = lists:foldl(
+                fun({From, WriteOp, _PreparedData}, {AccVectors, AccReplies}) ->
+                    case apply_write_to_rocksdb_batch(WriteOp, Batch, CfV, CfM, CfT, Dim) of
+                        {ok, {Id, Vector}} ->
+                            {[{Id, Vector} | AccVectors], [{From, ok} | AccReplies]};
+                        {ok, VectorList} when is_list(VectorList) ->
+                            %% Batch insert - return stats
+                            Count = length(VectorList),
+                            {VectorList ++ AccVectors, [{From, {ok, #{inserted => Count}}} | AccReplies]};
+                        {error, Reason} ->
+                            {AccVectors, [{From, {error, Reason}} | AccReplies]}
+                    end
+                end,
+                {[], []},
+                PreparedWrites
+            ),
+
+            %% Insert into index (batch or individual)
+            case insert_vectors_to_index(lists:reverse(VectorsForIndex), Index, Mod, SupportsBatchInsert) of
+                {ok, NewIndex} ->
+                    %% Commit the RocksDB batch atomically
+                    case rocksdb:write_batch(Db, Batch, []) of
+                        ok ->
+                            Replies = [{reply, From, Reply} || {From, Reply} <- Replies0],
+                            {Replies, State#state{index = NewIndex}};
+                        {error, Reason} ->
+                            ErrorReplies = [{reply, From, {error, {db_error, Reason}}}
+                                           || {From, _} <- Replies0],
+                            {ErrorReplies, State}
+                    end;
                 {error, Reason} ->
-                    %% All writes fail on batch commit error
-                    ErrorReplies = [{reply, From, {error, {db_error, Reason}}}
-                                   || {From, _, _} <- PreparedWrites],
+                    ErrorReplies = [{reply, From, {error, {index_error, Reason}}}
+                                   || {From, _} <- Replies0],
                     {ErrorReplies, State}
             end;
         {error, From, Reason, SuccessfulPreps} ->
@@ -446,6 +465,64 @@ process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = Cf
                     {[ErrorReply | OkReplies], NewState}
             end
     end.
+
+%% Apply write to RocksDB batch only (no index update yet)
+apply_write_to_rocksdb_batch({add_vector, Id, Text, Metadata, Vector}, Batch, CfV, CfM, CfT, Dim) ->
+    case length(Vector) of
+        Dim ->
+            VectorBin = encode_vector(Vector),
+            MetadataBin = term_to_binary(Metadata),
+            ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
+            ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
+            ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+            {ok, {Id, Vector}};
+        Other ->
+            {error, {dimension_mismatch, Dim, Other}}
+    end;
+apply_write_to_rocksdb_batch({add_vector_batch, Docs}, Batch, CfV, CfM, CfT, Dim) ->
+    %% Process batch - collect all vectors
+    Results = lists:map(
+        fun({Id, Text, Metadata, Vector}) ->
+            case length(Vector) of
+                Dim ->
+                    VectorBin = encode_vector(Vector),
+                    MetadataBin = term_to_binary(Metadata),
+                    ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
+                    ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
+                    ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+                    {ok, {Id, Vector}};
+                Other ->
+                    {error, {dimension_mismatch, Dim, Other}}
+            end
+        end,
+        Docs
+    ),
+    %% Check for any errors
+    case [E || {error, _} = E <- Results] of
+        [] ->
+            Vectors = [{Id, Vec} || {ok, {Id, Vec}} <- Results],
+            {ok, Vectors};
+        [FirstError | _] ->
+            FirstError
+    end.
+
+%% Insert vectors to index - use batch insert if available
+insert_vectors_to_index([], Index, _Mod, _SupportsBatch) ->
+    {ok, Index};
+insert_vectors_to_index(Vectors, Index, Mod, true) ->
+    %% Use batch insert
+    Mod:insert_batch(Index, Vectors, #{});
+insert_vectors_to_index(Vectors, Index, Mod, false) ->
+    %% Fall back to individual inserts
+    lists:foldl(
+        fun({Id, Vector}, {ok, AccIndex}) ->
+            Mod:insert(AccIndex, Id, Vector);
+           (_, {error, _} = Err) ->
+            Err
+        end,
+        {ok, Index},
+        Vectors
+    ).
 
 %% Prepare writes by computing embeddings where needed
 prepare_writes(Writes, State) ->
@@ -482,53 +559,6 @@ prepare_batch_embeddings(Docs, State) ->
             end, Docs, Vectors),
             {ok, PreparedDocs};
         {error, Reason} ->
-            {error, Reason}
-    end.
-
-%% Apply a single write operation to the batch
-apply_write_to_batch({add_vector, Id, Text, Metadata, Vector}, _PreparedData,
-                      Batch, CfV, CfM, CfT, _CfH, Index, Mod, Dim) ->
-    case length(Vector) of
-        Dim ->
-            VectorBin = encode_vector(Vector),
-            MetadataBin = term_to_binary(Metadata),
-            ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
-            ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
-            ok = rocksdb:batch_put(Batch, CfT, Id, Text),
-            %% Index updated in-memory only (rebuilt from vectors on startup)
-            case Mod:insert(Index, Id, Vector) of
-                {ok, NewIndex} -> {ok, NewIndex, ok};
-                {error, Reason} -> {error, Reason}
-            end;
-        Other ->
-            {error, {dimension_mismatch, Dim, Other}}
-    end;
-
-apply_write_to_batch({add_vector_batch, Docs}, _PreparedData,
-                      Batch, CfV, CfM, CfT, _CfH, Index, Mod, Dim) ->
-    try
-        {NewIndex, Count} = lists:foldl(fun({Id, Text, Meta, Vector}, {AccIndex, AccCount}) ->
-            case length(Vector) of
-                Dim ->
-                    VectorBin = encode_vector(Vector),
-                    MetadataBin = term_to_binary(Meta),
-                    ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
-                    ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
-                    ok = rocksdb:batch_put(Batch, CfT, Id, Text),
-                    %% Index updated in-memory only (rebuilt from vectors on startup)
-                    case Mod:insert(AccIndex, Id, Vector) of
-                        {ok, UpdatedIndex} -> {UpdatedIndex, AccCount + 1};
-                        {error, Reason} -> throw({insert_error, Reason})
-                    end;
-                Other ->
-                    throw({dimension_mismatch, Dim, Other})
-            end
-        end, {Index, 0}, Docs),
-        {ok, NewIndex, {ok, #{inserted => Count}}}
-    catch
-        throw:{dimension_mismatch, Expected, Got} ->
-            {error, {dimension_mismatch, Expected, Got}};
-        throw:{insert_error, Reason} ->
             {error, Reason}
     end.
 
