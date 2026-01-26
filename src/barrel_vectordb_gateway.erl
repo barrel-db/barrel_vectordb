@@ -34,6 +34,11 @@
 -define(API_KEY_HEADER, <<"x-api-key">>).
 -define(ENTERPRISE_MOD, barrel_vectordb_gateway_enterprise).
 
+%% Suppress dialyzer warnings for optional enterprise module functions
+-dialyzer({nowarn_function, [enterprise_authenticate/2,
+                             enterprise_authorize/3,
+                             enterprise_audit/3]}).
+
 %%====================================================================
 %% API
 %%====================================================================
@@ -779,6 +784,8 @@ get_resource_id(Req, Action) ->
     end.
 
 %% @private Get API key prefix for audit logging (first 12 chars).
+%% Note: undefined clause kept for defensive programming
+-dialyzer({nowarn_function, get_key_prefix/1}).
 get_key_prefix(undefined) ->
     undefined;
 get_key_prefix(KeyRecord) ->

@@ -25,7 +25,9 @@
     search/3,
     count/0,
     info/0,
-    rebuild_index/0
+    rebuild_index/0,
+    %% DiskANN ID mapping API
+    get_diskann_db/0
 ]).
 
 %% gen_server callbacks
@@ -39,6 +41,9 @@
     cf_metadata :: rocksdb:cf_handle(),
     cf_text :: rocksdb:cf_handle(),
     cf_hnsw :: rocksdb:cf_handle(),
+    %% DiskANN ID mapping column families
+    cf_diskann_ids_fwd :: rocksdb:cf_handle(),
+    cf_diskann_ids_rev :: rocksdb:cf_handle(),
     hnsw_index :: hnsw_index(),
     dimension :: pos_integer(),
     embed_state :: barrel_vectordb_embed:embed_state() | undefined,
@@ -104,6 +109,12 @@ info() ->
 rebuild_index() ->
     gen_server:call(?SERVER, rebuild_index, infinity).
 
+%% @doc Get DiskANN ID mapping database handles
+%% Returns {ok, {Db, CfFwd, CfRev}} | {error, not_started}
+-spec get_diskann_db() -> {ok, {rocksdb:db_handle(), rocksdb:cf_handle(), rocksdb:cf_handle()}} | {error, term()}.
+get_diskann_db() ->
+    gen_server:call(?SERVER, get_diskann_db).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -130,6 +141,8 @@ init(Config) ->
                         cf_metadata = maps:get(metadata, CfHandles),
                         cf_text = maps:get(text, CfHandles),
                         cf_hnsw = maps:get(hnsw, CfHandles),
+                        cf_diskann_ids_fwd = maps:get(diskann_ids_fwd, CfHandles),
+                        cf_diskann_ids_rev = maps:get(diskann_ids_rev, CfHandles),
                         hnsw_index = HnswIndex,
                         dimension = Dimension,
                         embed_state = EmbedState,
@@ -192,6 +205,10 @@ handle_call(rebuild_index, _From, State) ->
             {reply, Error, State}
     end;
 
+handle_call(get_diskann_db, _From, #state{db = Db, cf_diskann_ids_fwd = CfFwd,
+                                           cf_diskann_ids_rev = CfRev} = State) ->
+    {reply, {ok, {Db, CfFwd, CfRev}}, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
@@ -218,22 +235,27 @@ init_rocksdb(DbPath) ->
 
     Options = [{create_if_missing, true}, {create_missing_column_families, true}],
 
-    %% Define column families
+    %% Define column families (including DiskANN ID mapping)
     CfDefs = [
         {?CF_DEFAULT, []},
         {?CF_VECTORS, []},
         {?CF_METADATA, []},
         {?CF_TEXT, []},
-        {?CF_HNSW, []}
+        {?CF_HNSW, []},
+        {?CF_DISKANN_IDS_FWD, []},
+        {?CF_DISKANN_IDS_REV, []}
     ],
 
     case rocksdb:open_with_cf(DbPath, Options, CfDefs) of
-        {ok, Db, [_Default, CfVectors, CfMetadata, CfText, CfHnsw]} ->
+        {ok, Db, [_Default, CfVectors, CfMetadata, CfText, CfHnsw,
+                  CfDiskannIdsFwd, CfDiskannIdsRev]} ->
             {ok, Db, #{
                 vectors => CfVectors,
                 metadata => CfMetadata,
                 text => CfText,
-                hnsw => CfHnsw
+                hnsw => CfHnsw,
+                diskann_ids_fwd => CfDiskannIdsFwd,
+                diskann_ids_rev => CfDiskannIdsRev
             }};
         {error, Reason} ->
             {error, Reason}

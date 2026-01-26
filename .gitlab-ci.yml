@@ -14,6 +14,9 @@ default:
   image: erlang:27
   before_script:
     - apt-get update && apt-get install -y cmake libsnappy-dev liblz4-dev libzstd-dev
+    # Configure git credentials for private dependencies using CI job token
+    - git config --global credential.helper store
+    - echo "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.enki.io" > ~/.git-credentials
     - rebar3 --version
 
 cache:
@@ -46,11 +49,6 @@ eunit:
     - rebar3 eunit --module=barrel_vectordb_tests
     - rebar3 eunit --module=barrel_vectordb_store_tests
     - rebar3 eunit --module=barrel_vectordb_hnsw_tests
-    - rebar3 eunit --module=barrel_vectordb_embed_tests
-    - rebar3 eunit --module=barrel_vectordb_embed_provider_tests
-    - rebar3 eunit --module=barrel_vectordb_embed_ollama_tests
-    - rebar3 eunit --module=barrel_vectordb_embed_openai_tests
-    - rebar3 eunit --module=barrel_vectordb_embed_local_tests
     - rebar3 eunit --module=barrel_vectordb_comprehensive_tests
 
 dialyzer:

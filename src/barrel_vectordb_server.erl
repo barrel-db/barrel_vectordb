@@ -19,6 +19,10 @@
 
 -include("barrel_vectordb.hrl").
 
+%% Long timeout for operations that may take a while (1 hour in ms)
+%% Using explicit value instead of infinity for gen_batch_server compatibility
+-define(LONG_TIMEOUT, 3600000).
+
 %% API
 -export([
     start_link/2,
@@ -95,24 +99,24 @@ stop(Store) ->
 %% @doc Add document with auto-embedding.
 -spec add(atom() | pid(), binary(), binary(), map()) -> ok | {error, term()}.
 add(Store, Id, Text, Metadata) ->
-    gen_batch_server:call(Store, {add, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {add, Id, Text, Metadata}, ?LONG_TIMEOUT).
 
 %% @doc Add document with explicit vector.
 -spec add_vector(atom() | pid(), binary(), binary(), map(), [float()]) -> ok | {error, term()}.
 add_vector(Store, Id, Text, Metadata, Vector) ->
-    gen_batch_server:call(Store, {add_vector, Id, Text, Metadata, Vector}, infinity).
+    gen_batch_server:call(Store, {add_vector, Id, Text, Metadata, Vector}, ?LONG_TIMEOUT).
 
 %% @doc Add multiple documents.
 -spec add_batch(atom() | pid(), [{binary(), binary(), map()}]) ->
     {ok, #{inserted := non_neg_integer()}} | {error, term()}.
 add_batch(Store, Docs) ->
-    gen_batch_server:call(Store, {add_batch, Docs}, infinity).
+    gen_batch_server:call(Store, {add_batch, Docs}, ?LONG_TIMEOUT).
 
 %% @doc Add multiple documents with pre-computed vectors (bulk insert).
 -spec add_vector_batch(atom() | pid(), [{binary(), binary(), map(), [float()]}]) ->
     {ok, #{inserted := non_neg_integer()}} | {error, term()}.
 add_vector_batch(Store, Docs) ->
-    gen_batch_server:call(Store, {add_vector_batch, Docs}, infinity).
+    gen_batch_server:call(Store, {add_vector_batch, Docs}, ?LONG_TIMEOUT).
 
 %% @doc Get document by ID.
 -spec get(atom() | pid(), binary()) -> {ok, map()} | not_found | {error, term()}.
@@ -122,12 +126,12 @@ get(Store, Id) ->
 %% @doc Update document metadata (re-embeds the text).
 -spec update(atom() | pid(), binary(), binary(), map()) -> ok | not_found | {error, term()}.
 update(Store, Id, Text, Metadata) ->
-    gen_batch_server:call(Store, {update, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {update, Id, Text, Metadata}, ?LONG_TIMEOUT).
 
 %% @doc Insert or update document.
 -spec upsert(atom() | pid(), binary(), binary(), map()) -> ok | {error, term()}.
 upsert(Store, Id, Text, Metadata) ->
-    gen_batch_server:call(Store, {upsert, Id, Text, Metadata}, infinity).
+    gen_batch_server:call(Store, {upsert, Id, Text, Metadata}, ?LONG_TIMEOUT).
 
 %% @doc Delete document.
 -spec delete(atom() | pid(), binary()) -> ok | {error, term()}.
@@ -142,22 +146,22 @@ peek(Store, Limit) ->
 %% @doc Search with text query.
 -spec search(atom() | pid(), binary(), map()) -> {ok, [map()]} | {error, term()}.
 search(Store, Query, Opts) ->
-    gen_batch_server:call(Store, {search, Query, Opts}, infinity).
+    gen_batch_server:call(Store, {search, Query, Opts}, ?LONG_TIMEOUT).
 
 %% @doc Search with vector query.
 -spec search_vector(atom() | pid(), [float()], map()) -> {ok, [map()]} | {error, term()}.
 search_vector(Store, Vector, Opts) ->
-    gen_batch_server:call(Store, {search_vector, Vector, Opts}, infinity).
+    gen_batch_server:call(Store, {search_vector, Vector, Opts}, ?LONG_TIMEOUT).
 
 %% @doc Embed single text.
 -spec embed(atom() | pid(), binary()) -> {ok, [float()]} | {error, term()}.
 embed(Store, Text) ->
-    gen_batch_server:call(Store, {embed, Text}, infinity).
+    gen_batch_server:call(Store, {embed, Text}, ?LONG_TIMEOUT).
 
 %% @doc Embed multiple texts.
 -spec embed_batch(atom() | pid(), [binary()]) -> {ok, [[float()]]} | {error, term()}.
 embed_batch(Store, Texts) ->
-    gen_batch_server:call(Store, {embed_batch, Texts}, infinity).
+    gen_batch_server:call(Store, {embed_batch, Texts}, ?LONG_TIMEOUT).
 
 %% @doc Get store statistics.
 -spec stats(atom() | pid()) -> {ok, map()}.
@@ -196,7 +200,14 @@ init({Name, Config}) ->
     %% Get backend-specific configuration
     IndexConfig = case Backend of
         hnsw -> maps:get(hnsw, Config, #{});
-        faiss -> maps:get(faiss, Config, #{})
+        faiss -> maps:get(faiss, Config, #{});
+        diskann ->
+            DiskAnnConfig = maps:get(diskann, Config, #{}),
+            %% Set default base_path relative to db_path if not specified
+            case maps:is_key(base_path, DiskAnnConfig) of
+                true -> DiskAnnConfig;
+                false -> DiskAnnConfig#{base_path => filename:join(DbPath, "diskann")}
+            end
     end,
 
     %% Initialize embedder
@@ -397,7 +408,7 @@ process_single_op({call, From, _Unknown}, State) ->
 process_writes_atomic([], State) ->
     {[], State};
 process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
-                                      cf_text = CfT, cf_hnsw = CfH,
+                                      cf_text = CfT,
                                       index = Index, index_module = Mod, dimension = Dim} = State) ->
     {ok, Batch} = rocksdb:batch(),
 
@@ -405,24 +416,43 @@ process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = Cf
     %% partial writes on embedding failures)
     case prepare_writes(Writes, State) of
         {ok, PreparedWrites} ->
-            %% Now apply all writes to the batch
-            {NewIndex, Replies} = lists:foldl(fun({From, WriteOp, PreparedData}, {AccIndex, AccReplies}) ->
-                case apply_write_to_batch(WriteOp, PreparedData, Batch, CfV, CfM, CfT, CfH, AccIndex, Mod, Dim) of
-                    {ok, UpdatedIndex, Reply} ->
-                        {UpdatedIndex, [{reply, From, Reply} | AccReplies]};
-                    {error, Reason} ->
-                        {AccIndex, [{reply, From, {error, Reason}} | AccReplies]}
-                end
-            end, {Index, []}, PreparedWrites),
+            %% Check if module supports batch insert (e.g., DiskANN)
+            SupportsBatchInsert = erlang:function_exported(Mod, insert_batch, 3),
 
-            %% Commit the batch atomically
-            case rocksdb:write_batch(Db, Batch, []) of
-                ok ->
-                    {Replies, State#state{index = NewIndex}};
+            %% Apply writes to RocksDB batch and collect vectors for index
+            {VectorsForIndex, Replies0} = lists:foldl(
+                fun({From, WriteOp, _PreparedData}, {AccVectors, AccReplies}) ->
+                    case apply_write_to_rocksdb_batch(WriteOp, Batch, CfV, CfM, CfT, Dim) of
+                        {ok, {Id, Vector}} ->
+                            {[{Id, Vector} | AccVectors], [{From, ok} | AccReplies]};
+                        {ok, VectorList} when is_list(VectorList) ->
+                            %% Batch insert - return stats
+                            Count = length(VectorList),
+                            {VectorList ++ AccVectors, [{From, {ok, #{inserted => Count}}} | AccReplies]};
+                        {error, Reason} ->
+                            {AccVectors, [{From, {error, Reason}} | AccReplies]}
+                    end
+                end,
+                {[], []},
+                PreparedWrites
+            ),
+
+            %% Insert into index (batch or individual)
+            case insert_vectors_to_index(lists:reverse(VectorsForIndex), Index, Mod, SupportsBatchInsert) of
+                {ok, NewIndex} ->
+                    %% Commit the RocksDB batch atomically
+                    case rocksdb:write_batch(Db, Batch, []) of
+                        ok ->
+                            Replies = [{reply, From, Reply} || {From, Reply} <- Replies0],
+                            {Replies, State#state{index = NewIndex}};
+                        {error, Reason} ->
+                            ErrorReplies = [{reply, From, {error, {db_error, Reason}}}
+                                           || {From, _} <- Replies0],
+                            {ErrorReplies, State}
+                    end;
                 {error, Reason} ->
-                    %% All writes fail on batch commit error
-                    ErrorReplies = [{reply, From, {error, {db_error, Reason}}}
-                                   || {From, _, _} <- PreparedWrites],
+                    ErrorReplies = [{reply, From, {error, {index_error, Reason}}}
+                                   || {From, _} <- Replies0],
                     {ErrorReplies, State}
             end;
         {error, From, Reason, SuccessfulPreps} ->
@@ -439,6 +469,64 @@ process_writes_atomic(Writes, #state{db = Db, cf_vectors = CfV, cf_metadata = Cf
                     {[ErrorReply | OkReplies], NewState}
             end
     end.
+
+%% Apply write to RocksDB batch only (no index update yet)
+apply_write_to_rocksdb_batch({add_vector, Id, Text, Metadata, Vector}, Batch, CfV, CfM, CfT, Dim) ->
+    case length(Vector) of
+        Dim ->
+            VectorBin = encode_vector(Vector),
+            MetadataBin = term_to_binary(Metadata),
+            ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
+            ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
+            ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+            {ok, {Id, Vector}};
+        Other ->
+            {error, {dimension_mismatch, Dim, Other}}
+    end;
+apply_write_to_rocksdb_batch({add_vector_batch, Docs}, Batch, CfV, CfM, CfT, Dim) ->
+    %% Process batch - collect all vectors
+    Results = lists:map(
+        fun({Id, Text, Metadata, Vector}) ->
+            case length(Vector) of
+                Dim ->
+                    VectorBin = encode_vector(Vector),
+                    MetadataBin = term_to_binary(Metadata),
+                    ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
+                    ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
+                    ok = rocksdb:batch_put(Batch, CfT, Id, Text),
+                    {ok, {Id, Vector}};
+                Other ->
+                    {error, {dimension_mismatch, Dim, Other}}
+            end
+        end,
+        Docs
+    ),
+    %% Check for any errors
+    case [E || {error, _} = E <- Results] of
+        [] ->
+            Vectors = [{Id, Vec} || {ok, {Id, Vec}} <- Results],
+            {ok, Vectors};
+        [FirstError | _] ->
+            FirstError
+    end.
+
+%% Insert vectors to index - use batch insert if available
+insert_vectors_to_index([], Index, _Mod, _SupportsBatch) ->
+    {ok, Index};
+insert_vectors_to_index(Vectors, Index, Mod, true) ->
+    %% Use batch insert
+    Mod:insert_batch(Index, Vectors, #{});
+insert_vectors_to_index(Vectors, Index, Mod, false) ->
+    %% Fall back to individual inserts
+    lists:foldl(
+        fun({Id, Vector}, {ok, AccIndex}) ->
+            Mod:insert(AccIndex, Id, Vector);
+           (_, {error, _} = Err) ->
+            Err
+        end,
+        {ok, Index},
+        Vectors
+    ).
 
 %% Prepare writes by computing embeddings where needed
 prepare_writes(Writes, State) ->
@@ -475,53 +563,6 @@ prepare_batch_embeddings(Docs, State) ->
             end, Docs, Vectors),
             {ok, PreparedDocs};
         {error, Reason} ->
-            {error, Reason}
-    end.
-
-%% Apply a single write operation to the batch
-apply_write_to_batch({add_vector, Id, Text, Metadata, Vector}, _PreparedData,
-                      Batch, CfV, CfM, CfT, _CfH, Index, Mod, Dim) ->
-    case length(Vector) of
-        Dim ->
-            VectorBin = encode_vector(Vector),
-            MetadataBin = term_to_binary(Metadata),
-            ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
-            ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
-            ok = rocksdb:batch_put(Batch, CfT, Id, Text),
-            %% Index updated in-memory only (rebuilt from vectors on startup)
-            case Mod:insert(Index, Id, Vector) of
-                {ok, NewIndex} -> {ok, NewIndex, ok};
-                {error, Reason} -> {error, Reason}
-            end;
-        Other ->
-            {error, {dimension_mismatch, Dim, Other}}
-    end;
-
-apply_write_to_batch({add_vector_batch, Docs}, _PreparedData,
-                      Batch, CfV, CfM, CfT, _CfH, Index, Mod, Dim) ->
-    try
-        {NewIndex, Count} = lists:foldl(fun({Id, Text, Meta, Vector}, {AccIndex, AccCount}) ->
-            case length(Vector) of
-                Dim ->
-                    VectorBin = encode_vector(Vector),
-                    MetadataBin = term_to_binary(Meta),
-                    ok = rocksdb:batch_put(Batch, CfV, Id, VectorBin),
-                    ok = rocksdb:batch_put(Batch, CfM, Id, MetadataBin),
-                    ok = rocksdb:batch_put(Batch, CfT, Id, Text),
-                    %% Index updated in-memory only (rebuilt from vectors on startup)
-                    case Mod:insert(AccIndex, Id, Vector) of
-                        {ok, UpdatedIndex} -> {UpdatedIndex, AccCount + 1};
-                        {error, Reason} -> throw({insert_error, Reason})
-                    end;
-                Other ->
-                    throw({dimension_mismatch, Dim, Other})
-            end
-        end, {Index, 0}, Docs),
-        {ok, NewIndex, {ok, #{inserted => Count}}}
-    catch
-        throw:{dimension_mismatch, Expected, Got} ->
-            {error, {dimension_mismatch, Expected, Got}};
-        throw:{insert_error, Reason} ->
             {error, Reason}
     end.
 
@@ -573,14 +614,32 @@ init_rocksdb(DbPath) ->
 
 %% Load existing index or create new one
 load_or_create_index(Db, CfHandles, Dimension, IndexConfig, IndexModule) ->
-    CfHnsw = maps:get(hnsw, CfHandles),
-    CfVectors = maps:get(vectors, CfHandles),
+    case IndexModule of
+        barrel_vectordb_diskann ->
+            %% DiskANN manages its own persistence - use open/new directly
+            load_or_create_diskann(IndexConfig, Dimension);
+        _ ->
+            %% HNSW/FAISS - rebuild from vectors stored in RocksDB
+            CfHnsw = maps:get(hnsw, CfHandles),
+            CfVectors = maps:get(vectors, CfHandles),
+            case load_index_meta(Db, CfHnsw) of
+                {ok, _IndexMeta} ->
+                    rebuild_from_vectors(Db, CfVectors, Dimension, IndexConfig, IndexModule);
+                not_found ->
+                    IndexModule:new(IndexConfig#{dimension => Dimension})
+            end
+    end.
 
-    case load_index_meta(Db, CfHnsw) of
-        {ok, _IndexMeta} ->
-            rebuild_from_vectors(Db, CfVectors, Dimension, IndexConfig, IndexModule);
-        not_found ->
-            IndexModule:new(IndexConfig#{dimension => Dimension})
+%% DiskANN-specific loading: try open existing, else create new
+load_or_create_diskann(Config, Dimension) ->
+    BasePath = maps:get(base_path, Config),
+    ok = filelib:ensure_dir(filename:join(BasePath, "dummy")),
+    case barrel_vectordb_diskann:open(BasePath) of
+        {ok, Index} ->
+            {ok, Index};
+        {error, _} ->
+            %% No existing index or failed to open - create new
+            barrel_vectordb_diskann:new(Config#{dimension => Dimension, storage_mode => disk})
     end.
 
 %% Load index metadata from storage
