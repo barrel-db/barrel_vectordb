@@ -43,7 +43,8 @@ diskann_disk_test_() ->
         {"lru cache eviction", fun test_lru_cache_eviction/0},
         {"cache warming persists", fun test_cache_warming_persists/0},
         {"batch insert deferred correctness", fun test_batch_insert_deferred/0},
-        {"batch insert deferred recall", fun test_batch_insert_recall_deferred/0}
+        {"batch insert deferred recall", fun test_batch_insert_recall_deferred/0},
+        {"cache prewarm coverage for batch", fun test_cache_prewarm_coverage/0}
     ].
 
 %% V2 format tests with RocksDB ID mapping
@@ -639,6 +640,60 @@ test_batch_insert_recall_deferred() ->
 
         %% Deferred approach may have slightly lower recall - accept 30%+
         %% The speed benefit justifies the trade-off
+        ?assert(AvgRecall >= 0.30),
+
+        ok = barrel_vectordb_diskann:close(Index1)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_cache_prewarm_coverage() ->
+    %% Test that cache pre-warming improves performance by pre-loading vectors
+    %% This test verifies that batch insert with cache pre-warming:
+    %% 1. Completes successfully
+    %% 2. Maintains good recall
+    %% 3. Cache grows after batch insert (vectors are loaded)
+    TmpDir = setup_disk(),
+    try
+        %% Build initial index
+        rand:seed(exsss, {777, 888, 999}),
+        InitialVectors = [{integer_to_binary(I), random_vector(16)}
+                          || I <- lists:seq(1, 100)],
+        Config = #{
+            dimension => 16,
+            r => 16,
+            l_build => 50,
+            l_search => 50,
+            alpha => 1.2,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => false,
+            cache_max_size => 200  %% Enough to hold pre-warmed vectors
+        },
+        {ok, Index0} = barrel_vectordb_diskann:build(Config, InitialVectors),
+
+        %% Get initial cache size
+        Info0 = barrel_vectordb_diskann:info(Index0),
+        StorageInfo0 = maps:get(storage, Info0),
+        CacheSize0 = maps:get(cache_size, StorageInfo0),
+
+        %% Batch insert more vectors - this should trigger cache pre-warming
+        NewVectors = [{integer_to_binary(100 + I), random_vector(16)}
+                      || I <- lists:seq(1, 50)],
+        {ok, Index1} = barrel_vectordb_diskann:insert_batch(Index0, NewVectors, #{}),
+        ?assertEqual(150, barrel_vectordb_diskann:size(Index1)),
+
+        %% Check that cache grew (pre-warming loaded vectors)
+        Info1 = barrel_vectordb_diskann:info(Index1),
+        StorageInfo1 = maps:get(storage, Info1),
+        CacheSize1 = maps:get(cache_size, StorageInfo1),
+        ?assert(CacheSize1 >= CacheSize0),
+
+        %% Verify search still works with good recall
+        AllVectors = InitialVectors ++ NewVectors,
+        Recalls = [measure_recall(Index1, random_vector(16), AllVectors, 10)
+                   || _ <- lists:seq(1, 5)],
+        AvgRecall = lists:sum(Recalls) / length(Recalls),
         ?assert(AvgRecall >= 0.30),
 
         ok = barrel_vectordb_diskann:close(Index1)

@@ -685,11 +685,18 @@ insert_batch_disk(Index0, Vectors, _Opts) ->
             Index3#diskann_index.file_handle, IntId, Neighbors, R)
     end, NewIntIds),
 
+    %% Phase 2.5: Pre-warm cache with existing nodes' vectors before Vamana pass
+    %% This reduces disk I/O during the hot path by pre-loading likely-accessed vectors
+    VectorMap2 = case Index2#diskann_index.size of
+        0 -> VectorMap;  %% Empty index, nothing to pre-warm
+        _ -> prewarm_cache_for_batch(Index3, MedoidIntId, VectorMap)
+    end,
+
     %% Phase 3: Refine graph using Vamana pass on new nodes only
     %% Use the in-memory vector map for fast distance computation
     %% Use deferred backward edges for better performance (FreshDiskANN technique)
     %% Returns updated index and list of existing nodes whose neighbor lists were modified
-    {Index4, ModifiedExisting} = vamana_pass_batch_deferred(Index3, NewIntIds, VectorMap, MedoidIntId, Alpha, L, R),
+    {Index4, ModifiedExisting} = vamana_pass_batch_deferred(Index3, NewIntIds, VectorMap2, MedoidIntId, Alpha, L, R),
 
     %% Write final edges to disk for new nodes
     lists:foreach(fun(IntId) ->
@@ -2209,6 +2216,42 @@ prewarm_caches(Index, MedoidIntId, MaxSize) ->
         ToLoad
     ),
     ok.
+
+%% Pre-warm cache for batch insert by loading 2-hop neighborhood vectors
+%% Returns updated VectorMap with pre-loaded vectors for faster distance computation
+prewarm_cache_for_batch(Index, MedoidIntId, VectorMap) ->
+    %% Get 1-hop neighbors (medoid's neighbors)
+    OneHop = get_neighbors_int(Index, MedoidIntId),
+
+    %% Get 2-hop neighbors (neighbors of medoid's neighbors)
+    TwoHop = lists:foldl(
+        fun(N, Acc) ->
+            NNeighbors = get_neighbors_int(Index, N),
+            lists:usort(NNeighbors ++ Acc)
+        end,
+        [],
+        OneHop
+    ),
+
+    %% Combine all nodes to pre-warm (medoid + 1-hop + 2-hop), remove duplicates
+    AllNodes = lists:usort([MedoidIntId | OneHop] ++ TwoHop),
+
+    %% Load vectors into VectorMap for fast access during Vamana pass
+    %% Also populates ETS cache as a side effect
+    lists:foldl(
+        fun(IntId, AccMap) ->
+            case maps:is_key(IntId, AccMap) of
+                true -> AccMap;  %% Already in map (new vector)
+                false ->
+                    case get_vector_by_int_id(Index, IntId) of
+                        undefined -> AccMap;
+                        Vec -> maps:put(IntId, Vec, AccMap)
+                    end
+            end
+        end,
+        VectorMap,
+        AllNodes
+    ).
 
 %% Train and apply PQ with integer IDs
 train_and_apply_pq_int(Index, Options, IntIdVectors) ->
