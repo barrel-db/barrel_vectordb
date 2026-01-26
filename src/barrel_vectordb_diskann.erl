@@ -86,10 +86,9 @@
     file_handle :: term() | undefined,
     base_path :: binary() | undefined,
 
-    %% Vector cache for disk mode (LRU eviction)
-    vector_cache = #{} :: #{binary() => [float()]},
-    cache_max_size = 10000 :: pos_integer(),
-    cache_lru = [] :: [binary()]
+    %% ETS-based vector cache for disk mode (persists across calls)
+    cache_table :: ets:tid() | undefined,
+    cache_max_size = 10000 :: pos_integer()
 }).
 
 -record(diskann_node, {
@@ -144,11 +143,17 @@ new(Options) ->
                         dimension = Dimension,
                         distance_fn = DistanceFn
                     },
+                    %% Create ETS cache table for disk mode
+                    CacheTable = case StorageMode of
+                        disk -> create_cache_table();
+                        memory -> undefined
+                    end,
                     {ok, #diskann_index{
                         config = Config,
                         storage_mode = StorageMode,
                         base_path = to_binary_or_undefined(BasePath),
-                        cache_max_size = CacheMaxSize
+                        cache_max_size = CacheMaxSize,
+                        cache_table = CacheTable
                     }};
                 {error, _} = Error ->
                     Error
@@ -261,14 +266,13 @@ build_disk_mode(Index0, Options, Vectors) ->
 
             %% During build, we need vectors in cache for distance calculations
             VectorMap = maps:from_list(Vectors),
+            %% Populate ETS cache with all vectors for build phase
+            populate_cache_for_build(Index0#diskann_index.cache_table, VectorMap),
             Index1 = Index0#diskann_index{
                 file_handle = FileHandle2,
                 id_to_idx = IdToIdx,
                 idx_to_id = IdxToId,
-                size = length(Vectors),
-                %% Temporarily put all vectors in cache for build
-                vector_cache = VectorMap,
-                cache_lru = maps:keys(VectorMap)
+                size = length(Vectors)
             },
 
             %% Find medoid
@@ -310,17 +314,16 @@ build_disk_mode(Index0, Options, Vectors) ->
 
             %% Clear the build cache, keep only limited cache for search
             CacheMaxSize = Index6#diskann_index.cache_max_size,
+            clear_cache_table(Index6#diskann_index.cache_table),
             Index7 = Index6#diskann_index{
                 file_handle = FileHandle3,
-                vectors = #{},  %% Clear vectors from memory
-                vector_cache = #{},  %% Clear build cache
-                cache_lru = []
+                vectors = #{}  %% Clear vectors from memory
             },
 
             %% Pre-warm cache with medoid neighbors
-            Index8 = prewarm_cache(Index7, MedoidId, CacheMaxSize),
+            prewarm_cache(Index7, MedoidId, CacheMaxSize),
 
-            {ok, Index8};
+            {ok, Index7};
 
         {error, Reason} ->
             {error, {disk_file_create_failed, Reason}}
@@ -356,14 +359,14 @@ prewarm_cache(Index, MedoidId, MaxSize) ->
     Neighbors = get_neighbors(Index, MedoidId),
     %% Load medoid and its neighbors into cache
     ToLoad = lists:sublist([MedoidId | Neighbors], MaxSize),
-    lists:foldl(
-        fun(Id, AccIndex) ->
-            {_Vec, NewIndex} = get_vector_cached(AccIndex, Id),
-            NewIndex
+    lists:foreach(
+        fun(Id) ->
+            %% get_vector_cached will add to ETS cache as side effect
+            _ = get_vector_cached(Index, Id)
         end,
-        Index,
         ToLoad
-    ).
+    ),
+    ok.
 
 %% @doc Insert a new vector (FreshVamana algorithm)
 -spec insert(diskann_index(), binary(), [float()]) -> {ok, diskann_index()} | {error, term()}.
@@ -391,8 +394,9 @@ insert(#diskann_index{medoid_id = undefined, config = Config} = Index, Id, Vecto
                             Idx = 0,
                             ok = barrel_vectordb_diskann_file:write_vector(
                                 Index1#diskann_index.file_handle, Idx, Vector),
-                            Index2 = add_to_cache(Index1, Id, Vector),
-                            NewIndex = Index2#diskann_index{
+                            %% Add to ETS cache
+                            cache_put(Index1#diskann_index.cache_table, Id, Vector),
+                            NewIndex = Index1#diskann_index{
                                 medoid_id = Id,
                                 nodes = #{Id => #diskann_node{id = Id, neighbors = []}},
                                 id_to_idx = #{Id => Idx},
@@ -442,15 +446,15 @@ insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
                     Idx = Index#diskann_index.size,
                     ok = barrel_vectordb_diskann_file:write_vector(
                         Index#diskann_index.file_handle, Idx, Vector),
-                    %% Add to cache for the insert operation
-                    Index0 = add_to_cache(Index, Id, Vector),
-                    Index0#diskann_index{
+                    %% Add to ETS cache for the insert operation
+                    cache_put(Index#diskann_index.cache_table, Id, Vector),
+                    Index#diskann_index{
                         nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
-                                         Index0#diskann_index.nodes),
-                        id_to_idx = maps:put(Id, Idx, Index0#diskann_index.id_to_idx),
-                        idx_to_id = maps:put(Idx, Id, Index0#diskann_index.idx_to_id),
+                                         Index#diskann_index.nodes),
+                        id_to_idx = maps:put(Id, Idx, Index#diskann_index.id_to_idx),
+                        idx_to_id = maps:put(Idx, Id, Index#diskann_index.idx_to_id),
                         pq_codes = NewPQCodes,
-                        size = Index0#diskann_index.size + 1
+                        size = Index#diskann_index.size + 1
                     }
             end,
 
@@ -484,7 +488,7 @@ insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
 
 %% Ensure disk files are created (for incremental insert in disk mode)
 ensure_disk_files(#diskann_index{file_handle = undefined, base_path = BasePath,
-                                  config = Config} = Index) when BasePath =/= undefined ->
+                                  config = Config, cache_table = CacheTable0} = Index) when BasePath =/= undefined ->
     FileConfig = #{
         dimension => Config#diskann_config.dimension,
         r => Config#diskann_config.r,
@@ -492,10 +496,18 @@ ensure_disk_files(#diskann_index{file_handle = undefined, base_path = BasePath,
     },
     case barrel_vectordb_diskann_file:create(BasePath, FileConfig) of
         {ok, FileHandle} ->
-            {ok, Index#diskann_index{file_handle = FileHandle}};
+            %% Create ETS cache table if needed
+            CacheTable = case CacheTable0 of
+                undefined -> create_cache_table();
+                _ -> CacheTable0
+            end,
+            {ok, Index#diskann_index{file_handle = FileHandle, cache_table = CacheTable}};
         {error, _} = Error ->
             Error
     end;
+ensure_disk_files(#diskann_index{file_handle = Handle, cache_table = undefined} = Index) when Handle =/= undefined ->
+    %% File handle exists but no cache table - create one
+    {ok, Index#diskann_index{cache_table = create_cache_table()}};
 ensure_disk_files(#diskann_index{file_handle = Handle} = Index) when Handle =/= undefined ->
     {ok, Index};
 ensure_disk_files(_Index) ->
@@ -558,7 +570,7 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
                     deleted_set = Deleted, nodes = Nodes, use_pq = UsePQ,
                     pq_state = PQState, pq_codes = PQCodes,
                     storage_mode = StorageMode, base_path = BasePath,
-                    vector_cache = VectorCache, cache_max_size = CacheMaxSize}) ->
+                    cache_table = CacheTable, cache_max_size = CacheMaxSize}) ->
     AvgDegree = case maps:size(Nodes) of
         0 -> 0.0;
         N ->
@@ -581,10 +593,14 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
         false ->
             #{enabled => false}
     end,
+    CacheSize = case CacheTable of
+        undefined -> 0;
+        _ -> ets:info(CacheTable, size)
+    end,
     StorageInfo = #{
         mode => StorageMode,
         base_path => BasePath,
-        cache_size => maps:size(VectorCache),
+        cache_size => CacheSize,
         cache_max_size => CacheMaxSize
     },
     #{
@@ -726,6 +742,9 @@ rebuild_index_from_disk(FileHandle, Header, BasePath) ->
         distance_fn = DistFn
     },
 
+    %% Create ETS cache table for this index
+    CacheTable = create_cache_table(),
+
     %% Read graph from disk (would need to implement graph reading in diskann_file)
     %% For now, we rebuild from the metadata file if available
     MetaPath = filename:join(BasePath, "diskann.index"),
@@ -737,21 +756,22 @@ rebuild_index_from_disk(FileHandle, Header, BasePath) ->
                     SerializedIndex#diskann_index{
                         file_handle = FileHandle,
                         base_path = BasePath,
-                        storage_mode = disk
+                        storage_mode = disk,
+                        cache_table = CacheTable
                     }
             catch
                 _:_ ->
                     %% Fallback to empty index with header info
-                    create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount)
+                    create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount, CacheTable)
             end;
         {error, _} ->
             %% No serialized state, create basic index
-            create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount)
+            create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount, CacheTable)
     end,
 
     {ok, Index0}.
 
-create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount) ->
+create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount, CacheTable) ->
     #diskann_index{
         config = Config,
         file_handle = FileHandle,
@@ -761,26 +781,40 @@ create_empty_disk_index(Config, FileHandle, BasePath, MedoidId, NodeCount) ->
         size = NodeCount,
         nodes = #{},
         id_to_idx = #{},
-        idx_to_id = #{}
+        idx_to_id = #{},
+        cache_table = CacheTable
     }.
 
 %% @doc Close the index and flush to disk
 -spec close(diskann_index()) -> ok.
-close(#diskann_index{file_handle = undefined}) ->
+close(#diskann_index{file_handle = undefined, cache_table = undefined}) ->
     ok;
 close(#diskann_index{file_handle = FileHandle, base_path = BasePath,
-                     storage_mode = disk} = Index) ->
+                     cache_table = CacheTable, storage_mode = disk} = Index) ->
     %% Save index metadata
     save_index_metadata(Index),
     %% Close file handles
-    barrel_vectordb_diskann_file:close(FileHandle),
+    case FileHandle of
+        undefined -> ok;
+        _ -> barrel_vectordb_diskann_file:close(FileHandle)
+    end,
+    %% Delete ETS cache table
+    case CacheTable of
+        undefined -> ok;
+        _ -> ets:delete(CacheTable)
+    end,
     %% Clear base_path reference
     case BasePath of
         undefined -> ok;
         _ -> ok
     end,
     ok;
-close(_Index) ->
+close(#diskann_index{cache_table = CacheTable}) ->
+    %% Memory mode - just clean up ETS table if any
+    case CacheTable of
+        undefined -> ok;
+        _ -> ets:delete(CacheTable)
+    end,
     ok.
 
 %% @doc Force sync to disk
@@ -797,11 +831,10 @@ save_index_metadata(#diskann_index{base_path = undefined}) ->
     ok;
 save_index_metadata(#diskann_index{base_path = BasePath} = Index) ->
     MetaPath = filename:join(BasePath, "diskann.index"),
-    %% Clear file handle before serializing (can't serialize file handles)
+    %% Clear file handle and cache table before serializing (can't serialize)
     IndexToSave = Index#diskann_index{
         file_handle = undefined,
-        vector_cache = #{},  %% Don't persist cache
-        cache_lru = []
+        cache_table = undefined  %% ETS table not serializable
     },
     file:write_file(MetaPath, term_to_binary(IndexToSave)).
 
@@ -809,14 +842,14 @@ save_index_metadata(#diskann_index{base_path = BasePath} = Index) ->
 -spec serialize(diskann_index()) -> binary().
 serialize(#diskann_index{storage_mode = memory} = Index) ->
     %% Memory mode: serialize entire index including vectors
-    term_to_binary(Index);
+    %% Don't serialize ETS table reference
+    term_to_binary(Index#diskann_index{cache_table = undefined});
 serialize(#diskann_index{storage_mode = disk} = Index) ->
     %% Disk mode: serialize only in-memory structures (no vectors, no cache)
     IndexToSave = Index#diskann_index{
         file_handle = undefined,
-        vectors = #{},
-        vector_cache = #{},
-        cache_lru = []
+        cache_table = undefined,  %% ETS table not serializable
+        vectors = #{}
     },
     term_to_binary(IndexToSave).
 
@@ -826,20 +859,23 @@ deserialize(Binary) ->
     try
         case binary_to_term(Binary) of
             #diskann_index{} = Index ->
-                %% Re-open disk files if in disk mode
+                %% Re-open disk files and create ETS table if in disk mode
                 case Index#diskann_index.storage_mode of
                     disk ->
                         BasePath = Index#diskann_index.base_path,
+                        %% Create new ETS cache table
+                        CacheTable = create_cache_table(),
+                        Index1 = Index#diskann_index{cache_table = CacheTable},
                         case BasePath of
                             undefined ->
-                                {ok, Index};
+                                {ok, Index1};
                             _ ->
                                 case barrel_vectordb_diskann_file:open(BasePath) of
                                     {ok, FileHandle} ->
-                                        {ok, Index#diskann_index{file_handle = FileHandle}};
+                                        {ok, Index1#diskann_index{file_handle = FileHandle}};
                                     {error, _} ->
                                         %% Files might not exist yet
-                                        {ok, Index}
+                                        {ok, Index1}
                                 end
                         end;
                     memory ->
@@ -1261,90 +1297,136 @@ prune_neighbors(Index, P, Candidates, Alpha, R) ->
     prune_loop_cached(Config, PVec, SortedCandidates, Alpha, R, []).
 
 %%====================================================================
-%% Internal: Vector Cache (LRU) - for disk mode
+%% Internal: ETS-based Vector Cache (LRU) - for disk mode
 %%====================================================================
 
+%% Create a new ETS table for caching vectors
+create_cache_table() ->
+    ets:new(diskann_vector_cache, [set, public, {read_concurrency, true}]).
+
+%% Populate cache with all vectors during build phase
+populate_cache_for_build(CacheTable, VectorMap) when CacheTable =/= undefined ->
+    Now = erlang:monotonic_time(),
+    maps:foreach(
+        fun(Id, Vec) ->
+            ets:insert(CacheTable, {Id, Vec, Now})
+        end,
+        VectorMap
+    );
+populate_cache_for_build(_, _) ->
+    ok.
+
+%% Clear all entries from cache table
+clear_cache_table(undefined) -> ok;
+clear_cache_table(CacheTable) ->
+    ets:delete_all_objects(CacheTable).
+
 %% Get vector: check cache/memory first, load from disk if needed
-get_vector_cached(#diskann_index{storage_mode = memory, vectors = Vectors} = Index, Id) ->
+get_vector_cached(#diskann_index{storage_mode = memory, vectors = Vectors}, Id) ->
     %% Memory mode: vectors are in the vectors map
     case maps:find(Id, Vectors) of
-        {ok, Vec} -> {Vec, Index};
-        error -> {undefined, Index}
+        {ok, Vec} -> {Vec, ok};
+        error -> {undefined, ok}
     end;
-get_vector_cached(#diskann_index{storage_mode = disk} = Index, Id) ->
-    %% Disk mode: check cache first
-    case maps:find(Id, Index#diskann_index.vector_cache) of
+get_vector_cached(#diskann_index{storage_mode = disk, cache_table = CacheTable} = Index, Id) ->
+    %% Disk mode: check ETS cache first
+    case cache_get(CacheTable, Id) of
         {ok, Vec} ->
-            %% Cache hit - touch to update LRU
-            {Vec, touch_cache(Index, Id)};
-        error ->
+            %% Cache hit - touch to update LRU timestamp
+            cache_touch(CacheTable, Id),
+            {Vec, ok};
+        not_found ->
             %% Cache miss - load from disk
             load_and_cache_vector(Index, Id)
     end.
 
-%% Load vector from disk and add to cache
-load_and_cache_vector(#diskann_index{file_handle = undefined} = Index, _Id) ->
+%% Load vector from disk and add to ETS cache
+load_and_cache_vector(#diskann_index{file_handle = undefined}, _Id) ->
     %% No file handle - can't load
-    {undefined, Index};
+    {undefined, ok};
 load_and_cache_vector(Index, Id) ->
     case maps:find(Id, Index#diskann_index.id_to_idx) of
         {ok, Idx} ->
             case barrel_vectordb_diskann_file:read_vector(
                     Index#diskann_index.file_handle, Idx) of
                 {ok, Vec} ->
-                    Index2 = add_to_cache(Index, Id, Vec),
-                    {Vec, Index2};
+                    %% Add to ETS cache with LRU eviction
+                    cache_put_with_eviction(Index, Id, Vec),
+                    {Vec, ok};
                 {error, _} ->
-                    {undefined, Index}
+                    {undefined, ok}
             end;
         error ->
-            {undefined, Index}
+            {undefined, ok}
     end.
 
-%% Add vector to LRU cache with eviction if full
-add_to_cache(#diskann_index{vector_cache = Cache, cache_lru = LRU,
-                            cache_max_size = MaxSize} = Index, Id, Vec) ->
-    %% Check if already in cache
-    case maps:is_key(Id, Cache) of
-        true ->
-            %% Already cached, just update LRU order
-            touch_cache(Index#diskann_index{vector_cache = Cache#{Id => Vec}}, Id);
-        false ->
-            %% Need to add new entry
-            {NewCache, NewLRU} = case maps:size(Cache) >= MaxSize of
+%% Get from ETS cache
+cache_get(undefined, _Id) -> not_found;
+cache_get(CacheTable, Id) ->
+    case ets:lookup(CacheTable, Id) of
+        [{Id, Vec, _Timestamp}] -> {ok, Vec};
+        [] -> not_found
+    end.
+
+%% Put into ETS cache (simple, no eviction)
+cache_put(undefined, _Id, _Vec) -> ok;
+cache_put(CacheTable, Id, Vec) ->
+    Now = erlang:monotonic_time(),
+    ets:insert(CacheTable, {Id, Vec, Now}),
+    ok.
+
+%% Touch cache entry (update timestamp for LRU)
+cache_touch(undefined, _Id) -> ok;
+cache_touch(CacheTable, Id) ->
+    Now = erlang:monotonic_time(),
+    ets:update_element(CacheTable, Id, {3, Now}),
+    ok.
+
+%% Put into cache with LRU eviction if full
+cache_put_with_eviction(#diskann_index{cache_table = CacheTable,
+                                        cache_max_size = MaxSize}, Id, Vec) ->
+    case CacheTable of
+        undefined -> ok;
+        _ ->
+            Now = erlang:monotonic_time(),
+            Size = ets:info(CacheTable, size),
+            case Size >= MaxSize of
                 true ->
-                    %% Evict oldest entry
-                    case lists:reverse(LRU) of
-                        [] ->
-                            {Cache, []};
-                        [Oldest | RestReversed] ->
-                            {maps:remove(Oldest, Cache), lists:reverse(RestReversed)}
-                    end;
+                    %% Evict oldest entries (batch evict ~10%)
+                    evict_oldest(CacheTable, max(1, MaxSize div 10));
                 false ->
-                    {Cache, LRU}
+                    ok
             end,
-            Index#diskann_index{
-                vector_cache = NewCache#{Id => Vec},
-                cache_lru = [Id | NewLRU]
-            }
+            ets:insert(CacheTable, {Id, Vec, Now}),
+            ok
     end.
 
-%% Touch cache entry to mark as recently used
-touch_cache(#diskann_index{cache_lru = LRU} = Index, Id) ->
-    NewLRU = [Id | lists:delete(Id, LRU)],
-    Index#diskann_index{cache_lru = NewLRU}.
+%% Evict N oldest entries from cache
+evict_oldest(CacheTable, N) ->
+    %% Get all entries with timestamps
+    Entries = ets:tab2list(CacheTable),
+    %% Sort by timestamp (oldest first)
+    Sorted = lists:sort(fun({_, _, T1}, {_, _, T2}) -> T1 < T2 end, Entries),
+    %% Delete oldest N
+    ToDelete = lists:sublist(Sorted, N),
+    lists:foreach(
+        fun({Id, _, _}) ->
+            ets:delete(CacheTable, Id)
+        end,
+        ToDelete
+    ).
 
 %% Get vector with fallback (for internal use during build/pruning)
 get_vector_or_cached(Index, Id) ->
     case Index#diskann_index.storage_mode of
         memory ->
             case maps:find(Id, Index#diskann_index.vectors) of
-                {ok, Vec} -> {Vec, Index};
+                {ok, Vec} -> {Vec, ok};
                 error ->
-                    %% Fallback to cache (during transition)
-                    case maps:find(Id, Index#diskann_index.vector_cache) of
-                        {ok, Vec} -> {Vec, Index};
-                        error -> {undefined, Index}
+                    %% Fallback to ETS cache (during transition)
+                    case cache_get(Index#diskann_index.cache_table, Id) of
+                        {ok, Vec} -> {Vec, ok};
+                        not_found -> {undefined, ok}
                     end
             end;
         disk ->

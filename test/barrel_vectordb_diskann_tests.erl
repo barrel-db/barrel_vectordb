@@ -40,6 +40,7 @@ diskann_disk_test_() ->
         {"disk mode persistence", fun test_disk_persistence/0},
         {"disk mode insert", fun test_disk_insert/0},
         {"lru cache eviction", fun test_lru_cache_eviction/0},
+        {"cache warming persists", fun test_cache_warming_persists/0},
         {"serialization roundtrip", fun test_serialization/0}
      ]
     }.
@@ -478,6 +479,58 @@ test_lru_cache_eviction() ->
         Query = random_vector(16),
         Results = barrel_vectordb_diskann:search(Index, Query, 5),
         ?assertEqual(5, length(Results)),
+
+        ok = barrel_vectordb_diskann:close(Index)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_cache_warming_persists() ->
+    %% Test that ETS cache warms up across multiple searches
+    TmpDir = setup_disk(),
+    try
+        Vectors = [{integer_to_binary(I), random_vector(16)}
+                   || I <- lists:seq(1, 50)],
+        Config = #{
+            dimension => 16,
+            r => 8,
+            l_build => 20,
+            l_search => 20,
+            storage_mode => disk,
+            base_path => TmpDir,
+            cache_max_size => 100,  %% Large cache
+            use_pq => true,
+            pq_m => 2,
+            pq_k => 16
+        },
+        {ok, Index} = barrel_vectordb_diskann:build(Config, Vectors),
+
+        %% After build, cache is cleared
+        Info0 = barrel_vectordb_diskann:info(Index),
+        StorageInfo0 = maps:get(storage, Info0),
+        CacheSize0 = maps:get(cache_size, StorageInfo0),
+        %% Prewarm cache has medoid + neighbors
+        ?assert(CacheSize0 > 0),
+
+        %% First search - should load vectors into cache
+        Query1 = random_vector(16),
+        _Results1 = barrel_vectordb_diskann:search(Index, Query1, 10),
+
+        %% Check cache grew (ETS cache persists across calls)
+        Info1 = barrel_vectordb_diskann:info(Index),
+        StorageInfo1 = maps:get(storage, Info1),
+        CacheSize1 = maps:get(cache_size, StorageInfo1),
+        ?assert(CacheSize1 > CacheSize0),
+
+        %% Second search with different query - cache should keep growing
+        Query2 = random_vector(16),
+        _Results2 = barrel_vectordb_diskann:search(Index, Query2, 10),
+
+        Info2 = barrel_vectordb_diskann:info(Index),
+        StorageInfo2 = maps:get(storage, Info2),
+        CacheSize2 = maps:get(cache_size, StorageInfo2),
+        %% Cache either grew or stayed same (if vectors were already cached)
+        ?assert(CacheSize2 >= CacheSize1),
 
         ok = barrel_vectordb_diskann:close(Index)
     after
