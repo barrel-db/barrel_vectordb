@@ -633,110 +633,321 @@ insert_batch_validated(#diskann_index{storage_mode = memory} = Index, Vectors, O
     insert_batch_memory(Index, Vectors, Opts).
 
 %% Batch insert for disk mode - optimized for throughput
+%% Uses Vamana-style construction for efficient bulk insertion
 insert_batch_disk(Index0, Vectors, _Opts) ->
     Config = Index0#diskann_index.config,
     #diskann_config{l_build = L, alpha = Alpha, r = R} = Config,
 
-    %% Phase 1: Assign integer IDs, write vectors and empty nodes to disk
-    {IntIdVecs, Index1} = lists:mapfoldl(
-        fun({Id, Vec}, AccIdx) ->
+    %% Phase 1: Assign integer IDs and write vectors to disk
+    %% Also build an in-memory vector map for fast access during graph building
+    {IntIdVecs, VectorMap, Index1} = lists:foldl(
+        fun({Id, Vec}, {AccIntIdVecs, AccVecMap, AccIdx}) ->
             {IntId, Idx1} = get_or_create_int_id(AccIdx, Id),
             %% Write vector to disk
             ok = barrel_vectordb_diskann_file:write_vector(
                 Idx1#diskann_index.file_handle, IntId, Vec),
-            %% Write empty node to disk
-            ok = barrel_vectordb_diskann_file:write_node_int(
-                Idx1#diskann_index.file_handle, IntId, [], R),
-            %% Cache the vector
+            %% Build in-memory map for fast access
+            NewVecMap = maps:put(IntId, Vec, AccVecMap),
+            %% Cache in ETS too
             cache_put_with_eviction_by_key(Idx1#diskann_index.cache_table, IntId, Vec,
                                            Idx1#diskann_index.cache_max_size),
-            %% Initialize node with empty neighbors in graph cache
-            graph_cache_put_with_eviction(Idx1#diskann_index.graph_cache_table, IntId, [],
-                                          Idx1#diskann_index.graph_cache_max_size),
-            %% Initialize in nodes_int map
-            Idx2 = Idx1#diskann_index{
-                nodes_int = maps:put(IntId, [], Idx1#diskann_index.nodes_int)
-            },
-            {{IntId, Vec}, Idx2}
+            {[{IntId, Vec} | AccIntIdVecs], NewVecMap, Idx1}
         end,
-        Index0,
+        {[], #{}, Index0},
         Vectors
     ),
+    IntIdVecsRev = lists:reverse(IntIdVecs),
+    NewIntIds = [IntId || {IntId, _} <- IntIdVecsRev],
 
-    %% Handle first insert (set medoid) - nodes already written to disk in Phase 1
-    {Index2, NewIntIds} = case Index1#diskann_index.medoid_int_id of
+    %% Handle empty index - set first as medoid
+    {Index2, MedoidIntId} = case Index1#diskann_index.medoid_int_id of
         undefined ->
-            {FirstIntId, _} = hd(IntIdVecs),
-            %% Lookup string ID for medoid
+            FirstIntId = hd(NewIntIds),
             {ok, FirstStringId} = int_id_to_string(Index1, FirstIntId),
-            %% First vector becomes medoid, skip it in graph building
             {Index1#diskann_index{
                 medoid_id = FirstStringId,
-                medoid_int_id = FirstIntId,
-                size = 1
-            }, tl([IntId || {IntId, _} <- IntIdVecs])};
-        _ ->
-            %% Already have medoid, process all new vectors
-            {Index1, [IntId || {IntId, _} <- IntIdVecs]}
+                medoid_int_id = FirstIntId
+            }, FirstIntId};
+        ExistingMedoid ->
+            {Index1, ExistingMedoid}
     end,
 
-    %% Phase 2: Build graph edges for all new nodes
-    %% Process in batches to balance memory and efficiency
-    BatchSize = maps:get(batch_size, _Opts, 50),
-    Index3 = insert_batch_build_graph(Index2, NewIntIds, IntIdVecs, L, Alpha, R, BatchSize),
+    %% Phase 2: Initialize random graph for new nodes
+    %% This gives each new node R random neighbors from ALL nodes (existing + new)
+    AllIntIds = maps:keys(Index2#diskann_index.nodes_int) ++ NewIntIds,
+    AllIntIdsUnique = lists:usort(AllIntIds),
+    Index3 = init_random_edges_for_new_nodes(Index2, NewIntIds, AllIntIdsUnique, R),
+
+    %% Write initial random edges to disk
+    lists:foreach(fun(IntId) ->
+        Neighbors = maps:get(IntId, Index3#diskann_index.nodes_int, []),
+        ok = barrel_vectordb_diskann_file:write_node_int(
+            Index3#diskann_index.file_handle, IntId, Neighbors, R)
+    end, NewIntIds),
+
+    %% Phase 3: Refine graph using Vamana pass on new nodes only
+    %% Use the in-memory vector map for fast distance computation
+    %% Use deferred backward edges for better performance (FreshDiskANN technique)
+    %% Returns updated index and list of existing nodes whose neighbor lists were modified
+    {Index4, ModifiedExisting} = vamana_pass_batch_deferred(Index3, NewIntIds, VectorMap, MedoidIntId, Alpha, L, R),
+
+    %% Write final edges to disk for new nodes
+    lists:foreach(fun(IntId) ->
+        Neighbors = maps:get(IntId, Index4#diskann_index.nodes_int, []),
+        ok = barrel_vectordb_diskann_file:write_node_int(
+            Index4#diskann_index.file_handle, IntId, Neighbors, R),
+        %% Update graph cache
+        graph_cache_put_with_eviction(Index4#diskann_index.graph_cache_table, IntId, Neighbors,
+                                      Index4#diskann_index.graph_cache_max_size)
+    end, NewIntIds),
+
+    %% Also write updated edges for existing nodes that received backward edges
+    lists:foreach(fun(IntId) ->
+        Neighbors = maps:get(IntId, Index4#diskann_index.nodes_int, []),
+        ok = barrel_vectordb_diskann_file:write_node_int(
+            Index4#diskann_index.file_handle, IntId, Neighbors, R),
+        %% Update graph cache
+        graph_cache_put_with_eviction(Index4#diskann_index.graph_cache_table, IntId, Neighbors,
+                                      Index4#diskann_index.graph_cache_max_size)
+    end, ModifiedExisting),
 
     %% Update size
-    NewSize = Index3#diskann_index.size + length(NewIntIds),
-    {ok, Index3#diskann_index{size = NewSize}}.
+    NewSize = Index4#diskann_index.size + length(NewIntIds),
+    {ok, Index4#diskann_index{size = NewSize}}.
 
-%% Build graph edges for batch of new nodes
-insert_batch_build_graph(Index, [], _IntIdVecs, _L, _Alpha, _R, _BatchSize) ->
-    Index;
-insert_batch_build_graph(Index, IntIds, IntIdVecs, L, Alpha, R, BatchSize) ->
-    %% Process in batches
-    {Batch, Rest} = safe_split(BatchSize, IntIds),
+%% Initialize random edges for new nodes
+init_random_edges_for_new_nodes(Index, NewIntIds, AllIntIds, R) ->
+    N = length(AllIntIds),
+    IdsArray = list_to_tuple(AllIntIds),
 
-    %% Build edges for this batch
-    Index1 = lists:foldl(
-        fun(IntId, AccIdx) ->
-            Vec = proplists:get_value(IntId, IntIdVecs),
-            insert_single_node_disk(AccIdx, IntId, Vec, L, Alpha, R)
+    NewNodesInt = lists:foldl(
+        fun(IntId, Acc) ->
+            %% Pick R random neighbors from all nodes (excluding self)
+            Neighbors = random_neighbors_int(IntId, IdsArray, N, R),
+            maps:put(IntId, Neighbors, Acc)
         end,
-        Index,
-        Batch
+        Index#diskann_index.nodes_int,
+        NewIntIds
+    ),
+    Index#diskann_index{nodes_int = NewNodesInt}.
+
+%% Optimized Vamana pass with deferred backward edge updates (FreshDiskANN technique)
+%% Collects backward edges in a Δ (delta) map, applies them in batch at the end.
+%% This reduces O(n × R) individual graph updates to O(n) batch updates.
+%% Returns {UpdatedIndex, ModifiedExistingNodeIds} where ModifiedExistingNodeIds
+%% are existing nodes whose neighbor lists were modified by backward edges.
+vamana_pass_batch_deferred(Index, NewIntIds, VectorMap, MedoidIntId, Alpha, L, R) ->
+    %% Shuffle for randomness
+    Sigma = shuffle(NewIntIds),
+    NewIntIdSet = sets:from_list(NewIntIds),
+
+    %% Phase 1: Process all new nodes, collect backward edges in Delta map
+    %% Delta = #{J => [list of new nodes that want J as neighbor]}
+    {Index2, Delta} = lists:foldl(
+        fun(IntId, {AccIndex, AccDelta}) ->
+            %% Get vector from in-memory map (fast!)
+            Vec = maps:get(IntId, VectorMap),
+
+            %% Search using in-memory vectors where possible
+            {_Results, Visited} = greedy_search_int_with_cache(AccIndex, MedoidIntId, Vec, 1, L, VectorMap),
+
+            %% Prune to select R out-neighbors for this new node
+            AccIndex2 = robust_prune_int_with_cache(AccIndex, IntId, sets:to_list(Visited), Alpha, R, VectorMap),
+            Neighbors = maps:get(IntId, AccIndex2#diskann_index.nodes_int, []),
+
+            %% Collect backward edges in Delta instead of updating immediately
+            %% For each neighbor J, record that IntId wants to be J's neighbor
+            NewDelta = lists:foldl(
+                fun(J, DeltaAcc) ->
+                    Existing = maps:get(J, DeltaAcc, []),
+                    maps:put(J, [IntId | Existing], DeltaAcc)
+                end,
+                AccDelta,
+                Neighbors
+            ),
+            {AccIndex2, NewDelta}
+        end,
+        {Index, #{}},
+        Sigma
     ),
 
-    insert_batch_build_graph(Index1, Rest, IntIdVecs, L, Alpha, R, BatchSize).
+    %% Phase 2: Apply all backward edges in batch
+    Index3 = apply_delta_edges(Index2, Delta, Alpha, R, VectorMap),
 
-%% Insert single node into graph (disk mode) - extracted from insert/3
-insert_single_node_disk(Index, IntId, Vec, L, Alpha, R) ->
-    MedoidIntId = Index#diskann_index.medoid_int_id,
+    %% Return the modified existing node IDs (Delta keys that are not new nodes)
+    ModifiedExisting = [J || J <- maps:keys(Delta), not sets:is_element(J, NewIntIdSet)],
+    {Index3, ModifiedExisting}.
 
-    %% Greedy search returns {Results, Visited} where Visited is a set of IntIds
-    {_Results, Visited} = greedy_search_int(Index, MedoidIntId, Vec, 1, L),
+%% Apply backward edges collected in Delta map
+%% For each node J in Delta, add all requesting nodes as neighbors, pruning if needed
+apply_delta_edges(Index, Delta, Alpha, R, VectorMap) ->
+    maps:fold(
+        fun(J, NewNeighbors, AccIndex) ->
+            %% Get J's current neighbors
+            JNeighbors = maps:get(J, AccIndex#diskann_index.nodes_int, []),
 
-    %% Robust prune uses the visited set (list of IntIds)
-    Index1 = robust_prune_int(Index, IntId, sets:to_list(Visited), Alpha, R),
+            %% Merge new neighbors (avoiding duplicates)
+            AllCandidates = lists:usort(NewNeighbors ++ JNeighbors),
 
-    %% Write node to disk
-    Neighbors = get_neighbors_int(Index1, IntId),
-    ok = barrel_vectordb_diskann_file:write_node_int(
-        Index1#diskann_index.file_handle, IntId, Neighbors, R),
-
-    %% Add backward edges
-    lists:foldl(
-        fun(J, AccIndex) ->
-            JNeighbors = get_neighbors_int(AccIndex, J),
-            case length(JNeighbors) + 1 > R of
+            %% If total exceeds R, prune; otherwise just add
+            case length(AllCandidates) > R of
                 true ->
-                    robust_prune_int(AccIndex, J, [IntId | JNeighbors], Alpha, R);
+                    %% Need to prune: use alpha-RNG to select best R neighbors
+                    robust_prune_int_with_cache(AccIndex, J, AllCandidates, Alpha, R, VectorMap);
                 false ->
-                    add_neighbor_int(AccIndex, J, IntId)
+                    %% Just update J's neighbors directly
+                    AccIndex#diskann_index{
+                        nodes_int = maps:put(J, AllCandidates, AccIndex#diskann_index.nodes_int)
+                    }
             end
         end,
-        Index1,
-        Neighbors
+        Index,
+        Delta
     ).
+
+%% Greedy search using in-memory vector cache for batch operations
+greedy_search_int_with_cache(Index, StartIntId, Query, K, L, VectorMap) ->
+    StartDist = distance_with_cache(Index, StartIntId, Query, VectorMap),
+    Candidates = gb_trees:from_orddict([{{StartDist, StartIntId}, true}]),
+    Results = gb_trees:from_orddict([{{StartDist, StartIntId}, true}]),
+    Visited = sets:from_list([StartIntId]),
+    FurthestDist = StartDist,
+    greedy_search_loop_int_cached(Index, Query, K, L, Candidates, Results, Visited, FurthestDist, VectorMap).
+
+greedy_search_loop_int_cached(Index, Query, K, L, Candidates, Results, Visited, FurthestDist, VectorMap) ->
+    case gb_trees:is_empty(Candidates) of
+        true ->
+            FinalResults = gb_trees:to_list(Results),
+            TopK = lists:sublist(FinalResults, K),
+            {[{IntId, Dist} || {{Dist, IntId}, _} <- TopK], Visited};
+        false ->
+            {{BestDist, BestIntId}, _, Candidates2} = gb_trees:take_smallest(Candidates),
+            case BestDist > FurthestDist of
+                true ->
+                    FinalResults = gb_trees:to_list(Results),
+                    TopK = lists:sublist(FinalResults, K),
+                    {[{IntId, Dist} || {{Dist, IntId}, _} <- TopK], Visited};
+                false ->
+                    %% Use get_neighbors_int to load from disk/cache for existing nodes
+                    Neighbors = get_neighbors_int_with_cache(Index, BestIntId),
+                    {Candidates3, Results3, Visited3, FurthestDist3} =
+                        process_neighbors_int_cached(Neighbors, Index, Query, L,
+                                                     Candidates2, Results, Visited, FurthestDist, VectorMap),
+                    greedy_search_loop_int_cached(Index, Query, K, L, Candidates3, Results3, Visited3, FurthestDist3, VectorMap)
+            end
+    end.
+
+%% Get neighbors using in-memory map first, falling back to disk/cache
+get_neighbors_int_with_cache(Index, IntId) ->
+    case maps:find(IntId, Index#diskann_index.nodes_int) of
+        {ok, Neighbors} -> Neighbors;
+        error -> get_neighbors_int(Index, IntId)
+    end.
+
+process_neighbors_int_cached([], _Index, _Query, _L, Candidates, Results, Visited, FurthestDist, _VectorMap) ->
+    {Candidates, Results, Visited, FurthestDist};
+process_neighbors_int_cached([N | Rest], Index, Query, L, Candidates, Results, Visited, FurthestDist, VectorMap) ->
+    case sets:is_element(N, Visited) of
+        true ->
+            process_neighbors_int_cached(Rest, Index, Query, L, Candidates, Results, Visited, FurthestDist, VectorMap);
+        false ->
+            Visited2 = sets:add_element(N, Visited),
+            Dist = distance_with_cache(Index, N, Query, VectorMap),
+            Candidates2 = gb_trees:enter({Dist, N}, true, Candidates),
+            ResultSize = gb_trees:size(Results),
+            {Results2, FurthestDist2} = case ResultSize < L of
+                true ->
+                    R2 = gb_trees:enter({Dist, N}, true, Results),
+                    F2 = case gb_trees:is_empty(R2) of
+                        true -> Dist;
+                        false -> element(1, element(1, gb_trees:largest(R2)))
+                    end,
+                    {R2, F2};
+                false when Dist < FurthestDist ->
+                    {_, _, R2} = gb_trees:take_largest(Results),
+                    R3 = gb_trees:enter({Dist, N}, true, R2),
+                    F2 = element(1, element(1, gb_trees:largest(R3))),
+                    {R3, F2};
+                false ->
+                    {Results, FurthestDist}
+            end,
+            process_neighbors_int_cached(Rest, Index, Query, L, Candidates2, Results2, Visited2, FurthestDist2, VectorMap)
+    end.
+
+%% Robust prune using in-memory vector cache
+robust_prune_int_with_cache(Index, IntId, Candidates, Alpha, R, VectorMap) ->
+    Vec = get_vector_with_cache(Index, IntId, VectorMap),
+
+    %% Score all candidates by distance
+    Scored = lists:filtermap(
+        fun(CandId) when CandId =/= IntId ->
+            CandVec = get_vector_with_cache(Index, CandId, VectorMap),
+            case CandVec of
+                undefined -> false;
+                _ -> {true, {distance_vecs(Index, Vec, CandVec), CandId}}
+            end;
+           (_) -> false
+        end,
+        Candidates
+    ),
+    Sorted = lists:sort(Scored),
+
+    %% Alpha-RNG pruning
+    Selected = alpha_rng_prune_cached(Sorted, [], Alpha, R, Index, VectorMap),
+
+    %% Update neighbors
+    Index#diskann_index{
+        nodes_int = maps:put(IntId, Selected, Index#diskann_index.nodes_int)
+    }.
+
+alpha_rng_prune_cached([], Acc, _Alpha, _R, _Index, _VectorMap) ->
+    lists:reverse(Acc);
+alpha_rng_prune_cached(_Remaining, Acc, _Alpha, R, _Index, _VectorMap) when length(Acc) >= R ->
+    lists:reverse(Acc);
+alpha_rng_prune_cached([{Dist, CandId} | Rest], Acc, Alpha, R, Index, VectorMap) ->
+    CandVec = get_vector_with_cache(Index, CandId, VectorMap),
+    %% Check alpha-RNG condition: keep if not dominated by existing neighbors
+    IsDominated = lists:any(
+        fun(SelectedId) ->
+            SelectedVec = get_vector_with_cache(Index, SelectedId, VectorMap),
+            DistToSelected = distance_vecs(Index, CandVec, SelectedVec),
+            DistToSelected * Alpha < Dist
+        end,
+        Acc
+    ),
+    case IsDominated of
+        true ->
+            alpha_rng_prune_cached(Rest, Acc, Alpha, R, Index, VectorMap);
+        false ->
+            alpha_rng_prune_cached(Rest, [CandId | Acc], Alpha, R, Index, VectorMap)
+    end.
+
+%% Get vector from cache or disk
+get_vector_with_cache(Index, IntId, VectorMap) ->
+    case maps:find(IntId, VectorMap) of
+        {ok, Vec} -> Vec;
+        error -> get_vector_by_int_id(Index, IntId)
+    end.
+
+%% Distance computation using cache
+distance_with_cache(Index, IntId, Query, VectorMap) ->
+    Vec = get_vector_with_cache(Index, IntId, VectorMap),
+    case Vec of
+        undefined -> infinity;
+        _ -> distance_vecs(Index, Vec, Query)
+    end.
+
+%% Helper to compute distance between two vectors
+distance_vecs(#diskann_index{config = Config}, Vec1, Vec2) ->
+    case Config#diskann_config.distance_fn of
+        cosine ->
+            case Config#diskann_config.assume_normalized of
+                true -> 1.0 - dot_product(Vec1, Vec2);
+                false -> cosine_distance(Vec1, Vec2)
+            end;
+        euclidean ->
+            euclidean_distance(Vec1, Vec2)
+    end.
 
 %% Batch insert for memory mode
 insert_batch_memory(Index0, Vectors, _Opts) ->
@@ -808,10 +1019,6 @@ insert_batch_memory(Index0, Vectors, _Opts) ->
 
     NewSize = Index3#diskann_index.size + length(ToInsert),
     {ok, Index3#diskann_index{size = NewSize}}.
-
-%% Safe split that handles lists shorter than N
-safe_split(N, List) when length(List) =< N -> {List, []};
-safe_split(N, List) -> lists:split(N, List).
 
 %% @doc Lazy delete - marks node as deleted
 -spec delete(diskann_index(), binary()) -> {ok, diskann_index()}.
@@ -2776,8 +2983,8 @@ get_vector_by_int_id(#diskann_index{storage_mode = disk, cache_table = CacheTabl
             cache_touch(CacheTable, IntId),
             Vec;
         not_found ->
-            %% Load from disk
-            case barrel_vectordb_diskann_file:read_vector(FH, IntId) of
+            %% Load from disk using mmap (zero-copy) if available
+            case barrel_vectordb_diskann_file:read_vector_mmap(FH, IntId) of
                 {ok, Vec} ->
                     cache_put_with_eviction_by_key(CacheTable, IntId, Vec, MaxSize),
                     Vec;

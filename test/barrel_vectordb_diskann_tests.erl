@@ -41,7 +41,9 @@ diskann_disk_test_() ->
         {"disk mode persistence", fun test_disk_persistence/0},
         {"disk mode insert", fun test_disk_insert/0},
         {"lru cache eviction", fun test_lru_cache_eviction/0},
-        {"cache warming persists", fun test_cache_warming_persists/0}
+        {"cache warming persists", fun test_cache_warming_persists/0},
+        {"batch insert deferred correctness", fun test_batch_insert_deferred/0},
+        {"batch insert deferred recall", fun test_batch_insert_recall_deferred/0}
     ].
 
 %% V2 format tests with RocksDB ID mapping
@@ -542,6 +544,104 @@ test_cache_warming_persists() ->
         ?assert(CacheSize2 >= CacheSize1),
 
         ok = barrel_vectordb_diskann:close(Index)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_batch_insert_deferred() ->
+    %% Test batch insert with deferred backward edges (FreshDiskANN optimization)
+    %% Inserts into an existing index and verifies search works and recall is reasonable
+    TmpDir = setup_disk(),
+    try
+        %% Build initial index with 100 vectors
+        rand:seed(exsss, {111, 222, 333}),
+        InitialVectors = [{integer_to_binary(I), random_vector(16)}
+                          || I <- lists:seq(1, 100)],
+        Config = #{
+            dimension => 16,
+            r => 16,        %% Higher R for better connectivity
+            l_build => 50,  %% Higher L for better search during construction
+            l_search => 50,
+            alpha => 1.2,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => false  %% Disable PQ for smaller test dataset
+        },
+        {ok, Index0} = barrel_vectordb_diskann:build(Config, InitialVectors),
+        ?assertEqual(100, barrel_vectordb_diskann:size(Index0)),
+
+        %% Batch insert 50 more vectors using deferred backward edges
+        NewVectors = [{integer_to_binary(100 + I), random_vector(16)}
+                      || I <- lists:seq(1, 50)],
+        {ok, Index1} = barrel_vectordb_diskann:insert_batch(Index0, NewVectors, #{}),
+        ?assertEqual(150, barrel_vectordb_diskann:size(Index1)),
+
+        %% Verify search returns valid results after batch insert
+        AllVectors = InitialVectors ++ NewVectors,
+        Query = random_vector(16),
+        Results = barrel_vectordb_diskann:search(Index1, Query, 10),
+        ?assertEqual(10, length(Results)),
+
+        %% Verify results are from our dataset
+        ResultIds = [Id || {Id, _} <- Results],
+        AllIds = [Id || {Id, _} <- AllVectors],
+        lists:foreach(fun(RId) ->
+            ?assert(lists:member(RId, AllIds))
+        end, ResultIds),
+
+        %% Check recall on random queries - should be reasonable after batch insert
+        Recalls = [measure_recall(Index1, random_vector(16), AllVectors, 10)
+                   || _ <- lists:seq(1, 5)],
+        AvgRecall = lists:sum(Recalls) / length(Recalls),
+        ?assert(AvgRecall >= 0.30),  %% At least 30% recall
+
+        ok = barrel_vectordb_diskann:close(Index1)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_batch_insert_recall_deferred() ->
+    %% Test that batch insert with deferred edges maintains reasonable recall
+    %% The deferred approach trades some recall for speed
+    TmpDir = setup_disk(),
+    try
+        %% Build initial index
+        rand:seed(exsss, {444, 555, 666}),
+        InitialVectors = [{integer_to_binary(I), random_vector(16)}
+                          || I <- lists:seq(1, 100)],
+        Config = #{
+            dimension => 16,
+            r => 32,        %% Higher R for better connectivity with deferred approach
+            l_build => 100, %% Higher L for better search during construction
+            l_search => 100,
+            alpha => 1.2,
+            storage_mode => disk,
+            base_path => TmpDir,
+            use_pq => false  %% Disable PQ for smaller test dataset
+        },
+        {ok, Index0} = barrel_vectordb_diskann:build(Config, InitialVectors),
+
+        %% Batch insert more vectors
+        NewVectors = [{integer_to_binary(100 + I), random_vector(16)}
+                      || I <- lists:seq(1, 100)],
+        {ok, Index1} = barrel_vectordb_diskann:insert_batch(Index0, NewVectors, #{}),
+        ?assertEqual(200, barrel_vectordb_diskann:size(Index1)),
+
+        %% All vectors for brute force ground truth
+        AllVectors = InitialVectors ++ NewVectors,
+
+        %% Measure recall on 5 random queries
+        Recalls = [begin
+            Query = random_vector(16),
+            measure_recall(Index1, Query, AllVectors, 10)
+        end || _ <- lists:seq(1, 5)],
+        AvgRecall = lists:sum(Recalls) / length(Recalls),
+
+        %% Deferred approach may have slightly lower recall - accept 30%+
+        %% The speed benefit justifies the trade-off
+        ?assert(AvgRecall >= 0.30),
+
+        ok = barrel_vectordb_diskann:close(Index1)
     after
         cleanup_disk(TmpDir)
     end.
