@@ -30,10 +30,12 @@
     read_nodes_batch/2,
     write_vector/3,
     read_vector/2,
+    read_vector_mmap/2,
     write_pq_codes/3,
     read_pq_codes/2,
     sync/1,
     get_path/1,
+    has_mmap/1,
     %% Integer ID functions for lazy graph loading
     write_node_int/4,
     read_node_by_int_id/3,
@@ -49,6 +51,7 @@
     path :: binary(),
     graph_fd :: file:fd() | undefined,
     vector_fd :: file:fd() | undefined,
+    vector_mmap :: term() | undefined,  %% iommap handle for zero-copy reads
     pq_fd :: file:fd() | undefined,
     header :: map()
 }).
@@ -112,10 +115,13 @@ open(Path) ->
             Header = binary_to_term(MetaBin),
             case open_files(GraphPath, VectorPath, PqPath, [read, write, binary, raw]) of
                 {ok, GraphFd, VectorFd, PqFd} ->
+                    %% Try to open vector file with mmap for zero-copy reads
+                    VectorMmap = try_open_mmap(VectorPath),
                     {ok, #diskann_file{
                         path = PathBin,
                         graph_fd = GraphFd,
                         vector_fd = VectorFd,
+                        vector_mmap = VectorMmap,
                         pq_fd = PqFd,
                         header = Header
                     }};
@@ -128,10 +134,12 @@ open(Path) ->
 
 %% @doc Close file handles
 -spec close(diskann_file()) -> ok.
-close(#diskann_file{graph_fd = GraphFd, vector_fd = VectorFd, pq_fd = PqFd, path = Path, header = Header}) ->
+close(#diskann_file{graph_fd = GraphFd, vector_fd = VectorFd, vector_mmap = VectorMmap,
+                    pq_fd = PqFd, path = Path, header = Header}) ->
     %% Write final metadata
     MetaPath = filename:join(Path, "diskann.meta"),
     ok = file:write_file(MetaPath, term_to_binary(Header)),
+    close_mmap_if_open(VectorMmap),
     close_if_open(GraphFd),
     close_if_open(VectorFd),
     close_if_open(PqFd),
@@ -292,6 +300,25 @@ read_vector(#diskann_file{vector_fd = Fd, header = Header}, Index) ->
             Error
     end.
 
+%% @doc Read a vector using mmap (zero-copy)
+%% Falls back to regular pread if mmap is not available
+-spec read_vector_mmap(diskann_file(), non_neg_integer()) -> {ok, [float()]} | {error, term()}.
+read_vector_mmap(#diskann_file{vector_mmap = undefined} = File, Index) ->
+    %% Fallback to regular pread
+    read_vector(File, Index);
+read_vector_mmap(#diskann_file{vector_mmap = Mmap, header = Header}, Index) ->
+    Dim = maps:get(dimension, Header, 128),
+    VectorSize = Dim * 4,
+    PaddedSize = ((VectorSize + ?SECTOR_SIZE - 1) div ?SECTOR_SIZE) * ?SECTOR_SIZE,
+    Offset = Index * PaddedSize,
+    case iommap:pread(Mmap, Offset, VectorSize) of
+        {ok, Data} ->
+            Vector = [F || <<F:32/float-little>> <= Data],
+            {ok, Vector};
+        {error, _} = Error ->
+            Error
+    end.
+
 %% @doc Write PQ codes for a batch of vectors
 -spec write_pq_codes(diskann_file(), non_neg_integer(), [binary()]) -> ok | {error, term()}.
 write_pq_codes(#diskann_file{pq_fd = Fd}, StartIndex, Codes) ->
@@ -330,6 +357,11 @@ sync(#diskann_file{graph_fd = GraphFd, vector_fd = VectorFd, pq_fd = PqFd}) ->
 -spec get_path(diskann_file()) -> binary().
 get_path(#diskann_file{path = Path}) -> Path.
 
+%% @doc Check if mmap is available for zero-copy reads
+-spec has_mmap(diskann_file()) -> boolean().
+has_mmap(#diskann_file{vector_mmap = undefined}) -> false;
+has_mmap(#diskann_file{}) -> true.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
@@ -363,6 +395,20 @@ close_if_open(Fd) -> file:close(Fd).
 
 sync_if_open(undefined) -> ok;
 sync_if_open(Fd) -> file:sync(Fd).
+
+close_mmap_if_open(undefined) -> ok;
+close_mmap_if_open(Mmap) -> iommap:close(Mmap).
+
+%% Try to open vector file with mmap, return undefined on failure
+try_open_mmap(VectorPath) ->
+    case iommap:open(VectorPath, read, []) of
+        {ok, Mmap} ->
+            %% Hint for random access pattern
+            _ = iommap:advise(Mmap, 0, 0, random),
+            Mmap;
+        {error, _} ->
+            undefined
+    end.
 
 write_header_internal(Fd, Header) ->
     %% Determine version based on whether we have entry_point_int
@@ -500,20 +546,22 @@ read_node_by_int_id(#diskann_file{graph_fd = Fd}, IntId, MaxR) ->
     end.
 
 %% @doc Batch read multiple nodes by integer IDs
+%% Uses batch pread/2 for efficiency (single system call)
 -spec read_nodes_batch_int(diskann_file(), [non_neg_integer()], pos_integer()) ->
     [{ok, {non_neg_integer(), [non_neg_integer()]}} | {error, term()}].
+read_nodes_batch_int(#diskann_file{graph_fd = _Fd}, [], _MaxR) ->
+    [];
 read_nodes_batch_int(#diskann_file{graph_fd = Fd}, IntIds, MaxR) ->
-    lists:map(
-        fun(IntId) ->
-            Offset = ?SECTOR_SIZE + (IntId * ?SECTOR_SIZE),
-            case file:pread(Fd, Offset, ?SECTOR_SIZE) of
-                {ok, Data} -> decode_node_int(Data, MaxR);
-                eof -> {error, eof};
-                {error, _} = Error -> Error
-            end
-        end,
-        IntIds
-    ).
+    %% Build list of {Offset, Size} for batch read
+    OffsetSizePairs = [{?SECTOR_SIZE + (IntId * ?SECTOR_SIZE), ?SECTOR_SIZE}
+                       || IntId <- IntIds],
+    case file:pread(Fd, OffsetSizePairs) of
+        {ok, Datas} ->
+            [decode_node_int(Data, MaxR) || Data <- Datas];
+        {error, _} = Error ->
+            %% Return error for all requested nodes
+            [Error || _ <- IntIds]
+    end.
 
 %% Encode node with integer ID
 %% Format: [IntId:64/little][NeighborCount:16/little][Neighbors:64/little each][padding]
