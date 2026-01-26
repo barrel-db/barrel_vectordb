@@ -463,61 +463,76 @@ shuffle(List) ->
 %% Internal: GreedySearch (Algorithm 1 from DiskANN paper)
 %%====================================================================
 
-%% @doc Core search algorithm
+%% @doc Core search algorithm - optimized version
+%% Uses separate candidate queue and result set for efficiency
 %% Returns ({SortedResults, VisitedSet})
 greedy_search(Index, StartId, Query, K, L) ->
     StartDist = distance(Index, StartId, Query),
-    %% Result list: {Distance, Id} sorted by distance
-    ResultList = gb_sets:singleton({StartDist, StartId}),
-    %% Visited tracks nodes we've EXPANDED (not just added to result list)
-    Visited = sets:new(),
+    %% Candidates: min-heap of nodes to explore
+    Candidates = gb_trees:from_orddict([{{StartDist, StartId}, true}]),
+    %% Results: best L nodes found so far
+    Results = gb_trees:from_orddict([{{StartDist, StartId}, true}]),
+    %% Visited: nodes we've already expanded
+    Visited = sets:from_list([StartId]),
+    %% Track furthest result distance for pruning
+    FurthestDist = StartDist,
 
-    greedy_loop(Index, Query, ResultList, Visited, K, L).
+    greedy_loop(Index, Query, Candidates, Results, Visited, FurthestDist, K, L).
 
-greedy_loop(Index, Query, ResultList, Visited, K, L) ->
-    %% Find closest unvisited node
-    Unvisited = gb_sets:filter(
-        fun({_D, Id}) -> not sets:is_element(Id, Visited) end,
-        ResultList
-    ),
+greedy_loop(_Index, _Query, {0, nil}, Results, Visited, _FurthestDist, K, _L) ->
+    %% No more candidates
+    ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+    TopK = lists:sublist(ResultList, K),
+    {TopK, Visited};
+greedy_loop(Index, Query, Candidates, Results, Visited, FurthestDist, K, L) ->
+    %% Get closest candidate
+    {{CurrentDist, CurrentId}, _, RestCandidates} = gb_trees:take_smallest(Candidates),
 
-    case gb_sets:is_empty(Unvisited) of
+    %% If closest candidate is further than our furthest result, we're done
+    case CurrentDist > FurthestDist of
         true ->
-            %% Return K closest and all visited
-            Results = gb_sets:to_list(ResultList),
-            TopK = lists:sublist(Results, K),
+            ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+            TopK = lists:sublist(ResultList, K),
             {TopK, Visited};
         false ->
-            {{_Dist, P}, _} = gb_sets:take_smallest(Unvisited),
-            NewVisited = sets:add_element(P, Visited),
-
             %% Expand neighbors
-            Neighbors = get_neighbors(Index, P),
-            {NewResultList, _} = lists:foldl(
-                fun(N, {AccResult, AccVisited}) ->
-                    case sets:is_element(N, AccVisited) of
+            Neighbors = get_neighbors(Index, CurrentId),
+            {NewCandidates, NewResults, NewVisited, NewFurthestDist} = lists:foldl(
+                fun(N, {CandAcc, ResAcc, VisAcc, FurthAcc}) ->
+                    case sets:is_element(N, VisAcc) of
                         true ->
-                            {AccResult, AccVisited};
+                            {CandAcc, ResAcc, VisAcc, FurthAcc};
                         false ->
+                            NewVisAcc = sets:add_element(N, VisAcc),
                             D = distance(Index, N, Query),
-                            NewResult = gb_sets:add({D, N}, AccResult),
-                            {NewResult, AccVisited}
+                            ResSize = gb_trees:size(ResAcc),
+                            ShouldAdd = D < FurthAcc orelse ResSize < L,
+                            case ShouldAdd of
+                                true ->
+                                    NewCandAcc = gb_trees:insert({D, N}, true, CandAcc),
+                                    NewResAcc0 = gb_trees:insert({D, N}, true, ResAcc),
+                                    %% Trim results if too many
+                                    NewResSize = gb_trees:size(NewResAcc0),
+                                    {NewResAcc, NewFurthAcc} = case NewResSize > L of
+                                        true ->
+                                            {_, _, Trimmed} = gb_trees:take_largest(NewResAcc0),
+                                            {{LastD, _}, _} = gb_trees:largest(Trimmed),
+                                            {Trimmed, LastD};
+                                        false ->
+                                            {{MaxD, _}, _} = gb_trees:largest(NewResAcc0),
+                                            {NewResAcc0, MaxD}
+                                    end,
+                                    {NewCandAcc, NewResAcc, NewVisAcc, NewFurthAcc};
+                                false ->
+                                    {CandAcc, ResAcc, NewVisAcc, FurthAcc}
+                            end
                     end
                 end,
-                {ResultList, NewVisited},
+                {RestCandidates, Results, Visited, FurthestDist},
                 Neighbors
             ),
 
-            %% Keep only L closest
-            Pruned = case gb_sets:size(NewResultList) > L of
-                true ->
-                    PrunedList = lists:sublist(gb_sets:to_list(NewResultList), L),
-                    gb_sets:from_list(PrunedList);
-                false ->
-                    NewResultList
-            end,
-
-            greedy_loop(Index, Query, Pruned, NewVisited, K, L)
+            greedy_loop(Index, Query, NewCandidates, NewResults, NewVisited, NewFurthestDist, K, L)
     end.
 
 %%====================================================================
@@ -527,58 +542,60 @@ greedy_loop(Index, Query, ResultList, Visited, K, L) ->
 %% @doc RobustPrune: Select R neighbors for node P using alpha-RNG pruning
 %% V = candidate neighbors
 %% Alpha > 1 keeps more long-range edges
+%% Optimized: cache distance computations
 robust_prune(Index, P, V, Alpha, R) ->
     %% V <- (V ∪ N_out(P)) \ {P}
     CurrentNeighbors = get_neighbors(Index, P),
     Candidates = lists:usort(V ++ CurrentNeighbors) -- [P],
 
-    %% Sort candidates by distance to P
+    %% Pre-compute distances from P to all candidates (cache)
     PVec = maps:get(P, Index#diskann_index.vectors),
-    SortedCandidates = lists:sort(
-        fun(A, B) ->
-            DistA = distance(Index, A, PVec),
-            DistB = distance(Index, B, PVec),
-            DistA =< DistB
-        end,
-        Candidates
-    ),
+    Config = Index#diskann_index.config,
+    Vectors = Index#diskann_index.vectors,
 
-    %% Prune to get new neighbors
-    NewNeighbors = prune_neighbors(Index, P, SortedCandidates, Alpha, R),
+    %% Build list with cached distances: [{Dist, Id, Vec}]
+    CandidatesWithDist = [{distance_vec(Config, PVec, maps:get(C, Vectors)), C, maps:get(C, Vectors)}
+                          || C <- Candidates],
+
+    %% Sort by distance to P
+    SortedCandidates = lists:sort(fun({D1, _, _}, {D2, _, _}) -> D1 =< D2 end, CandidatesWithDist),
+
+    %% Prune with cached data
+    NewNeighbors = prune_loop_cached(Config, PVec, SortedCandidates, Alpha, R, []),
 
     %% Update node
     set_neighbors(Index, P, NewNeighbors).
 
-%% Alpha-RNG pruning: remove p' if there's a better path through p*
-prune_neighbors(Index, P, Candidates, Alpha, R) ->
-    PVec = maps:get(P, Index#diskann_index.vectors),
-    prune_loop(Index, PVec, Candidates, Alpha, R, []).
-
-prune_loop(_Index, _PVec, [], _Alpha, _R, Acc) ->
+%% Alpha-RNG pruning with cached vectors - avoids repeated map lookups
+prune_loop_cached(_Config, _PVec, [], _Alpha, _R, Acc) ->
     lists:reverse(Acc);
-prune_loop(_Index, _PVec, _Candidates, _Alpha, R, Acc) when length(Acc) >= R ->
+prune_loop_cached(_Config, _PVec, _Candidates, _Alpha, R, Acc) when length(Acc) >= R ->
     lists:reverse(Acc);
-prune_loop(Index, PVec, [PStar | Rest], Alpha, R, Acc) ->
-    %% p* is the closest remaining candidate
+prune_loop_cached(Config, PVec, [{_Dist, PStar, PStarVec} | Rest], Alpha, R, Acc) ->
     %% Add p* to neighbors
     NewAcc = [PStar | Acc],
 
     %% Filter out candidates that are closer to p* than to P (with alpha factor)
-    PStarVec = maps:get(PStar, Index#diskann_index.vectors),
-
     FilteredRest = lists:filter(
-        fun(PPrime) ->
-            PPrimeVec = maps:get(PPrime, Index#diskann_index.vectors),
-            DistPStar_PPrime = distance_vec(Index#diskann_index.config, PStarVec, PPrimeVec),
-            DistP_PPrime = distance_vec(Index#diskann_index.config, PVec, PPrimeVec),
+        fun({DistP_PPrime, _PPrime, PPrimeVec}) ->
+            DistPStar_PPrime = distance_vec(Config, PStarVec, PPrimeVec),
             %% Keep p' only if alpha * d(p*, p') > d(p, p')
-            %% (i.e., p* is NOT a good detour to reach p')
             Alpha * DistPStar_PPrime > DistP_PPrime
         end,
         Rest
     ),
 
-    prune_loop(Index, PVec, FilteredRest, Alpha, R, NewAcc).
+    prune_loop_cached(Config, PVec, FilteredRest, Alpha, R, NewAcc).
+
+%% Original prune_neighbors kept for compatibility with consolidate_deletes
+prune_neighbors(Index, P, Candidates, Alpha, R) ->
+    PVec = maps:get(P, Index#diskann_index.vectors),
+    Config = Index#diskann_index.config,
+    Vectors = Index#diskann_index.vectors,
+    CandidatesWithDist = [{distance_vec(Config, PVec, maps:get(C, Vectors)), C, maps:get(C, Vectors)}
+                          || C <- Candidates],
+    SortedCandidates = lists:sort(fun({D1, _, _}, {D2, _, _}) -> D1 =< D2 end, CandidatesWithDist),
+    prune_loop_cached(Config, PVec, SortedCandidates, Alpha, R, []).
 
 %%====================================================================
 %% Internal: Distance Functions
