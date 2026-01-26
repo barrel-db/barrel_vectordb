@@ -396,13 +396,13 @@ static ERL_NIF_TERM nif_simd_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM a
  * ============================================================ */
 
 static ErlNifFunc nif_funcs[] = {
-    {"nif_dot_product", 2, nif_dot_product, 0},
-    {"nif_cosine_distance", 2, nif_cosine_distance, 0},
-    {"nif_cosine_distance_normalized", 2, nif_cosine_distance_normalized, 0},
-    {"nif_euclidean_distance", 2, nif_euclidean_distance, 0},
-    {"nif_to_binary", 1, nif_list_to_binary, 0},
-    {"nif_from_binary", 1, nif_binary_to_list, 0},
-    {"nif_simd_info", 0, nif_simd_info, 0}
+    {"nif_dot_product", 2, nif_dot_product, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_cosine_distance", 2, nif_cosine_distance, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_cosine_distance_normalized", 2, nif_cosine_distance_normalized, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_euclidean_distance", 2, nif_euclidean_distance, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_to_binary", 1, nif_list_to_binary, 0},  /* Fast conversion, no dirty needed */
+    {"nif_from_binary", 1, nif_binary_to_list, 0},  /* Fast conversion, no dirty needed */
+    {"nif_simd_info", 0, nif_simd_info, 0}  /* Instant, no dirty needed */
 };
 
 static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
