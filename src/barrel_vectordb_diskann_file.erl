@@ -139,10 +139,10 @@ close(#diskann_file{graph_fd = GraphFd, vector_fd = VectorFd, vector_mmap = Vect
     %% Write final metadata
     MetaPath = filename:join(Path, "diskann.meta"),
     ok = file:write_file(MetaPath, term_to_binary(Header)),
-    close_mmap_if_open(VectorMmap),
-    close_if_open(GraphFd),
-    close_if_open(VectorFd),
-    close_if_open(PqFd),
+    _ = close_mmap_if_open(VectorMmap),
+    _ = close_if_open(GraphFd),
+    _ = close_if_open(VectorFd),
+    _ = close_if_open(PqFd),
     ok.
 
 %% @doc Write index header
@@ -348,9 +348,9 @@ read_pq_codes(#diskann_file{pq_fd = Fd}, {StartIndex, Count}) ->
 %% @doc Sync all file handles to disk
 -spec sync(diskann_file()) -> ok.
 sync(#diskann_file{graph_fd = GraphFd, vector_fd = VectorFd, pq_fd = PqFd}) ->
-    sync_if_open(GraphFd),
-    sync_if_open(VectorFd),
-    sync_if_open(PqFd),
+    _ = sync_if_open(GraphFd),
+    _ = sync_if_open(VectorFd),
+    _ = sync_if_open(PqFd),
     ok.
 
 %% @doc Get the base path
@@ -378,12 +378,12 @@ open_files(GraphPath, VectorPath, PqPath, Modes) ->
                         {ok, PqFd} ->
                             {ok, GraphFd, VectorFd, PqFd};
                         {error, Reason} ->
-                            file:close(GraphFd),
-                            file:close(VectorFd),
+                            _ = file:close(GraphFd),
+                            _ = file:close(VectorFd),
                             {error, {pq_file, Reason}}
                     end;
                 {error, Reason} ->
-                    file:close(GraphFd),
+                    _ = file:close(GraphFd),
                     {error, {vector_file, Reason}}
             end;
         {error, Reason} ->

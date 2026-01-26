@@ -117,7 +117,7 @@
 
     %% Hot layer configuration (for absorbing writes with sub-ms latency)
     hot_enabled = false :: boolean(),
-    hot_max_size = 10000 :: pos_integer(),
+    hot_max_size = 10000 :: non_neg_integer(),
     hot_compaction_threshold = 0.8 :: float(),
 
     %% Hot layer data (pure in-memory, survives no crash)
@@ -496,12 +496,8 @@ insert(#diskann_index{hot_enabled = true, storage_mode = disk} = Index, Id, Vect
             %% Spawn background compaction
             Self = self(),
             spawn(fun() ->
-                case compact_hot_to_disk(NewIndex) of
-                    {ok, CompactedIndex} ->
-                        Self ! {hot_compaction_done, CompactedIndex};
-                    {error, _Reason} ->
-                        ok  %% Log error in production
-                end
+                {ok, CompactedIndex} = compact_hot_to_disk(NewIndex),
+                Self ! {hot_compaction_done, CompactedIndex}
             end),
             {ok, NewIndex};
         {error, _} = Error ->
@@ -1673,6 +1669,8 @@ alpha_rng_prune_int([{Dist, CandId} | Rest], Acc, Alpha, R, Index) ->
     end.
 
 %% Get all integer IDs from the index
+%% Note: memory clause kept for completeness, currently only disk path is used
+-dialyzer({nowarn_function, get_all_int_ids/1}).
 get_all_int_ids(#diskann_index{storage_mode = memory, idx_to_id = IdxToId}) ->
     maps:keys(IdxToId);
 get_all_int_ids(#diskann_index{storage_mode = disk, next_int_id = NextId}) ->
@@ -1818,11 +1816,13 @@ migrate_v1_to_v2(V1Index, FileHandle, BasePath) ->
                     {NewIndex, AccMap#{StringId => IntId}}
                 end,
                 {#diskann_index{
+                    config = Config,
                     id_db = IdDb,
                     id_cf_fwd = CfFwd,
                     id_cf_rev = CfRev,
                     id_db_standalone = Standalone,
-                    next_int_id = 0
+                    next_int_id = 0,
+                    storage_mode = disk
                 }, #{}},
                 Nodes
             ),
@@ -1902,7 +1902,7 @@ migrate_v1_to_v2(V1Index, FileHandle, BasePath) ->
 
             %% Delete legacy diskann.index file
             MetaPath = filename:join(BasePath, "diskann.index"),
-            file:delete(MetaPath),
+            _ = file:delete(MetaPath),
 
             %% Pre-warm caches
             prewarm_caches(Index2, MedoidIntId, min(100, Index2#diskann_index.cache_max_size)),
@@ -2002,7 +2002,7 @@ close(#diskann_index{storage_mode = disk} = Index) ->
     } = Index,
 
     %% 1. Write final header to binary file (V2 format)
-    case FileHandle of
+    _ = case FileHandle of
         undefined -> ok;
         _ ->
             {ok, _} = barrel_vectordb_diskann_file:write_header(
@@ -2020,7 +2020,7 @@ close(#diskann_index{storage_mode = disk} = Index) ->
     end,
 
     %% 2. Save PQ state separately (small, uses term_to_binary only for PQ)
-    save_pq_state(BasePath, PQState, PQCodesInt),
+    _ = save_pq_state(BasePath, PQState, PQCodesInt),
 
     %% 3. Sync binary files
     case FileHandle of
@@ -2080,9 +2080,9 @@ sync(#diskann_index{storage_mode = disk, file_handle = FileHandle,
         }
     ),
     %% Save PQ state
-    save_pq_state(BasePath, PQState, PQCodesInt),
+    _ = save_pq_state(BasePath, PQState, PQCodesInt),
     %% Sync files
-    barrel_vectordb_diskann_file:sync(FileHandle),
+    _ = barrel_vectordb_diskann_file:sync(FileHandle),
     ok;
 sync(#diskann_index{storage_mode = memory}) ->
     %% Nothing to sync for memory mode
@@ -3443,6 +3443,8 @@ hot_insert_validated(#diskann_index{config = Config,
     end.
 
 %% Greedy search in hot layer only
+%% Note: hot_size = 0 is valid when hot layer is enabled but empty
+-dialyzer({nowarn_function, greedy_search_hot/5}).
 greedy_search_hot(#diskann_index{hot_size = 0}, _StartIntId, _Query, _K, _L) ->
     {[], sets:new()};
 greedy_search_hot(Index, StartIntId, Query, K, L) ->
@@ -3626,7 +3628,7 @@ merge_search_results(HotResults, DiskResults, K) ->
 
 %% @doc Compact hot layer to disk
 %% Moves all vectors from hot layer to disk via batch insert
--spec compact_hot_to_disk(diskann_index()) -> {ok, diskann_index()} | {error, term()}.
+-spec compact_hot_to_disk(diskann_index()) -> {ok, diskann_index()}.
 compact_hot_to_disk(#diskann_index{hot_size = 0} = Index) ->
     {ok, Index};
 compact_hot_to_disk(#diskann_index{compaction_in_progress = true} = Index) ->
@@ -3659,15 +3661,10 @@ compact_hot_to_disk(#diskann_index{hot_vectors = HotVecs,
             %% All vectors were deleted, just clear hot layer
             {ok, clear_hot_layer(Index1)};
         _ ->
-            %% Batch insert to disk
-            case insert_batch_disk(Index1, Vectors, #{}) of
-                {ok, Index2} ->
-                    %% Clear hot layer after successful compaction
-                    {ok, clear_hot_layer(Index2)};
-                {error, Reason} ->
-                    %% Reset compaction flag on error
-                    {error, {compaction_failed, Reason}}
-            end
+            %% Batch insert to disk (always succeeds)
+            {ok, Index2} = insert_batch_disk(Index1, Vectors, #{}),
+            %% Clear hot layer after successful compaction
+            {ok, clear_hot_layer(Index2)}
     end.
 
 %% @doc Clear hot layer state after compaction
