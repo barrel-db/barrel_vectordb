@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Cross-encoder reranking server for barrel_vectordb using JSON-lines protocol.
+Cross-encoder reranking server for barrel_vectordb using async JSON-lines protocol.
 
 Cross-encoders score query-document pairs directly, providing more accurate
 relevance scores than bi-encoder similarity for reranking candidate results.
 
+Uses asyncio for non-blocking I/O with optional uvloop for better performance.
+
 Requirements:
     pip install transformers torch
+    pip install uvloop  # optional, for better performance
 
 Usage:
     python rerank_server.py [model_name]
@@ -15,11 +18,11 @@ Protocol:
     Request (stdin):
         {"action": "info"}
         {"action": "rerank", "query": "search query", "documents": ["doc1", "doc2", ...]}
-        {"action": "rerank", "query": "search query", "documents": ["doc1", ...], "top_k": 5}
+        {"action": "rerank", "query": "search query", "documents": ["doc1", ...], "top_k": 5, "id": 123}
 
     Response (stdout):
         {"ok": true, "model": "cross-encoder/ms-marco-MiniLM-L-6-v2"}
-        {"ok": true, "results": [{"index": 0, "score": 0.95}, {"index": 2, "score": 0.82}, ...]}
+        {"ok": true, "results": [{"index": 0, "score": 0.95}, {"index": 2, "score": 0.82}, ...], "id": 123}
         {"ok": false, "error": "error message"}
 
 Supported models:
@@ -32,6 +35,16 @@ Supported models:
 import sys
 import json
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Try to use uvloop for better performance
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    HAS_UVLOOP = True
+except ImportError:
+    HAS_UVLOOP = False
 
 # Configure logging to stderr
 logging.basicConfig(
@@ -75,8 +88,8 @@ class CrossEncoderModel:
             logger.error(f"Failed to load model: {e}")
             return False
 
-    def rerank(self, query, documents, top_k=None):
-        """Rerank documents by relevance to query.
+    def rerank_sync(self, query, documents, top_k=None):
+        """Rerank documents by relevance to query (synchronous).
 
         Args:
             query: The search query string
@@ -84,81 +97,162 @@ class CrossEncoderModel:
             top_k: Optional limit on number of results to return
 
         Returns:
-            List of {"index": int, "score": float} sorted by score descending
+            dict with 'ok' and 'results' keys
         """
         import torch
 
         if not documents:
-            return []
+            return {"ok": True, "results": []}
 
-        # Create query-document pairs
-        pairs = [[query, doc] for doc in documents]
+        try:
+            # Create query-document pairs
+            pairs = [[query, doc] for doc in documents]
 
-        # Tokenize all pairs
-        inputs = self.tokenizer(
-            pairs,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
+            # Tokenize all pairs
+            inputs = self.tokenizer(
+                pairs,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt"
+            )
+
+            # Get scores
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                # For sequence classification, logits shape is [batch_size, num_labels]
+                # For reranking models, typically num_labels=1, so we squeeze
+                if outputs.logits.shape[-1] == 1:
+                    scores = outputs.logits.squeeze(-1)
+                else:
+                    # Some models output 2 classes (not relevant, relevant)
+                    # Use the "relevant" class score
+                    scores = outputs.logits[:, 1] if outputs.logits.shape[-1] == 2 else outputs.logits[:, 0]
+
+            # Convert to list and pair with indices
+            scores_list = scores.tolist()
+            results = [{"index": i, "score": score} for i, score in enumerate(scores_list)]
+
+            # Sort by score descending
+            results.sort(key=lambda x: x["score"], reverse=True)
+
+            # Apply top_k limit if specified
+            if top_k is not None and top_k > 0:
+                results = results[:top_k]
+
+            return {"ok": True, "results": results}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+class AsyncRerankServer:
+    """Async reranking server matching barrel_embed style."""
+
+    def __init__(self, model: CrossEncoderModel, max_workers: int = 4):
+        self.model = model
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.write_lock = asyncio.Lock()
+        self._max_workers = max_workers
+
+    async def run(self):
+        """Main event loop - read requests, dispatch, write responses."""
+        loop = asyncio.get_event_loop()
+
+        # Setup async stdin reader
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+        # Setup async stdout writer
+        writer_transport, writer_protocol = await loop.connect_write_pipe(
+            asyncio.streams.FlowControlMixin, sys.stdout
+        )
+        writer = asyncio.StreamWriter(
+            writer_transport, writer_protocol, reader, loop
         )
 
-        # Get scores
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            # For sequence classification, logits shape is [batch_size, num_labels]
-            # For reranking models, typically num_labels=1, so we squeeze
-            if outputs.logits.shape[-1] == 1:
-                scores = outputs.logits.squeeze(-1)
-            else:
-                # Some models output 2 classes (not relevant, relevant)
-                # Use the "relevant" class score
-                scores = outputs.logits[:, 1] if outputs.logits.shape[-1] == 2 else outputs.logits[:, 0]
+        logger.info(f"Async server ready (uvloop={HAS_UVLOOP}, workers={self._max_workers})")
 
-        # Convert to list and pair with indices
-        scores_list = scores.tolist()
-        results = [{"index": i, "score": score} for i, score in enumerate(scores_list)]
+        # Process requests
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            # Fire and forget - handle_request manages its own response
+            asyncio.create_task(self.handle_request(line, writer))
 
-        # Sort by score descending
-        results.sort(key=lambda x: x["score"], reverse=True)
+    async def handle_request(self, line: bytes, writer):
+        """Handle a single request."""
+        request_id = None
+        try:
+            request = json.loads(line.decode())
+            request_id = request.get("id")
+            response = await self.dispatch(request)
+        except Exception as e:
+            logger.error(f"Error handling request: {e}")
+            response = {"ok": False, "error": str(e)}
 
-        # Apply top_k limit if specified
-        if top_k is not None and top_k > 0:
-            results = results[:top_k]
+        # Always include request ID in response if provided
+        if request_id is not None:
+            response["id"] = request_id
 
-        return results
+        # Serialize writes to prevent interleaving
+        async with self.write_lock:
+            output = json.dumps(response) + "\n"
+            writer.write(output.encode())
+            await writer.drain()
 
+    async def dispatch(self, request: dict) -> dict:
+        """Dispatch request to appropriate handler."""
+        action = request.get("action")
 
-def handle_info(model):
-    """Handle info request."""
-    return {
-        "ok": True,
-        "model": model.model_name,
-        "type": "rerank"
-    }
+        if action == "info":
+            return self.handle_info()
+        elif action == "rerank":
+            query = request.get("query", "")
+            documents = request.get("documents", [])
+            top_k = request.get("top_k")
+            return await self.handle_rerank(query, documents, top_k)
+        else:
+            return {"ok": False, "error": f"Unknown action: {action}"}
 
+    def handle_info(self) -> dict:
+        """Handle info request."""
+        return {
+            "ok": True,
+            "model": self.model.model_name,
+            "type": "rerank",
+            "async": True,
+            "uvloop": HAS_UVLOOP,
+            "workers": self._max_workers
+        }
 
-def handle_rerank(model, query, documents, top_k=None):
-    """Handle rerank request."""
-    if not isinstance(query, str):
-        return {"ok": False, "error": "query must be a string"}
+    async def handle_rerank(self, query: str, documents: list, top_k=None) -> dict:
+        """Handle rerank request - run in thread pool."""
+        if not isinstance(query, str):
+            return {"ok": False, "error": "query must be a string"}
 
-    if not isinstance(documents, list):
-        return {"ok": False, "error": "documents must be a list"}
+        if not isinstance(documents, list):
+            return {"ok": False, "error": "documents must be a list"}
 
-    if len(documents) == 0:
-        return {"ok": True, "results": []}
+        if len(documents) == 0:
+            return {"ok": True, "results": []}
 
-    # Validate all documents are strings
-    for i, doc in enumerate(documents):
-        if not isinstance(doc, str):
-            return {"ok": False, "error": f"documents[{i}] must be a string"}
+        # Validate all documents are strings
+        for i, doc in enumerate(documents):
+            if not isinstance(doc, str):
+                return {"ok": False, "error": f"documents[{i}] must be a string"}
 
-    try:
-        results = model.rerank(query, documents, top_k)
-        return {"ok": True, "results": results}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        # Run CPU-bound reranking in thread pool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            self.executor,
+            self.model.rerank_sync,
+            query,
+            documents,
+            top_k
+        )
+        return result
 
 
 def main():
@@ -172,35 +266,12 @@ def main():
         print(json.dumps({"ok": False, "error": "Failed to load model"}), flush=True)
         sys.exit(1)
 
-    logger.info("Ready to process requests")
-
-    # Process requests line by line
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError as e:
-            response = {"ok": False, "error": f"Invalid JSON: {e}"}
-            print(json.dumps(response), flush=True)
-            continue
-
-        action = request.get("action")
-
-        if action == "info":
-            response = handle_info(model)
-        elif action == "rerank":
-            query = request.get("query", "")
-            documents = request.get("documents", [])
-            top_k = request.get("top_k")
-            response = handle_rerank(model, query, documents, top_k)
-        else:
-            response = {"ok": False, "error": f"Unknown action: {action}"}
-
-        # Send response
-        print(json.dumps(response), flush=True)
+    # Create and run async server
+    server = AsyncRerankServer(model)
+    try:
+        asyncio.run(server.run())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
 
 
 if __name__ == "__main__":
