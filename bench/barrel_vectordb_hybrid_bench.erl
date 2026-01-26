@@ -1,12 +1,11 @@
 %%%-------------------------------------------------------------------
-%%% @doc Benchmark: Hybrid DiskANN vs Pure HNSW
+%%% @doc Benchmark: DiskANN (Memory/Disk) vs Pure HNSW
 %%%
 %%% Compares:
 %%% - Build time
 %%% - Memory usage (estimated)
 %%% - Search latency
 %%% - Recall@10
-%%% - Compaction overhead
 %%%
 %%% @end
 %%%-------------------------------------------------------------------
@@ -36,7 +35,7 @@ run(Config) ->
 
     io:format("~n"),
     io:format("============================================================~n"),
-    io:format("       DiskANN Hybrid vs Pure HNSW Benchmark~n"),
+    io:format("       DiskANN vs HNSW Benchmark~n"),
     io:format("============================================================~n"),
     io:format("~n"),
     io:format("Configuration:~n"),
@@ -65,117 +64,127 @@ run(Config) ->
             Vectors
         )
     end),
-    io:format("HNSW build:   ~.2f s~n", [HnswBuildUs / 1_000_000]),
+    io:format("HNSW build:            ~.2f s~n", [HnswBuildUs / 1_000_000]),
 
-    %% Build Hybrid index (insert + compact)
-    %% PQ only makes sense for large datasets (>= 10k vectors)
-    %% For smaller datasets, the quantization loss hurts more than memory savings help
-    UsePQ = NumVectors >= 10000,
-    PQK = case NumVectors < 50000 of
-        true -> 64;
-        false -> 256
-    end,
-    PQM = min(8, max(4, Dim div 8)),
-    {HybridBuildUs, HybridIndex} = timer:tc(fun() ->
-        {ok, Index0} = barrel_vectordb_index_hybrid:new(#{
-            dimension => Dim,
-            hot_capacity => NumVectors + 1,
-            hnsw_m => 16,
-            hnsw_ef_construction => 100,
-            diskann_r => 16,
-            diskann_l_build => 30,
-            diskann_alpha => 1.2,
-            %% Only enable PQ for large datasets
-            use_pq => UsePQ,
-            pq_m => PQM,
-            pq_k => PQK
-        }),
-        Index1 = lists:foldl(
-            fun({Id, Vec}, Acc) ->
-                {ok, NewAcc} = barrel_vectordb_index_hybrid:insert(Acc, Id, Vec),
-                NewAcc
-            end,
-            Index0,
-            Vectors
-        ),
-        {ok, Compacted} = barrel_vectordb_index_hybrid:compact(Index1),
-        Compacted
+    %% Build DiskANN (memory mode) - NO PQ for memory mode (better recall)
+    %% Higher R and L params for better graph quality
+    R = 32,  %% Increased from 16
+    LBuild = 75,  %% Increased from 30
+    LSearch = 75,  %% Increased from 30
+
+    DiskannConfig = #{
+        dimension => Dim,
+        r => R,
+        l_build => LBuild,
+        l_search => LSearch,
+        alpha => 1.2,
+        storage_mode => memory,
+        use_pq => false  %% Disable PQ in memory mode for better recall
+    },
+    {DiskannBuildUs, {ok, DiskannIndex}} = timer:tc(fun() ->
+        barrel_vectordb_diskann:build(DiskannConfig, Vectors)
     end),
-    io:format("Hybrid build: ~.2f s (includes compaction + PQ training)~n", [HybridBuildUs / 1_000_000]),
+    io:format("DiskANN (memory) build: ~.2f s~n", [DiskannBuildUs / 1_000_000]),
+
+    %% Build DiskANN (disk mode) with PQ for memory savings
+    TmpDir = filename:join(["/tmp", "diskann_bench_" ++ integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+
+    %% PQ config for disk mode
+    PQK = case NumVectors < 500 of
+        true -> 16;
+        _ -> case NumVectors < 5000 of
+            true -> 64;
+            false -> 256
+        end
+    end,
+    PQM = max(2, min(8, Dim div 4)),
+
+    DiskannDiskConfig = DiskannConfig#{
+        storage_mode => disk,
+        base_path => TmpDir,
+        cache_max_size => min(1000, NumVectors div 10),
+        use_pq => true,  %% Enable PQ for disk mode (memory savings)
+        pq_m => PQM,
+        pq_k => PQK
+    },
+    {DiskannDiskBuildUs, {ok, DiskannDiskIndex}} = timer:tc(fun() ->
+        barrel_vectordb_diskann:build(DiskannDiskConfig, Vectors)
+    end),
+    io:format("DiskANN (disk) build:   ~.2f s~n", [DiskannDiskBuildUs / 1_000_000]),
 
     %% Memory usage (estimated)
     io:format("~n--- Memory Usage (Estimated) ---~n"),
     HnswMemBytes = estimate_hnsw_memory(HnswIndex, Dim),
-    HybridMemBytes = estimate_hybrid_memory(HybridIndex, Dim),
-    io:format("HNSW:   ~.2f MB (~.1f bytes/vector)~n",
+    DiskannMemBytes = estimate_diskann_memory(DiskannIndex, Dim),
+    DiskannDiskMemBytes = estimate_diskann_disk_memory(DiskannDiskIndex, Dim),
+
+    io:format("HNSW:            ~.2f MB (~.1f bytes/vector)~n",
               [HnswMemBytes / 1_048_576, HnswMemBytes / NumVectors]),
-    io:format("Hybrid: ~.2f MB (~.1f bytes/vector)~n",
-              [HybridMemBytes / 1_048_576, HybridMemBytes / NumVectors]),
-    MemReduction = HnswMemBytes / max(1, HybridMemBytes),
-    io:format("Memory reduction: ~.1fx~n", [MemReduction]),
+    io:format("DiskANN (memory): ~.2f MB (~.1f bytes/vector)~n",
+              [DiskannMemBytes / 1_048_576, DiskannMemBytes / NumVectors]),
+    io:format("DiskANN (disk):   ~.2f MB (~.1f bytes/vector) [vectors on SSD]~n",
+              [DiskannDiskMemBytes / 1_048_576, DiskannDiskMemBytes / NumVectors]),
+
+    MemReductionMem = HnswMemBytes / max(1, DiskannMemBytes),
+    MemReductionDisk = HnswMemBytes / max(1, DiskannDiskMemBytes),
+    io:format("~nMemory reduction vs HNSW:~n"),
+    io:format("  DiskANN (memory): ~.1fx~n", [MemReductionMem]),
+    io:format("  DiskANN (disk):   ~.1fx~n", [MemReductionDisk]),
 
     %% Search latency
     io:format("~n--- Search Latency (~p queries) ---~n", [NumQueries]),
     {HnswSearchUs, _} = timer:tc(fun() ->
         [barrel_vectordb_hnsw:search(HnswIndex, Q, K) || Q <- Queries]
     end),
-    {HybridSearchUs, _} = timer:tc(fun() ->
-        [barrel_vectordb_index_hybrid:search(HybridIndex, Q, K) || Q <- Queries]
+    {DiskannSearchUs, _} = timer:tc(fun() ->
+        [barrel_vectordb_diskann:search(DiskannIndex, Q, K) || Q <- Queries]
     end),
+    {DiskannDiskSearchUs, _} = timer:tc(fun() ->
+        [barrel_vectordb_diskann:search(DiskannDiskIndex, Q, K) || Q <- Queries]
+    end),
+
     HnswLatencyMs = HnswSearchUs / NumQueries / 1000,
-    HybridLatencyMs = HybridSearchUs / NumQueries / 1000,
-    io:format("HNSW avg latency:   ~.3f ms~n", [HnswLatencyMs]),
-    io:format("Hybrid avg latency: ~.3f ms~n", [HybridLatencyMs]),
+    DiskannLatencyMs = DiskannSearchUs / NumQueries / 1000,
+    DiskannDiskLatencyMs = DiskannDiskSearchUs / NumQueries / 1000,
+    io:format("HNSW avg latency:            ~.3f ms~n", [HnswLatencyMs]),
+    io:format("DiskANN (memory) avg latency: ~.3f ms~n", [DiskannLatencyMs]),
+    io:format("DiskANN (disk) avg latency:   ~.3f ms~n", [DiskannDiskLatencyMs]),
 
     %% Recall@K
     io:format("~n--- Recall@~p ---~n", [K]),
     HnswRecalls = [measure_recall(HnswIndex, hnsw, Q, Vectors, K) || Q <- Queries],
-    HybridRecalls = [measure_recall(HybridIndex, hybrid, Q, Vectors, K) || Q <- Queries],
-    AvgHnswRecall = lists:sum(HnswRecalls) / length(HnswRecalls),
-    AvgHybridRecall = lists:sum(HybridRecalls) / length(HybridRecalls),
-    io:format("HNSW recall@~p:   ~.1f%~n", [K, AvgHnswRecall * 100]),
-    io:format("Hybrid recall@~p: ~.1f%~n", [K, AvgHybridRecall * 100]),
+    DiskannRecalls = [measure_recall(DiskannIndex, diskann, Q, Vectors, K) || Q <- Queries],
+    DiskannDiskRecalls = [measure_recall(DiskannDiskIndex, diskann, Q, Vectors, K) || Q <- Queries],
 
-    %% Compaction overhead
-    io:format("~n--- Compaction Overhead ---~n"),
-    %% Create fresh hybrid with vectors in hot layer
-    {ok, FreshHybrid0} = barrel_vectordb_index_hybrid:new(#{
-        dimension => Dim,
-        hot_capacity => NumVectors + 1,
-        diskann_r => 16,
-        diskann_l_build => 30
-    }),
-    CompactionTestSize = min(500, NumVectors),
-    FreshHybrid1 = lists:foldl(
-        fun({Id, Vec}, Acc) ->
-            {ok, NewAcc} = barrel_vectordb_index_hybrid:insert(Acc, Id, Vec),
-            NewAcc
-        end,
-        FreshHybrid0,
-        lists:sublist(Vectors, CompactionTestSize)
-    ),
-    {CompactUs, _} = timer:tc(fun() ->
-        barrel_vectordb_index_hybrid:compact(FreshHybrid1)
-    end),
-    io:format("Compaction time (~p vectors): ~.2f s~n", [CompactionTestSize, CompactUs / 1_000_000]),
+    AvgHnswRecall = lists:sum(HnswRecalls) / length(HnswRecalls),
+    AvgDiskannRecall = lists:sum(DiskannRecalls) / length(DiskannRecalls),
+    AvgDiskannDiskRecall = lists:sum(DiskannDiskRecalls) / length(DiskannDiskRecalls),
+    io:format("HNSW recall@~p:            ~.1f%~n", [K, AvgHnswRecall * 100]),
+    io:format("DiskANN (memory) recall@~p: ~.1f%~n", [K, AvgDiskannRecall * 100]),
+    io:format("DiskANN (disk) recall@~p:   ~.1f%~n", [K, AvgDiskannDiskRecall * 100]),
+
+    %% Cleanup
+    barrel_vectordb_diskann:close(DiskannDiskIndex),
+    os:cmd("rm -rf " ++ TmpDir),
 
     %% Summary
     io:format("~n============================================================~n"),
     io:format("                        Summary~n"),
     io:format("============================================================~n"),
     io:format("~n"),
-    io:format("| Metric              | HNSW          | Hybrid        |~n"),
-    io:format("|---------------------|---------------|---------------|~n"),
-    io:format("| Build time          | ~6.2f s      | ~6.2f s      |~n",
-              [HnswBuildUs / 1_000_000, HybridBuildUs / 1_000_000]),
-    io:format("| Memory (MB)         | ~6.2f        | ~6.2f        |~n",
-              [HnswMemBytes / 1_048_576, HybridMemBytes / 1_048_576]),
-    io:format("| Search latency (ms) | ~6.3f        | ~6.3f        |~n",
-              [HnswLatencyMs, HybridLatencyMs]),
-    io:format("| Recall@~p           | ~6.1f%       | ~6.1f%       |~n",
-              [K, AvgHnswRecall * 100, AvgHybridRecall * 100]),
+    io:format("| Metric              | HNSW          | DiskANN(mem)  | DiskANN(disk) |~n"),
+    io:format("|---------------------|---------------|---------------|---------------|~n"),
+    io:format("| Build time (s)      | ~6.2f        | ~6.2f        | ~6.2f        |~n",
+              [HnswBuildUs / 1_000_000, DiskannBuildUs / 1_000_000, DiskannDiskBuildUs / 1_000_000]),
+    io:format("| Memory (MB)         | ~6.2f        | ~6.2f        | ~6.2f        |~n",
+              [HnswMemBytes / 1_048_576, DiskannMemBytes / 1_048_576, DiskannDiskMemBytes / 1_048_576]),
+    io:format("| Search latency (ms) | ~6.3f        | ~6.3f        | ~6.3f        |~n",
+              [HnswLatencyMs, DiskannLatencyMs, DiskannDiskLatencyMs]),
+    io:format("| Recall@~p           | ~6.1f%       | ~6.1f%       | ~6.1f%       |~n",
+              [K, AvgHnswRecall * 100, AvgDiskannRecall * 100, AvgDiskannDiskRecall * 100]),
     io:format("~n"),
-    io:format("Memory reduction: ~.1fx~n", [MemReduction]),
+    io:format("Memory reduction: DiskANN(disk) uses ~.1fx less RAM than HNSW~n", [MemReductionDisk]),
     io:format("~n"),
 
     #{
@@ -185,11 +194,17 @@ run(Config) ->
             latency_ms => HnswLatencyMs,
             recall => AvgHnswRecall
         },
-        hybrid => #{
-            build_time_s => HybridBuildUs / 1_000_000,
-            memory_mb => HybridMemBytes / 1_048_576,
-            latency_ms => HybridLatencyMs,
-            recall => AvgHybridRecall
+        diskann_memory => #{
+            build_time_s => DiskannBuildUs / 1_000_000,
+            memory_mb => DiskannMemBytes / 1_048_576,
+            latency_ms => DiskannLatencyMs,
+            recall => AvgDiskannRecall
+        },
+        diskann_disk => #{
+            build_time_s => DiskannDiskBuildUs / 1_000_000,
+            memory_mb => DiskannDiskMemBytes / 1_048_576,
+            latency_ms => DiskannDiskLatencyMs,
+            recall => AvgDiskannDiskRecall
         }
     }.
 
@@ -223,40 +238,56 @@ estimate_hnsw_memory(Index, Dim) ->
 
     Size * (VecBytes + NormBytes + NeighborBytes).
 
-estimate_hybrid_memory(Index, Dim) ->
-    Info = barrel_vectordb_index_hybrid:info(Index),
-    HotSize = maps:get(hot_size, Info, 0),
-    ColdSize = maps:get(cold_size, Info, 0),
-
-    %% Hot layer: same as HNSW
-    HotBytes = HotSize * (Dim + 4 + 8 + 16 * 16),
-
-    %% Cold layer (DiskANN): check if PQ is enabled
-    ColdInfo = maps:get(cold_info, Info, #{}),
-    R = maps:get(r, maps:get(config, ColdInfo, #{}), 64),
-    PQInfo = maps:get(pq, ColdInfo, #{enabled => false}),
+estimate_diskann_memory(Index, Dim) ->
+    Info = barrel_vectordb_diskann:info(Index),
+    Size = maps:get(size, Info, 0),
+    ConfigInfo = maps:get(config, Info, #{}),
+    R = maps:get(r, ConfigInfo, 64),
+    PQInfo = maps:get(pq, Info, #{enabled => false}),
     PQEnabled = maps:get(enabled, PQInfo, false),
 
-    %% Per cold vector: ID (16) + neighbor IDs (R * 16) + vector storage
-    %% With PQ: only M bytes for codes (in RAM), full vectors on disk
-    %% Without PQ: full vectors in RAM (Dim * 8)
-    ColdVecBytes = case PQEnabled of
+    %% Memory mode: vectors in RAM
+    %% Per vector: ID (16) + neighbors (R * 16) + vector or PQ code
+    VecBytes = case PQEnabled of
         true ->
-            %% With PQ: just codes in RAM (M bytes) + graph
-            PQM = maps:get(m, maps:get(m, PQInfo, #{}), 8),
-            16 + R * 16 + PQM;  %% ID + neighbors + PQ code
+            %% With PQ: full vectors still in RAM for memory mode
+            Dim * 4 + 8;  %% float32 + PQ code
         false ->
-            %% Without PQ: full vectors in RAM
-            16 + R * 16 + Dim * 8
+            Dim * 4  %% float32
     end,
-    ColdBytes = ColdSize * ColdVecBytes,
+    GraphBytes = R * 8,  %% neighbor IDs
+    IdBytes = 16,
 
-    HotBytes + ColdBytes.
+    Size * (IdBytes + GraphBytes + VecBytes).
+
+estimate_diskann_disk_memory(Index, Dim) ->
+    Info = barrel_vectordb_diskann:info(Index),
+    Size = maps:get(size, Info, 0),
+    ConfigInfo = maps:get(config, Info, #{}),
+    R = maps:get(r, ConfigInfo, 64),
+    PQInfo = maps:get(pq, Info, #{enabled => false}),
+    PQEnabled = maps:get(enabled, PQInfo, false),
+    StorageInfo = maps:get(storage, Info, #{}),
+    CacheSize = maps:get(cache_size, StorageInfo, 0),
+
+    %% Disk mode: only graph + PQ codes in RAM, vectors on SSD
+    %% Per vector in RAM: ID (16) + neighbors (R * 8) + PQ code (M bytes)
+    PQBytes = case PQEnabled of
+        true -> 8;  %% M bytes for PQ code
+        false -> 0
+    end,
+    GraphBytes = R * 8,  %% neighbor IDs
+    IdBytes = 16,
+
+    %% Cache memory (full vectors for cached items)
+    CacheMemory = CacheSize * Dim * 4,
+
+    Size * (IdBytes + GraphBytes + PQBytes) + CacheMemory.
 
 measure_recall(Index, Type, Query, Vectors, K) ->
     Results = case Type of
         hnsw -> barrel_vectordb_hnsw:search(Index, Query, K);
-        hybrid -> barrel_vectordb_index_hybrid:search(Index, Query, K)
+        diskann -> barrel_vectordb_diskann:search(Index, Query, K)
     end,
     ResultIds = [Id || {Id, _} <- Results],
 

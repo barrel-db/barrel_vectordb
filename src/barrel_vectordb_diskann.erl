@@ -513,6 +513,9 @@ search(Index, Query, K) ->
     search(Index, Query, K, #{}).
 
 %% @doc Search with options
+%% Options:
+%%   - l_search: Search beam width (default: from config)
+%%   - rerank_factor: Multiplier for rerank candidates (default: 4)
 -spec search(diskann_index(), [float()], pos_integer(), map()) -> [{binary(), float()}].
 search(#diskann_index{medoid_id = undefined}, _Query, _K, _Opts) ->
     [];
@@ -520,16 +523,19 @@ search(#diskann_index{medoid_id = S, config = Config, deleted_set = DeletedSet,
                       use_pq = UsePQ, pq_state = PQState} = Index,
        Query, K, Opts) ->
     L = maps:get(l_search, Opts, Config#diskann_config.l_search),
+    %% Increased rerank factor for better recall (was K*2, now K*4)
+    RerankFactor = maps:get(rerank_factor, Opts, 4),
+    RerankK = K * RerankFactor,
 
     %% Use PQ-based beam search if PQ is available
     Results = case UsePQ andalso PQState =/= undefined of
         true ->
             %% Precompute distance tables for this query
             DistTables = barrel_vectordb_pq:precompute_tables(PQState, Query),
-            beam_search_pq(Index, S, Query, DistTables, K * 2, L);
+            beam_search_pq(Index, S, Query, DistTables, RerankK, L);
         false ->
             %% Standard greedy search
-            {Res, _Visited} = greedy_search(Index, S, Query, K * 2, L),
+            {Res, _Visited} = greedy_search(Index, S, Query, RerankK, L),
             Res
     end,
 
@@ -890,7 +896,8 @@ train_and_apply_pq(Index, Options, Vectors) ->
 %%====================================================================
 
 %% Find medoid (vector closest to centroid)
-find_medoid(Vectors, #diskann_config{dimension = Dim}) ->
+%% Uses the configured distance function for consistency
+find_medoid(Vectors, #diskann_config{dimension = Dim} = Config) ->
     %% Compute centroid
     N = length(Vectors),
     Centroid = lists:foldl(
@@ -902,10 +909,10 @@ find_medoid(Vectors, #diskann_config{dimension = Dim}) ->
     ),
     NormCentroid = [C / N || C <- Centroid],
 
-    %% Find closest to centroid
+    %% Find closest to centroid using configured distance function
     {MedoidId, _MinDist} = lists:foldl(
         fun({Id, Vec}, {BestId, BestDist}) ->
-            Dist = euclidean_distance(Vec, NormCentroid),
+            Dist = distance_vec(Config, Vec, NormCentroid),
             case Dist < BestDist of
                 true -> {Id, Dist};
                 false -> {BestId, BestDist}
@@ -1361,22 +1368,35 @@ distance_vec(#diskann_config{distance_fn = cosine}, Vec1, Vec2) ->
 distance_vec(#diskann_config{distance_fn = euclidean}, Vec1, Vec2) ->
     euclidean_distance(Vec1, Vec2).
 
+%% Optimized cosine distance - avoids redundant norm calculations
+%% For normalized vectors, this simplifies to 1 - dot(v1, v2)
 cosine_distance(Vec1, Vec2) ->
-    Dot = dot_product(Vec1, Vec2),
-    Norm1 = math:sqrt(dot_product(Vec1, Vec1)),
-    Norm2 = math:sqrt(dot_product(Vec2, Vec2)),
-    Denom = Norm1 * Norm2,
+    {Dot, SumSq1, SumSq2} = dot_and_norms(Vec1, Vec2),
+    Denom = math:sqrt(SumSq1 * SumSq2),
     case Denom < 1.0e-10 of
         true -> 1.0;
         false -> 1.0 - (Dot / Denom)
     end.
 
+%% Optimized: compute dot product and squared norms in single pass
+dot_and_norms(Vec1, Vec2) ->
+    dot_and_norms(Vec1, Vec2, 0.0, 0.0, 0.0).
+
+dot_and_norms([], [], Dot, SumSq1, SumSq2) ->
+    {Dot, SumSq1, SumSq2};
+dot_and_norms([A | Rest1], [B | Rest2], Dot, SumSq1, SumSq2) ->
+    dot_and_norms(Rest1, Rest2, Dot + A * B, SumSq1 + A * A, SumSq2 + B * B).
+
+%% Optimized euclidean distance - avoid math:pow
 euclidean_distance(Vec1, Vec2) ->
-    SumSq = lists:sum([math:pow(A - B, 2) || {A, B} <- lists:zip(Vec1, Vec2)]),
+    SumSq = sum_sq_diff(Vec1, Vec2, 0.0),
     math:sqrt(SumSq).
 
-dot_product(Vec1, Vec2) ->
-    lists:sum([A * B || {A, B} <- lists:zip(Vec1, Vec2)]).
+sum_sq_diff([], [], Acc) -> Acc;
+sum_sq_diff([A | Rest1], [B | Rest2], Acc) ->
+    Diff = A - B,
+    sum_sq_diff(Rest1, Rest2, Acc + Diff * Diff).
+
 
 %%====================================================================
 %% Internal: Graph Operations
