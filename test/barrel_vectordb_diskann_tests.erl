@@ -58,6 +58,19 @@ diskann_v2_test_() ->
         {"v2 format rocksdb id mapping", fun test_v2_rocksdb_id_mapping/0}
     ].
 
+%% Hot layer tests
+hot_layer_test_() ->
+    [
+        {"hot layer insert", fun test_hot_insert/0},
+        {"hot layer search", fun test_hot_search/0},
+        {"hot layer combined search", fun test_hot_combined_search/0},
+        {"hot layer delete", fun test_hot_delete/0},
+        {"hot layer compaction threshold", fun test_hot_compaction_threshold/0},
+        {"hot layer compaction correctness", fun test_hot_compaction_correctness/0},
+        {"hot layer recall", fun test_hot_layer_recall/0},
+        {"hot layer latency under 1ms", fun test_hot_layer_latency/0}
+    ].
+
 %%====================================================================
 %% Setup/Teardown
 %%====================================================================
@@ -1104,4 +1117,337 @@ cosine_distance(Vec1, Vec2) ->
     case Denom < 1.0e-10 of
         true -> 1.0;
         false -> 1.0 - (Dot / Denom)
+    end.
+
+%%====================================================================
+%% Hot Layer Tests
+%%====================================================================
+
+test_hot_insert() ->
+    TmpDir = setup_disk(),
+    try
+        BasePath = filename:join(TmpDir, "hot_insert_idx"),
+        {ok, Index0} = barrel_vectordb_diskann:new(#{
+            dimension => 4,
+            storage_mode => disk,
+            base_path => BasePath,
+            hot_layer => true,
+            hot_max_size => 100
+        }),
+
+        %% Insert vectors into hot layer
+        Vec1 = [1.0, 0.0, 0.0, 0.0],
+        Vec2 = [0.0, 1.0, 0.0, 0.0],
+        {ok, Index1} = barrel_vectordb_diskann:insert(Index0, <<"v1">>, Vec1),
+        {ok, Index2} = barrel_vectordb_diskann:insert(Index1, <<"v2">>, Vec2),
+
+        %% Check size
+        ?assertEqual(2, barrel_vectordb_diskann:size(Index2)),
+
+        %% Check hot layer info
+        Info = barrel_vectordb_diskann:info(Index2),
+        HotInfo = maps:get(hot_layer, Info),
+        ?assertEqual(true, maps:get(enabled, HotInfo)),
+        ?assertEqual(2, maps:get(size, HotInfo)),
+
+        %% Cleanup
+        barrel_vectordb_diskann:close(Index2)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_hot_search() ->
+    TmpDir = setup_disk(),
+    try
+        BasePath = filename:join(TmpDir, "hot_search_idx"),
+        {ok, Index0} = barrel_vectordb_diskann:new(#{
+            dimension => 4,
+            storage_mode => disk,
+            base_path => BasePath,
+            hot_layer => true,
+            hot_max_size => 100
+        }),
+
+        %% Insert vectors into hot layer
+        Vectors = [
+            {<<"v1">>, [1.0, 0.0, 0.0, 0.0]},
+            {<<"v2">>, [0.0, 1.0, 0.0, 0.0]},
+            {<<"v3">>, [0.0, 0.0, 1.0, 0.0]},
+            {<<"v4">>, [0.0, 0.0, 0.0, 1.0]}
+        ],
+        Index1 = lists:foldl(
+            fun({Id, Vec}, Acc) ->
+                {ok, NewAcc} = barrel_vectordb_diskann:insert(Acc, Id, Vec),
+                NewAcc
+            end,
+            Index0,
+            Vectors
+        ),
+
+        %% Search should find nearest neighbor
+        Query = [1.0, 0.1, 0.0, 0.0],
+        Results = barrel_vectordb_diskann:search(Index1, Query, 2),
+        ?assertEqual(2, length(Results)),
+        %% v1 should be closest
+        [{TopId, _} | _] = Results,
+        ?assertEqual(<<"v1">>, TopId),
+
+        barrel_vectordb_diskann:close(Index1)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_hot_combined_search() ->
+    TmpDir = setup_disk(),
+    try
+        BasePath = filename:join(TmpDir, "hot_combined_idx"),
+        %% Build initial index with some vectors on disk
+        Vectors = [
+            {<<"disk1">>, [1.0, 0.0, 0.0, 0.0]},
+            {<<"disk2">>, [0.0, 1.0, 0.0, 0.0]}
+        ],
+        {ok, Index0} = barrel_vectordb_diskann:build(#{
+            dimension => 4,
+            storage_mode => disk,
+            base_path => BasePath,
+            hot_layer => true,
+            hot_max_size => 100
+        }, Vectors),
+
+        %% Insert vectors into hot layer
+        {ok, Index1} = barrel_vectordb_diskann:insert(Index0, <<"hot1">>, [0.0, 0.0, 1.0, 0.0]),
+        {ok, Index2} = barrel_vectordb_diskann:insert(Index1, <<"hot2">>, [0.0, 0.0, 0.0, 1.0]),
+
+        %% Search should find results from both layers
+        Query = [0.5, 0.5, 0.5, 0.0],
+        Results = barrel_vectordb_diskann:search(Index2, Query, 4),
+        ResultIds = [Id || {Id, _} <- Results],
+
+        %% Should have results from both disk and hot layer
+        ?assert(lists:member(<<"disk1">>, ResultIds) orelse lists:member(<<"disk2">>, ResultIds)),
+        ?assert(lists:member(<<"hot1">>, ResultIds) orelse lists:member(<<"hot2">>, ResultIds)),
+
+        barrel_vectordb_diskann:close(Index2)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_hot_delete() ->
+    TmpDir = setup_disk(),
+    try
+        BasePath = filename:join(TmpDir, "hot_delete_idx"),
+        {ok, Index0} = barrel_vectordb_diskann:new(#{
+            dimension => 4,
+            storage_mode => disk,
+            base_path => BasePath,
+            hot_layer => true,
+            hot_max_size => 100
+        }),
+
+        %% Insert vectors
+        {ok, Index1} = barrel_vectordb_diskann:insert(Index0, <<"v1">>, [1.0, 0.0, 0.0, 0.0]),
+        {ok, Index2} = barrel_vectordb_diskann:insert(Index1, <<"v2">>, [0.0, 1.0, 0.0, 0.0]),
+
+        %% Delete one vector
+        {ok, Index3} = barrel_vectordb_diskann:delete(Index2, <<"v1">>),
+
+        %% Size should be 1 (2 - 1 deleted)
+        ?assertEqual(1, barrel_vectordb_diskann:size(Index3)),
+
+        %% Search should not return deleted vector
+        Query = [1.0, 0.0, 0.0, 0.0],
+        Results = barrel_vectordb_diskann:search(Index3, Query, 2),
+        ResultIds = [Id || {Id, _} <- Results],
+        ?assertNot(lists:member(<<"v1">>, ResultIds)),
+
+        barrel_vectordb_diskann:close(Index3)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_hot_compaction_threshold() ->
+    TmpDir = setup_disk(),
+    try
+        BasePath = filename:join(TmpDir, "hot_threshold_idx"),
+        %% Set small hot layer size and low threshold
+        {ok, Index0} = barrel_vectordb_diskann:new(#{
+            dimension => 4,
+            storage_mode => disk,
+            base_path => BasePath,
+            hot_layer => true,
+            hot_max_size => 10,
+            hot_compaction_threshold => 0.5  %% Trigger at 5 vectors
+        }),
+
+        %% Insert vectors - should trigger compaction signal at 5
+        Index1 = lists:foldl(
+            fun(I, Acc) ->
+                Id = list_to_binary("v" ++ integer_to_list(I)),
+                Vec = [float(I), 0.0, 0.0, 0.0],
+                {ok, NewAcc} = barrel_vectordb_diskann:insert(Acc, Id, Vec),
+                NewAcc
+            end,
+            Index0,
+            lists:seq(1, 4)
+        ),
+
+        %% Hot layer should still have vectors (compaction is async)
+        Info = barrel_vectordb_diskann:info(Index1),
+        HotInfo = maps:get(hot_layer, Info),
+        ?assertEqual(4, maps:get(size, HotInfo)),
+
+        barrel_vectordb_diskann:close(Index1)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_hot_compaction_correctness() ->
+    TmpDir = setup_disk(),
+    try
+        BasePath = filename:join(TmpDir, "hot_compact_idx"),
+        {ok, Index0} = barrel_vectordb_diskann:new(#{
+            dimension => 4,
+            storage_mode => disk,
+            base_path => BasePath,
+            hot_layer => true,
+            hot_max_size => 100
+        }),
+
+        %% Insert vectors into hot layer
+        Vectors = [
+            {<<"v1">>, [1.0, 0.0, 0.0, 0.0]},
+            {<<"v2">>, [0.0, 1.0, 0.0, 0.0]},
+            {<<"v3">>, [0.0, 0.0, 1.0, 0.0]}
+        ],
+        Index1 = lists:foldl(
+            fun({Id, Vec}, Acc) ->
+                {ok, NewAcc} = barrel_vectordb_diskann:insert(Acc, Id, Vec),
+                NewAcc
+            end,
+            Index0,
+            Vectors
+        ),
+
+        %% Verify vectors are in hot layer
+        Info1 = barrel_vectordb_diskann:info(Index1),
+        HotInfo1 = maps:get(hot_layer, Info1),
+        ?assertEqual(3, maps:get(size, HotInfo1)),
+
+        %% Compact to disk
+        {ok, Index2} = barrel_vectordb_diskann:compact(Index1),
+
+        %% Hot layer should be empty now
+        Info2 = barrel_vectordb_diskann:info(Index2),
+        HotInfo2 = maps:get(hot_layer, Info2),
+        ?assertEqual(0, maps:get(size, HotInfo2)),
+
+        %% Total size should still be 3
+        ?assertEqual(3, barrel_vectordb_diskann:size(Index2)),
+
+        %% Search should still work
+        Query = [1.0, 0.0, 0.0, 0.0],
+        Results = barrel_vectordb_diskann:search(Index2, Query, 3),
+        ?assertEqual(3, length(Results)),
+        [{TopId, _} | _] = Results,
+        ?assertEqual(<<"v1">>, TopId),
+
+        barrel_vectordb_diskann:close(Index2)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_hot_layer_recall() ->
+    TmpDir = setup_disk(),
+    try
+        BasePath = filename:join(TmpDir, "hot_recall_idx"),
+        Dim = 32,
+        NumVectors = 100,
+
+        %% Generate random vectors
+        Vectors = [{list_to_binary("v" ++ integer_to_list(I)),
+                    [rand:uniform() || _ <- lists:seq(1, Dim)]}
+                   || I <- lists:seq(1, NumVectors)],
+
+        {ok, Index0} = barrel_vectordb_diskann:new(#{
+            dimension => Dim,
+            storage_mode => disk,
+            base_path => BasePath,
+            hot_layer => true,
+            hot_max_size => 1000
+        }),
+
+        %% Insert all vectors into hot layer
+        Index1 = lists:foldl(
+            fun({Id, Vec}, Acc) ->
+                {ok, NewAcc} = barrel_vectordb_diskann:insert(Acc, Id, Vec),
+                NewAcc
+            end,
+            Index0,
+            Vectors
+        ),
+
+        %% Run recall test
+        K = 10,
+        Query = [rand:uniform() || _ <- lists:seq(1, Dim)],
+        Results = barrel_vectordb_diskann:search(Index1, Query, K),
+        ResultIds = [Id || {Id, _} <- Results],
+
+        %% Brute force ground truth
+        TrueTopK = brute_force_search(Vectors, Query, K),
+        TrueIds = [Id || {Id, _} <- TrueTopK],
+
+        %% Compute recall
+        Intersection = length([Id || Id <- ResultIds, lists:member(Id, TrueIds)]),
+        Recall = Intersection / K,
+
+        %% Hot layer should maintain good recall (>= 0.7)
+        ?assert(Recall >= 0.7),
+
+        barrel_vectordb_diskann:close(Index1)
+    after
+        cleanup_disk(TmpDir)
+    end.
+
+test_hot_layer_latency() ->
+    TmpDir = setup_disk(),
+    try
+        BasePath = filename:join(TmpDir, "hot_latency_idx"),
+        Dim = 64,
+
+        {ok, Index0} = barrel_vectordb_diskann:new(#{
+            dimension => Dim,
+            storage_mode => disk,
+            base_path => BasePath,
+            hot_layer => true,
+            hot_max_size => 10000
+        }),
+
+        %% Insert first vector
+        Vec1 = [rand:uniform() || _ <- lists:seq(1, Dim)],
+        {ok, Index1} = barrel_vectordb_diskann:insert(Index0, <<"first">>, Vec1),
+
+        %% Measure insert latency for subsequent inserts
+        NumInserts = 50,
+        {TotalTime, FinalIndex} = lists:foldl(
+            fun(I, {AccTime, AccIndex}) ->
+                Vec = [rand:uniform() || _ <- lists:seq(1, Dim)],
+                Id = list_to_binary("v" ++ integer_to_list(I)),
+                Start = erlang:monotonic_time(microsecond),
+                {ok, NewIndex} = barrel_vectordb_diskann:insert(AccIndex, Id, Vec),
+                End = erlang:monotonic_time(microsecond),
+                {AccTime + (End - Start), NewIndex}
+            end,
+            {0, Index1},
+            lists:seq(1, NumInserts)
+        ),
+
+        AvgLatencyUs = TotalTime / NumInserts,
+        AvgLatencyMs = AvgLatencyUs / 1000.0,
+
+        %% Average insert latency should be under 1ms
+        ?assert(AvgLatencyMs < 1.0),
+
+        barrel_vectordb_diskann:close(FinalIndex)
+    after
+        cleanup_disk(TmpDir)
     end.

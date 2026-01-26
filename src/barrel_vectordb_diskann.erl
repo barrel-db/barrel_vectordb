@@ -33,6 +33,8 @@
     get_vector/2,
     consolidate_deletes/1,
     needs_consolidation/1,
+    %% Hot layer API
+    compact/1,
     %% Persistence API
     open/1,
     close/1,
@@ -111,7 +113,23 @@
 
     %% ETS-based graph cache for disk mode (lazy loading of neighbor lists)
     graph_cache_table :: ets:tid() | undefined,
-    graph_cache_max_size = 100000 :: pos_integer()
+    graph_cache_max_size = 100000 :: pos_integer(),
+
+    %% Hot layer configuration (for absorbing writes with sub-ms latency)
+    hot_enabled = false :: boolean(),
+    hot_max_size = 10000 :: pos_integer(),
+    hot_compaction_threshold = 0.8 :: float(),
+
+    %% Hot layer data (pure in-memory, survives no crash)
+    hot_vectors = #{} :: #{non_neg_integer() => [float()]},
+    hot_graph = #{} :: #{non_neg_integer() => [non_neg_integer()]},
+    hot_id_to_int = #{} :: #{binary() => non_neg_integer()},
+    hot_int_to_id = #{} :: #{non_neg_integer() => binary()},
+    hot_next_int_id = 0 :: non_neg_integer(),
+    hot_deleted = sets:new() :: sets:set(non_neg_integer()),
+    hot_pq_codes = #{} :: #{non_neg_integer() => binary()},
+    hot_size = 0 :: non_neg_integer(),
+    compaction_in_progress = false :: boolean()
 }).
 
 -record(diskann_node, {
@@ -141,6 +159,9 @@
 %%   - storage_mode: memory | disk (default: memory)
 %%   - base_path: Path for disk storage (required if storage_mode=disk)
 %%   - cache_max_size: Max vectors in LRU cache (default: 10000)
+%%   - hot_layer: Enable hot memory layer for fast writes (default: false)
+%%   - hot_max_size: Maximum vectors in hot layer before compaction (default: 10000)
+%%   - hot_compaction_threshold: Trigger compaction at this % of max (default: 0.8)
 -spec new(map()) -> {ok, diskann_index()} | {error, term()}.
 new(Options) ->
     R = maps:get(r, Options, 64),
@@ -153,6 +174,10 @@ new(Options) ->
     StorageMode = maps:get(storage_mode, Options, memory),
     BasePath = maps:get(base_path, Options, undefined),
     CacheMaxSize = maps:get(cache_max_size, Options, 10000),
+    %% Hot layer options
+    HotEnabled = maps:get(hot_layer, Options, false),
+    HotMaxSize = maps:get(hot_max_size, Options, 10000),
+    HotCompactionThreshold = maps:get(hot_compaction_threshold, Options, 0.8),
 
     case Dimension of
         undefined ->
@@ -169,6 +194,11 @@ new(Options) ->
                         distance_fn = DistanceFn,
                         assume_normalized = AssumeNormalized
                     },
+                    HotOpts = #{
+                        enabled => HotEnabled,
+                        max_size => HotMaxSize,
+                        compaction_threshold => HotCompactionThreshold
+                    },
                     case StorageMode of
                         memory ->
                             {ok, #diskann_index{
@@ -180,7 +210,7 @@ new(Options) ->
                             }};
                         disk ->
                             %% V2 format: Set up RocksDB and disk files
-                            new_disk_mode(Config, BasePath, CacheMaxSize)
+                            new_disk_mode(Config, BasePath, CacheMaxSize, HotOpts)
                     end;
                 {error, _} = Error ->
                     Error
@@ -195,8 +225,12 @@ validate_storage_options(_, _) ->
     ok.
 
 %% Create new disk mode index (V2 format with RocksDB)
-new_disk_mode(Config, BasePath, CacheMaxSize) ->
+new_disk_mode(Config, BasePath, CacheMaxSize, HotOpts) ->
     BasePathBin = to_binary_or_undefined(BasePath),
+    %% Extract hot layer options
+    HotEnabled = maps:get(enabled, HotOpts, false),
+    HotMaxSize = maps:get(max_size, HotOpts, 10000),
+    HotCompactionThreshold = maps:get(compaction_threshold, HotOpts, 0.8),
     %% Open RocksDB for ID mapping
     case open_id_db(BasePathBin) of
         {ok, IdDb, CfFwd, CfRev, Standalone} ->
@@ -223,7 +257,11 @@ new_disk_mode(Config, BasePath, CacheMaxSize) ->
                         id_db = IdDb,
                         id_cf_fwd = CfFwd,
                         id_cf_rev = CfRev,
-                        next_int_id = 0
+                        next_int_id = 0,
+                        %% Hot layer configuration
+                        hot_enabled = HotEnabled,
+                        hot_max_size = HotMaxSize,
+                        hot_compaction_threshold = HotCompactionThreshold
                     }};
                 {error, Reason} ->
                     close_id_db(IdDb, Standalone),
@@ -448,9 +486,30 @@ insert(#diskann_index{medoid_id = undefined, config = Config,
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end;
+insert(#diskann_index{hot_enabled = true, storage_mode = disk} = Index, Id, Vector) ->
+    %% Hot layer enabled - insert to hot layer for sub-millisecond writes
+    %% This clause handles both first and subsequent insertions for hot layer
+    case hot_insert(Index, Id, Vector) of
+        {ok, NewIndex} ->
+            {ok, NewIndex};
+        {compact_needed, NewIndex} ->
+            %% Spawn background compaction
+            Self = self(),
+            spawn(fun() ->
+                case compact_hot_to_disk(NewIndex) of
+                    {ok, CompactedIndex} ->
+                        Self ! {hot_compaction_done, CompactedIndex};
+                    {error, _Reason} ->
+                        ok  %% Log error in production
+                end
+            end),
+            {ok, NewIndex};
+        {error, _} = Error ->
+            Error
+    end;
 insert(#diskann_index{medoid_id = undefined, medoid_int_id = undefined, config = Config,
                       storage_mode = disk} = Index, Id, Vector) ->
-    %% First insertion - disk mode V2 (with RocksDB)
+    %% First insertion - disk mode V2 (with RocksDB) without hot layer
     Dim = Config#diskann_config.dimension,
     R = Config#diskann_config.r,
     case length(Vector) of
@@ -537,7 +596,7 @@ insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
 insert(#diskann_index{config = Config, medoid_int_id = MedoidIntId,
                       use_pq = UsePQ, pq_state = PQState, pq_codes_int = PQCodesInt,
                       storage_mode = disk} = Index, Id, Vector) ->
-    %% Subsequent insertions - disk mode V2 (with integer IDs)
+    %% Subsequent insertions - disk mode V2 (with integer IDs) without hot layer
     Dim = Config#diskann_config.dimension,
     case length(Vector) of
         Dim ->
@@ -1030,8 +1089,32 @@ insert_batch_memory(Index0, Vectors, _Opts) ->
 
 %% @doc Lazy delete - marks node as deleted
 -spec delete(diskann_index(), binary()) -> {ok, diskann_index()}.
+delete(#diskann_index{hot_enabled = true, hot_id_to_int = HotIdToInt,
+                      storage_mode = disk} = Index, Id) ->
+    %% Hot layer enabled - check if ID is in hot layer first
+    case maps:is_key(Id, HotIdToInt) of
+        true ->
+            %% Delete from hot layer
+            case hot_delete(Index, Id) of
+                {ok, NewIndex} -> {ok, NewIndex};
+                not_found ->
+                    %% Fallback to disk delete
+                    delete_from_disk(Index, Id)
+            end;
+        false ->
+            %% Delete from disk layer
+            delete_from_disk(Index, Id)
+    end;
 delete(#diskann_index{storage_mode = disk} = Index, Id) ->
     %% Disk mode: need to update both string and int deleted sets
+    delete_from_disk(Index, Id);
+delete(Index, Id) ->
+    %% Memory mode: only string set needed
+    NewDeleted = sets:add_element(Id, Index#diskann_index.deleted_set),
+    {ok, Index#diskann_index{deleted_set = NewDeleted}}.
+
+%% Delete from disk layer
+delete_from_disk(Index, Id) ->
     NewDeletedStr = sets:add_element(Id, Index#diskann_index.deleted_set),
     case string_id_to_int(Index, Id) of
         {ok, IntId} ->
@@ -1040,11 +1123,7 @@ delete(#diskann_index{storage_mode = disk} = Index, Id) ->
         not_found ->
             %% ID not found, just update string set
             {ok, Index#diskann_index{deleted_set = NewDeletedStr}}
-    end;
-delete(Index, Id) ->
-    %% Memory mode: only string set needed
-    NewDeleted = sets:add_element(Id, Index#diskann_index.deleted_set),
-    {ok, Index#diskann_index{deleted_set = NewDeleted}}.
+    end.
 
 %% @doc Search for K nearest neighbors
 -spec search(diskann_index(), [float()], pos_integer()) -> [{binary(), float()}].
@@ -1056,10 +1135,26 @@ search(Index, Query, K) ->
 %%   - l_search: Search beam width (default: from config)
 %%   - rerank_factor: Multiplier for rerank candidates (default: 4)
 -spec search(diskann_index(), [float()], pos_integer(), map()) -> [{binary(), float()}].
-search(#diskann_index{medoid_id = undefined, medoid_int_id = undefined}, _Query, _K, _Opts) ->
+search(#diskann_index{medoid_id = undefined, medoid_int_id = undefined,
+                      hot_size = 0}, _Query, _K, _Opts) ->
     [];
-search(#diskann_index{medoid_id = undefined, medoid_int_id = 0}, _Query, _K, _Opts) ->
+search(#diskann_index{medoid_id = undefined, medoid_int_id = undefined,
+                      hot_enabled = true, hot_size = HotSize} = Index,
+       Query, K, Opts) when HotSize > 0 ->
+    %% Only hot layer has data - search hot layer only
+    search_hot_layer(Index, Query, K, Opts);
+search(#diskann_index{medoid_id = undefined, medoid_int_id = 0,
+                      hot_size = 0}, _Query, _K, _Opts) ->
     [];
+search(#diskann_index{medoid_id = undefined, medoid_int_id = 0,
+                      hot_enabled = true, hot_size = HotSize} = Index,
+       Query, K, Opts) when HotSize > 0 ->
+    %% Only hot layer has data - search hot layer only
+    search_hot_layer(Index, Query, K, Opts);
+search(#diskann_index{hot_enabled = true, hot_size = HotSize, storage_mode = disk} = Index,
+       Query, K, Opts) when HotSize > 0 ->
+    %% Hot layer enabled with data - search both layers and merge
+    search_combined(Index, Query, K, Opts);
 search(#diskann_index{storage_mode = disk} = Index, Query, K, Opts) ->
     %% Disk mode: use integer IDs internally
     search_disk_mode(Index, Query, K, Opts);
@@ -1231,8 +1326,11 @@ rerank_with_full_vectors_int(PQResults, Query, Index, K) ->
 
 %% @doc Get index size (excluding deleted)
 -spec size(diskann_index()) -> non_neg_integer().
-size(#diskann_index{size = Size, deleted_set = Deleted}) ->
-    Size - sets:size(Deleted).
+size(#diskann_index{size = Size, deleted_set = Deleted,
+                    hot_size = HotSize, hot_deleted = HotDeleted}) ->
+    TotalSize = Size + HotSize,
+    TotalDeleted = sets:size(Deleted) + sets:size(HotDeleted),
+    TotalSize - TotalDeleted.
 
 %% @doc Get index info
 -spec info(diskann_index()) -> map().
@@ -1240,7 +1338,8 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
                     deleted_set = Deleted, nodes = Nodes, use_pq = UsePQ,
                     pq_state = PQState, pq_codes = PQCodes,
                     storage_mode = StorageMode, base_path = BasePath,
-                    cache_table = CacheTable, cache_max_size = CacheMaxSize}) ->
+                    cache_table = CacheTable, cache_max_size = CacheMaxSize,
+                    hot_size = HotSize} = Index) ->
     AvgDegree = case maps:size(Nodes) of
         0 -> 0.0;
         N ->
@@ -1273,14 +1372,17 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
         cache_size => CacheSize,
         cache_max_size => CacheMaxSize
     },
+    %% Include hot layer in total size calculation
+    TotalSize = Size + HotSize,
     #{
-        size => Size,
-        active_size => Size - sets:size(Deleted),
+        size => TotalSize,
+        active_size => TotalSize - sets:size(Deleted),
         deleted_count => sets:size(Deleted),
         medoid => Medoid,
         avg_degree => AvgDegree,
         pq => PQInfo,
         storage => StorageInfo,
+        hot_layer => hot_layer_info(Index),
         config => #{
             r => Config#diskann_config.r,
             l_build => Config#diskann_config.l_build,
@@ -1301,6 +1403,18 @@ get_vector(#diskann_index{storage_mode = memory} = Index, Id) ->
         undefined -> not_found;
         _ -> {ok, Vec}
     end;
+get_vector(#diskann_index{hot_enabled = true, hot_id_to_int = HotIdToInt,
+                          hot_vectors = HotVecs, storage_mode = disk} = Index, StringId) ->
+    %% Hot layer enabled - check hot layer first
+    case maps:find(StringId, HotIdToInt) of
+        {ok, HotIntId} ->
+            case maps:find(HotIntId, HotVecs) of
+                {ok, Vec} -> {ok, Vec};
+                error -> get_vector_from_disk(Index, StringId)
+            end;
+        error ->
+            get_vector_from_disk(Index, StringId)
+    end;
 get_vector(#diskann_index{storage_mode = disk, id_db = undefined} = Index, Id) ->
     %% Disk mode without RocksDB (legacy V1 fallback)
     {Vec, _UpdatedIndex} = get_vector_or_cached(Index, Id),
@@ -1310,6 +1424,16 @@ get_vector(#diskann_index{storage_mode = disk, id_db = undefined} = Index, Id) -
     end;
 get_vector(#diskann_index{storage_mode = disk} = Index, StringId) ->
     %% Disk mode with RocksDB (V2 format): convert string ID to integer ID
+    get_vector_from_disk(Index, StringId).
+
+%% Get vector from disk layer
+get_vector_from_disk(#diskann_index{id_db = undefined} = Index, StringId) ->
+    {Vec, _UpdatedIndex} = get_vector_or_cached(Index, StringId),
+    case Vec of
+        undefined -> not_found;
+        _ -> {ok, Vec}
+    end;
+get_vector_from_disk(Index, StringId) ->
     case string_id_to_int(Index, StringId) of
         {ok, IntId} ->
             Vec = get_vector_by_int_id(Index, IntId),
@@ -3215,3 +3339,390 @@ cache_put_with_eviction_by_key(CacheTable, Key, Vec, MaxSize) ->
     end,
     ets:insert(CacheTable, {Key, Vec, Now}),
     ok.
+
+%%====================================================================
+%% Hot Layer Functions
+%%====================================================================
+
+%% @doc Insert a vector into the hot layer (in-memory, sub-millisecond)
+%% Returns {ok, NewIndex} or {compact_needed, NewIndex} when threshold reached
+-spec hot_insert(diskann_index(), binary(), [float()]) ->
+    {ok, diskann_index()} | {compact_needed, diskann_index()} | {error, term()}.
+hot_insert(#diskann_index{config = Config} = Index, Id, Vector) ->
+    Dim = Config#diskann_config.dimension,
+    case length(Vector) of
+        Dim ->
+            hot_insert_validated(Index, Id, Vector);
+        Other ->
+            {error, {dimension_mismatch, Dim, Other}}
+    end.
+
+hot_insert_validated(#diskann_index{hot_size = 0} = Index, Id, Vector) ->
+    %% First insertion into hot layer - set as entry point
+    HotIntId = 0,
+    NewIndex = Index#diskann_index{
+        hot_vectors = #{HotIntId => Vector},
+        hot_graph = #{HotIntId => []},
+        hot_id_to_int = #{Id => HotIntId},
+        hot_int_to_id = #{HotIntId => Id},
+        hot_next_int_id = 1,
+        hot_size = 1
+    },
+    {ok, NewIndex};
+hot_insert_validated(#diskann_index{config = Config,
+                                     hot_vectors = HotVecs,
+                                     hot_graph = HotGraph,
+                                     hot_id_to_int = HotIdToInt,
+                                     hot_int_to_id = HotIntToId,
+                                     hot_next_int_id = NextIntId,
+                                     hot_size = HotSize,
+                                     hot_max_size = HotMaxSize,
+                                     hot_compaction_threshold = Threshold,
+                                     use_pq = UsePQ,
+                                     pq_state = PQState,
+                                     hot_pq_codes = HotPQCodes} = Index,
+                     Id, Vector) ->
+    %% Assign integer ID
+    HotIntId = NextIntId,
+    #diskann_config{l_build = L, alpha = Alpha, r = R} = Config,
+
+    %% Update PQ codes if enabled
+    NewHotPQCodes = case UsePQ andalso PQState =/= undefined of
+        true ->
+            Code = barrel_vectordb_pq:encode(PQState, Vector),
+            maps:put(HotIntId, Code, HotPQCodes);
+        false ->
+            HotPQCodes
+    end,
+
+    %% Add vector and empty neighbor list
+    HotVecs1 = maps:put(HotIntId, Vector, HotVecs),
+    HotGraph1 = maps:put(HotIntId, [], HotGraph),
+    HotIdToInt1 = maps:put(Id, HotIntId, HotIdToInt),
+    HotIntToId1 = maps:put(HotIntId, Id, HotIntToId),
+
+    %% Build temporary index state for search
+    TmpIndex = Index#diskann_index{
+        hot_vectors = HotVecs1,
+        hot_graph = HotGraph1,
+        hot_id_to_int = HotIdToInt1,
+        hot_int_to_id = HotIntToId1,
+        hot_next_int_id = NextIntId + 1,
+        hot_pq_codes = NewHotPQCodes,
+        hot_size = HotSize + 1
+    },
+
+    %% Find neighbors using greedy search in hot layer
+    {_Results, Visited} = greedy_search_hot(TmpIndex, 0, Vector, 1, L),
+
+    %% Prune to select R out-neighbors
+    TmpIndex2 = robust_prune_hot(TmpIndex, HotIntId, sets:to_list(Visited), Alpha, R),
+    Neighbors = maps:get(HotIntId, TmpIndex2#diskann_index.hot_graph, []),
+
+    %% Add backward edges
+    FinalIndex = lists:foldl(
+        fun(J, AccIndex) ->
+            JNeighbors = maps:get(J, AccIndex#diskann_index.hot_graph, []),
+            case length(JNeighbors) + 1 > R of
+                true ->
+                    robust_prune_hot(AccIndex, J, [HotIntId | JNeighbors], Alpha, R);
+                false ->
+                    add_neighbor_hot(AccIndex, J, HotIntId)
+            end
+        end,
+        TmpIndex2,
+        Neighbors
+    ),
+
+    %% Check if compaction is needed
+    NewHotSize = FinalIndex#diskann_index.hot_size,
+    CompactionNeeded = NewHotSize >= trunc(HotMaxSize * Threshold),
+    case CompactionNeeded of
+        true -> {compact_needed, FinalIndex};
+        false -> {ok, FinalIndex}
+    end.
+
+%% Greedy search in hot layer only
+greedy_search_hot(#diskann_index{hot_size = 0}, _StartIntId, _Query, _K, _L) ->
+    {[], sets:new()};
+greedy_search_hot(Index, StartIntId, Query, K, L) ->
+    StartDist = distance_hot(Index, StartIntId, Query),
+    Candidates = gb_trees:from_orddict([{{StartDist, StartIntId}, true}]),
+    Results = gb_trees:from_orddict([{{StartDist, StartIntId}, true}]),
+    Visited = sets:from_list([StartIntId]),
+    FurthestDist = StartDist,
+    greedy_loop_hot(Index, Query, Candidates, Results, Visited, FurthestDist, K, L).
+
+greedy_loop_hot(_Index, _Query, {0, nil}, Results, Visited, _FurthestDist, K, _L) ->
+    ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+    TopK = lists:sublist(ResultList, K),
+    {TopK, Visited};
+greedy_loop_hot(Index, Query, Candidates, Results, Visited, FurthestDist, K, L) ->
+    {{CurrentDist, CurrentIntId}, _, RestCandidates} = gb_trees:take_smallest(Candidates),
+
+    case CurrentDist > FurthestDist of
+        true ->
+            ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+            TopK = lists:sublist(ResultList, K),
+            {TopK, Visited};
+        false ->
+            Neighbors = maps:get(CurrentIntId, Index#diskann_index.hot_graph, []),
+            {NewCandidates, NewResults, NewVisited, NewFurthestDist} = lists:foldl(
+                fun(N, {CandAcc, ResAcc, VisAcc, FurthAcc}) ->
+                    case sets:is_element(N, VisAcc) of
+                        true ->
+                            {CandAcc, ResAcc, VisAcc, FurthAcc};
+                        false ->
+                            NewVisAcc = sets:add_element(N, VisAcc),
+                            D = distance_hot(Index, N, Query),
+                            ResSize = gb_trees:size(ResAcc),
+                            ShouldAdd = D < FurthAcc orelse ResSize < L,
+                            case ShouldAdd of
+                                true ->
+                                    NewCandAcc = gb_trees:insert({D, N}, true, CandAcc),
+                                    NewResAcc0 = gb_trees:insert({D, N}, true, ResAcc),
+                                    NewResSize = gb_trees:size(NewResAcc0),
+                                    {NewResAcc, NewFurthAcc} = case NewResSize > L of
+                                        true ->
+                                            {_, _, Trimmed} = gb_trees:take_largest(NewResAcc0),
+                                            {{LastD, _}, _} = gb_trees:largest(Trimmed),
+                                            {Trimmed, LastD};
+                                        false ->
+                                            {{MaxD, _}, _} = gb_trees:largest(NewResAcc0),
+                                            {NewResAcc0, MaxD}
+                                    end,
+                                    {NewCandAcc, NewResAcc, NewVisAcc, NewFurthAcc};
+                                false ->
+                                    {CandAcc, ResAcc, NewVisAcc, FurthAcc}
+                            end
+                    end
+                end,
+                {RestCandidates, Results, Visited, FurthestDist},
+                Neighbors
+            ),
+            greedy_loop_hot(Index, Query, NewCandidates, NewResults, NewVisited, NewFurthestDist, K, L)
+    end.
+
+%% Distance computation for hot layer vectors
+distance_hot(#diskann_index{hot_vectors = HotVecs, config = Config}, IntId, QueryVec) ->
+    case maps:find(IntId, HotVecs) of
+        {ok, Vec} -> distance_vec(Config, QueryVec, Vec);
+        error -> infinity
+    end.
+
+%% RobustPrune for hot layer
+robust_prune_hot(Index, P, Candidates, Alpha, R) ->
+    #diskann_index{config = Config, hot_vectors = HotVecs} = Index,
+    PVec = maps:get(P, HotVecs),
+
+    %% Sort candidates by distance to P
+    WithDist = lists:filtermap(
+        fun(C) ->
+            case C =:= P of
+                true -> false;
+                false ->
+                    case maps:find(C, HotVecs) of
+                        {ok, CVec} ->
+                            D = distance_vec(Config, PVec, CVec),
+                            {true, {D, C}};
+                        error -> false
+                    end
+            end
+        end,
+        Candidates
+    ),
+    Sorted = lists:sort(WithDist),
+
+    %% Alpha-RNG pruning
+    Neighbors = prune_by_alpha_hot(Index, PVec, Sorted, Alpha, R, []),
+
+    %% Update graph
+    Index#diskann_index{
+        hot_graph = maps:put(P, Neighbors, Index#diskann_index.hot_graph)
+    }.
+
+prune_by_alpha_hot(_Index, _PVec, [], _Alpha, _R, Acc) ->
+    lists:reverse(Acc);
+prune_by_alpha_hot(_Index, _PVec, _Candidates, _Alpha, R, Acc) when length(Acc) >= R ->
+    lists:reverse(Acc);
+prune_by_alpha_hot(Index, PVec, [{D_pv, V} | Rest], Alpha, R, Acc) ->
+    #diskann_index{config = Config, hot_vectors = HotVecs} = Index,
+    VVec = maps:get(V, HotVecs),
+
+    %% Check if any neighbor in Acc is closer to V than Alpha * D(p,v)
+    IsPruned = lists:any(
+        fun(U) ->
+            UVec = maps:get(U, HotVecs),
+            D_uv = distance_vec(Config, UVec, VVec),
+            D_uv < Alpha * D_pv
+        end,
+        Acc
+    ),
+
+    case IsPruned of
+        true -> prune_by_alpha_hot(Index, PVec, Rest, Alpha, R, Acc);
+        false -> prune_by_alpha_hot(Index, PVec, Rest, Alpha, R, [V | Acc])
+    end.
+
+%% Add a neighbor in hot layer graph
+add_neighbor_hot(#diskann_index{hot_graph = HotGraph} = Index, Node, Neighbor) ->
+    Neighbors = maps:get(Node, HotGraph, []),
+    case lists:member(Neighbor, Neighbors) of
+        true -> Index;
+        false -> Index#diskann_index{hot_graph = maps:put(Node, [Neighbor | Neighbors], HotGraph)}
+    end.
+
+%% @doc Search in hot layer only
+-spec search_hot_layer(diskann_index(), [float()], pos_integer(), map()) -> [{binary(), float()}].
+search_hot_layer(#diskann_index{hot_size = 0}, _Query, _K, _Opts) ->
+    [];
+search_hot_layer(#diskann_index{hot_size = HotSize, config = Config,
+                                 hot_deleted = HotDeleted,
+                                 hot_int_to_id = HotIntToId} = Index,
+                  Query, K, Opts) when HotSize > 0 ->
+    L = maps:get(l_search, Opts, Config#diskann_config.l_search),
+
+    %% Search from entry point 0
+    {IntResults, _Visited} = greedy_search_hot(Index, 0, Query, K * 2, L),
+
+    %% Filter deleted and convert to string IDs
+    Filtered = lists:filtermap(
+        fun({D, IntId}) ->
+            case sets:is_element(IntId, HotDeleted) of
+                true -> false;
+                false ->
+                    case maps:find(IntId, HotIntToId) of
+                        {ok, StringId} -> {true, {StringId, D}};
+                        error -> false
+                    end
+            end
+        end,
+        IntResults
+    ),
+    lists:sublist(Filtered, K).
+
+%% @doc Search both hot layer and disk layer, merge results
+-spec search_combined(diskann_index(), [float()], pos_integer(), map()) -> [{binary(), float()}].
+search_combined(#diskann_index{hot_size = 0} = Index, Query, K, Opts) ->
+    %% No hot layer data, just search disk
+    search_disk_mode(Index, Query, K, Opts);
+search_combined(Index, Query, K, Opts) ->
+    %% Search both layers in parallel
+    HotResults = search_hot_layer(Index, Query, K, Opts),
+    DiskResults = search_disk_mode(Index, Query, K, Opts),
+    merge_search_results(HotResults, DiskResults, K).
+
+%% @doc Merge and deduplicate search results from hot and disk layers
+-spec merge_search_results([{binary(), float()}], [{binary(), float()}], pos_integer()) ->
+    [{binary(), float()}].
+merge_search_results(HotResults, DiskResults, K) ->
+    %% Combine results, hot layer takes precedence for duplicates
+    HotIds = sets:from_list([Id || {Id, _} <- HotResults]),
+    FilteredDisk = [{Id, D} || {Id, D} <- DiskResults, not sets:is_element(Id, HotIds)],
+    Combined = HotResults ++ FilteredDisk,
+    %% Sort by distance and take top K
+    Sorted = lists:sort(fun({_, D1}, {_, D2}) -> D1 =< D2 end, Combined),
+    lists:sublist(Sorted, K).
+
+%% @doc Compact hot layer to disk
+%% Moves all vectors from hot layer to disk via batch insert
+-spec compact_hot_to_disk(diskann_index()) -> {ok, diskann_index()} | {error, term()}.
+compact_hot_to_disk(#diskann_index{hot_size = 0} = Index) ->
+    {ok, Index};
+compact_hot_to_disk(#diskann_index{compaction_in_progress = true} = Index) ->
+    %% Already compacting
+    {ok, Index};
+compact_hot_to_disk(#diskann_index{hot_vectors = HotVecs,
+                                    hot_int_to_id = HotIntToId,
+                                    hot_deleted = HotDeleted} = Index) ->
+    %% Mark compaction in progress
+    Index1 = Index#diskann_index{compaction_in_progress = true},
+
+    %% Build list of vectors to transfer (excluding deleted)
+    Vectors = maps:fold(
+        fun(IntId, Vec, Acc) ->
+            case sets:is_element(IntId, HotDeleted) of
+                true -> Acc;
+                false ->
+                    case maps:find(IntId, HotIntToId) of
+                        {ok, StringId} -> [{StringId, Vec} | Acc];
+                        error -> Acc
+                    end
+            end
+        end,
+        [],
+        HotVecs
+    ),
+
+    case Vectors of
+        [] ->
+            %% All vectors were deleted, just clear hot layer
+            {ok, clear_hot_layer(Index1)};
+        _ ->
+            %% Batch insert to disk
+            case insert_batch_disk(Index1, Vectors, #{}) of
+                {ok, Index2} ->
+                    %% Clear hot layer after successful compaction
+                    {ok, clear_hot_layer(Index2)};
+                {error, Reason} ->
+                    %% Reset compaction flag on error
+                    {error, {compaction_failed, Reason}}
+            end
+    end.
+
+%% @doc Clear hot layer state after compaction
+-spec clear_hot_layer(diskann_index()) -> diskann_index().
+clear_hot_layer(Index) ->
+    Index#diskann_index{
+        hot_vectors = #{},
+        hot_graph = #{},
+        hot_id_to_int = #{},
+        hot_int_to_id = #{},
+        hot_next_int_id = 0,
+        hot_deleted = sets:new(),
+        hot_pq_codes = #{},
+        hot_size = 0,
+        compaction_in_progress = false
+    }.
+
+%% @doc Delete from hot layer (tombstone)
+-spec hot_delete(diskann_index(), binary()) -> {ok, diskann_index()} | not_found.
+hot_delete(#diskann_index{hot_id_to_int = HotIdToInt,
+                           hot_deleted = HotDeleted} = Index, Id) ->
+    case maps:find(Id, HotIdToInt) of
+        {ok, IntId} ->
+            NewDeleted = sets:add_element(IntId, HotDeleted),
+            {ok, Index#diskann_index{hot_deleted = NewDeleted}};
+        error ->
+            not_found
+    end.
+
+%% @doc Get hot layer statistics
+-spec hot_layer_info(diskann_index()) -> map().
+hot_layer_info(#diskann_index{hot_enabled = false}) ->
+    #{enabled => false};
+hot_layer_info(#diskann_index{hot_enabled = true,
+                               hot_size = HotSize,
+                               hot_max_size = HotMaxSize,
+                               hot_compaction_threshold = Threshold,
+                               hot_deleted = HotDeleted,
+                               compaction_in_progress = Compacting}) ->
+    #{
+        enabled => true,
+        size => HotSize,
+        max_size => HotMaxSize,
+        compaction_threshold => Threshold,
+        deleted_count => sets:size(HotDeleted),
+        compaction_in_progress => Compacting,
+        fill_ratio => case HotMaxSize of
+            0 -> 0.0;
+            _ -> HotSize / HotMaxSize
+        end
+    }.
+
+%% @doc Trigger manual compaction of hot layer to disk
+-spec compact(diskann_index()) -> {ok, diskann_index()} | {error, term()}.
+compact(#diskann_index{hot_enabled = false} = Index) ->
+    {ok, Index};
+compact(Index) ->
+    compact_hot_to_disk(Index).

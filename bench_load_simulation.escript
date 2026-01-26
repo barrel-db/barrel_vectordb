@@ -24,7 +24,8 @@ main(Args) ->
     io:format("  Vector dimension: ~p~n", [maps:get(dimension, Config)]),
     io:format("  Batch size:      ~p~n", [maps:get(batch_size, Config)]),
     io:format("  Initial index:   ~p vectors~n", [maps:get(initial_size, Config)]),
-    io:format("  Mode:            ~p~n~n", [maps:get(mode, Config)]),
+    io:format("  Mode:            ~p~n", [maps:get(mode, Config)]),
+    io:format("  Hot layer:       ~p~n~n", [maps:get(hot_layer, Config)]),
 
     %% Setup
     TmpDir = "/tmp/barrel_memory_bench_" ++ integer_to_list(erlang:unique_integer([positive])),
@@ -45,7 +46,9 @@ parse_args(Args) ->
         dimension => 128,
         batch_size => 1,  %% 1 = single inserts, >1 = batch
         initial_size => 100,
-        mode => sequential  %% sequential | concurrent | burst
+        mode => sequential,  %% sequential | concurrent | burst
+        hot_layer => false,  %% Enable hot layer for fast writes
+        hot_max_size => 10000
     },
     parse_args(Args, Defaults).
 
@@ -60,6 +63,10 @@ parse_args(["--batch", N | Rest], Config) ->
     parse_args(Rest, Config#{batch_size => list_to_integer(N)});
 parse_args(["--initial", N | Rest], Config) ->
     parse_args(Rest, Config#{initial_size => list_to_integer(N)});
+parse_args(["--hot" | Rest], Config) ->
+    parse_args(Rest, Config#{hot_layer => true});
+parse_args(["--hot-size", N | Rest], Config) ->
+    parse_args(Rest, Config#{hot_max_size => list_to_integer(N)});
 parse_args(["--mode", M | Rest], Config) ->
     Mode = case M of
         "sequential" -> sequential;
@@ -83,18 +90,24 @@ print_help() ->
     io:format("  --batch N       Batch size, 1=single inserts (default: 1)~n"),
     io:format("  --initial N     Initial index size (default: 100)~n"),
     io:format("  --mode M        Mode: sequential|concurrent|burst (default: sequential)~n"),
+    io:format("  --hot           Enable hot layer for fast writes~n"),
+    io:format("  --hot-size N    Hot layer max size (default: 10000)~n"),
     io:format("  --help          Show this help~n~n"),
     io:format("Examples:~n"),
     io:format("  # 10 users, single inserts, sequential~n"),
     io:format("  ./bench_load_simulation.escript~n~n"),
     io:format("  # 50 users, concurrent inserts~n"),
     io:format("  ./bench_load_simulation.escript --users 50 --mode concurrent~n~n"),
+    io:format("  # With hot layer enabled~n"),
+    io:format("  ./bench_load_simulation.escript --users 50 --hot~n~n"),
     io:format("  # Burst mode with batching~n"),
     io:format("  ./bench_load_simulation.escript --users 100 --batch 50 --mode burst~n").
 
 run_benchmark(Config, TmpDir) ->
     Dim = maps:get(dimension, Config),
     InitialSize = maps:get(initial_size, Config),
+    HotLayer = maps:get(hot_layer, Config),
+    HotMaxSize = maps:get(hot_max_size, Config),
 
     %% Build initial index
     io:format("Building initial index with ~p vectors...~n", [InitialSize]),
@@ -110,11 +123,17 @@ run_benchmark(Config, TmpDir) ->
         alpha => 1.2,
         storage_mode => disk,
         base_path => TmpDir,
-        use_pq => false
+        use_pq => false,
+        hot_layer => HotLayer,
+        hot_max_size => HotMaxSize
     },
 
     {ok, Index0} = barrel_vectordb_diskann:build(IndexConfig, InitialVectors),
-    io:format("Initial index ready. Size: ~p~n~n", [barrel_vectordb_diskann:size(Index0)]),
+    io:format("Initial index ready. Size: ~p~n", [barrel_vectordb_diskann:size(Index0)]),
+    case HotLayer of
+        true -> io:format("Hot layer: ENABLED (max_size: ~p)~n~n", [HotMaxSize]);
+        false -> io:format("Hot layer: disabled~n~n")
+    end,
 
     %% Run based on mode
     Mode = maps:get(mode, Config),
@@ -333,6 +352,28 @@ print_results(Stats, FinalIndex, Config) ->
     io:format("  Sustainable rate: ~.1f inserts/sec (70%% of max)~n", [SafeThroughput]),
     io:format("  Users at 1 mem/sec: ~p concurrent users~n", [trunc(SafeThroughput)]),
     io:format("  Users at 0.1 mem/sec: ~p concurrent users~n", [trunc(SafeThroughput * 10)]),
+    io:format("~n"),
+
+    %% Index info including hot layer
+    Info = barrel_vectordb_diskann:info(FinalIndex),
+    io:format("Index Status:~n"),
+    io:format("  Total size: ~p vectors~n", [maps:get(size, Info)]),
+    HotInfo = maps:get(hot_layer, Info),
+    case maps:get(enabled, HotInfo) of
+        true ->
+            io:format("  Hot layer size: ~p vectors~n", [maps:get(size, HotInfo)]),
+            io:format("  Hot layer fill: ~.1f%%~n", [maps:get(fill_ratio, HotInfo) * 100]);
+        false ->
+            ok
+    end,
+    io:format("~n"),
+
+    %% Memory usage
+    io:format("Memory Usage:~n"),
+    {memory, ProcMem} = erlang:process_info(self(), memory),
+    io:format("  Process memory: ~.2f MB~n", [ProcMem / 1024 / 1024]),
+    TotalMem = erlang:memory(total),
+    io:format("  Total BEAM memory: ~.2f MB~n", [TotalMem / 1024 / 1024]),
     io:format("~n"),
 
     %% Search performance check
