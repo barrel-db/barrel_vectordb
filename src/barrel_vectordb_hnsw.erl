@@ -478,18 +478,40 @@ euclidean_distance_quantized(<<QScale:32/float-little, QComps/binary>>,
     SumSq = euclidean_sum_sq_int8(QComps, NComps, QScale, NScale, 0.0),
     math:sqrt(SumSq).
 
-%% Integer domain dot product for int8 vectors
-dot_product_int8(<<>>, <<>>) -> 0;
-dot_product_int8(<<A:8/signed, RestA/binary>>, <<B:8/signed, RestB/binary>>) ->
-    A * B + dot_product_int8(RestA, RestB).
+%% Integer domain dot product for int8 vectors - optimized 8 bytes at a time
+dot_product_int8(A, B) ->
+    dot_product_int8_acc(A, B, 0).
 
-%% Euclidean sum of squares for int8 vectors
-euclidean_sum_sq_int8(<<>>, <<>>, _QS, _NS, Acc) -> Acc;
-euclidean_sum_sq_int8(<<A:8/signed, RestA/binary>>, <<B:8/signed, RestB/binary>>, QS, NS, Acc) ->
-    VA = A * QS / 127.0,
-    VB = B * NS / 127.0,
-    Diff = VA - VB,
-    euclidean_sum_sq_int8(RestA, RestB, QS, NS, Acc + Diff * Diff).
+dot_product_int8_acc(<<A1:8/signed, A2:8/signed, A3:8/signed, A4:8/signed,
+                       A5:8/signed, A6:8/signed, A7:8/signed, A8:8/signed, RestA/binary>>,
+                     <<B1:8/signed, B2:8/signed, B3:8/signed, B4:8/signed,
+                       B5:8/signed, B6:8/signed, B7:8/signed, B8:8/signed, RestB/binary>>, Acc) ->
+    Sum = A1*B1 + A2*B2 + A3*B3 + A4*B4 + A5*B5 + A6*B6 + A7*B7 + A8*B8,
+    dot_product_int8_acc(RestA, RestB, Acc + Sum);
+dot_product_int8_acc(<<A:8/signed, RestA/binary>>, <<B:8/signed, RestB/binary>>, Acc) ->
+    dot_product_int8_acc(RestA, RestB, Acc + A * B);
+dot_product_int8_acc(<<>>, <<>>, Acc) -> Acc.
+
+%% Euclidean sum of squares for int8 vectors - optimized 4 bytes at a time
+euclidean_sum_sq_int8(A, B, QS, NS, Acc) ->
+    ScaleQ = QS / 127.0,
+    ScaleN = NS / 127.0,
+    euclidean_sum_sq_int8_acc(A, B, ScaleQ, ScaleN, Acc).
+
+euclidean_sum_sq_int8_acc(<<A1:8/signed, A2:8/signed, A3:8/signed, A4:8/signed, RestA/binary>>,
+                          <<B1:8/signed, B2:8/signed, B3:8/signed, B4:8/signed, RestB/binary>>,
+                          ScaleQ, ScaleN, Acc) ->
+    D1 = A1 * ScaleQ - B1 * ScaleN,
+    D2 = A2 * ScaleQ - B2 * ScaleN,
+    D3 = A3 * ScaleQ - B3 * ScaleN,
+    D4 = A4 * ScaleQ - B4 * ScaleN,
+    SumSq = D1*D1 + D2*D2 + D3*D3 + D4*D4,
+    euclidean_sum_sq_int8_acc(RestA, RestB, ScaleQ, ScaleN, Acc + SumSq);
+euclidean_sum_sq_int8_acc(<<A:8/signed, RestA/binary>>, <<B:8/signed, RestB/binary>>,
+                          ScaleQ, ScaleN, Acc) ->
+    Diff = A * ScaleQ - B * ScaleN,
+    euclidean_sum_sq_int8_acc(RestA, RestB, ScaleQ, ScaleN, Acc + Diff * Diff);
+euclidean_sum_sq_int8_acc(<<>>, <<>>, _ScaleQ, _ScaleN, Acc) -> Acc.
 
 %%====================================================================
 %% Internal: Search with Priority Queue (gb_trees)
