@@ -41,3 +41,4 @@ erl_crash.dump
 # Generated documentation
 doc/
 site/
+rebar3.crashdump
