@@ -6,6 +6,8 @@
 %%%
 %%% Tests automatically skip if the required backend is not available.
 %%%
+%%% Note: Uses barrel_embed library modules for provider implementations.
+%%%
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_vectordb_integration_tests).
@@ -55,8 +57,8 @@ test_local_embed() ->
             io:format("~n  SKIPPED: Python/sentence-transformers not available~n"),
             ok;
         true ->
-            {ok, Config} = barrel_vectordb_embed_local:init(local_config()),
-            {ok, Vector} = barrel_vectordb_embed_local:embed(<<"Hello world">>, Config),
+            {ok, Config} = barrel_embed_local:init(local_config()),
+            {ok, Vector} = barrel_embed_local:embed(<<"Hello world">>, Config),
 
             %% Default model produces 768-dim vectors
             ?assertEqual(768, length(Vector)),
@@ -75,9 +77,9 @@ test_local_batch() ->
             io:format("~n  SKIPPED: Python/sentence-transformers not available~n"),
             ok;
         true ->
-            {ok, Config} = barrel_vectordb_embed_local:init(local_config()),
+            {ok, Config} = barrel_embed_local:init(local_config()),
             Texts = [<<"Hello">>, <<"World">>, <<"Test">>],
-            {ok, Vectors} = barrel_vectordb_embed_local:embed_batch(Texts, Config),
+            {ok, Vectors} = barrel_embed_local:embed_batch(Texts, Config),
 
             ?assertEqual(3, length(Vectors)),
             lists:foreach(fun(V) ->
@@ -100,10 +102,10 @@ test_local_custom_model() ->
         true ->
             %% Use a smaller model for faster test
             BaseConfig = local_config(),
-            {ok, Config} = barrel_vectordb_embed_local:init(
+            {ok, Config} = barrel_embed_local:init(
                 BaseConfig#{model => "sentence-transformers/all-MiniLM-L6-v2"}
             ),
-            {ok, Vector} = barrel_vectordb_embed_local:embed(<<"Test">>, Config),
+            {ok, Vector} = barrel_embed_local:embed(<<"Test">>, Config),
 
             %% This model produces 384-dim vectors
             ?assertEqual(384, length(Vector)),
@@ -121,8 +123,8 @@ test_ollama_embed() ->
             io:format("~n  SKIPPED: Ollama not available~n"),
             ok;
         true ->
-            {ok, Config} = barrel_vectordb_embed_ollama:init(#{}),
-            {ok, Vector} = barrel_vectordb_embed_ollama:embed(<<"Hello world">>, Config),
+            {ok, Config} = barrel_embed_ollama:init(#{}),
+            {ok, Vector} = barrel_embed_ollama:embed(<<"Hello world">>, Config),
 
             %% Default model (nomic-embed-text) produces 768-dim vectors
             ?assertEqual(768, length(Vector)),
@@ -135,9 +137,9 @@ test_ollama_batch() ->
             io:format("~n  SKIPPED: Ollama not available~n"),
             ok;
         true ->
-            {ok, Config} = barrel_vectordb_embed_ollama:init(#{}),
+            {ok, Config} = barrel_embed_ollama:init(#{}),
             Texts = [<<"Hello">>, <<"World">>, <<"Test">>],
-            {ok, Vectors} = barrel_vectordb_embed_ollama:embed_batch(Texts, Config),
+            {ok, Vectors} = barrel_embed_ollama:embed_batch(Texts, Config),
 
             ?assertEqual(3, length(Vectors)),
             lists:foreach(fun(V) ->
@@ -151,10 +153,10 @@ test_ollama_custom_model() ->
             io:format("~n  SKIPPED: Ollama model 'all-minilm' not available~n"),
             ok;
         true ->
-            {ok, Config} = barrel_vectordb_embed_ollama:init(#{
+            {ok, Config} = barrel_embed_ollama:init(#{
                 model => <<"all-minilm">>
             }),
-            {ok, Vector} = barrel_vectordb_embed_ollama:embed(<<"Test">>, Config),
+            {ok, Vector} = barrel_embed_ollama:embed(<<"Test">>, Config),
 
             %% all-minilm produces 384-dim vectors
             ?assertEqual(384, length(Vector))
@@ -170,8 +172,8 @@ test_openai_embed() ->
             io:format("~n  SKIPPED: OpenAI API not available (no API key)~n"),
             ok;
         true ->
-            {ok, Config} = barrel_vectordb_embed_openai:init(#{}),
-            case barrel_vectordb_embed_openai:embed(<<"Hello world">>, Config) of
+            {ok, Config} = barrel_embed_openai:init(#{}),
+            case barrel_embed_openai:embed(<<"Hello world">>, Config) of
                 {ok, Vector} ->
                     %% Default model (text-embedding-3-small) produces 1536-dim vectors
                     ?assertEqual(1536, length(Vector)),
@@ -191,9 +193,9 @@ test_openai_batch() ->
             ok;
         true ->
             timer:sleep(1000),  %% Rate limit delay
-            {ok, Config} = barrel_vectordb_embed_openai:init(#{}),
+            {ok, Config} = barrel_embed_openai:init(#{}),
             Texts = [<<"Hello">>, <<"World">>, <<"Test">>],
-            case barrel_vectordb_embed_openai:embed_batch(Texts, Config) of
+            case barrel_embed_openai:embed_batch(Texts, Config) of
                 {ok, Vectors} ->
                     ?assertEqual(3, length(Vectors)),
                     lists:foreach(fun(V) ->
@@ -215,11 +217,11 @@ test_openai_custom_model() ->
         true ->
             timer:sleep(1000),  %% Rate limit delay
             %% Use text-embedding-3-large for higher dimensions
-            {ok, Config} = barrel_vectordb_embed_openai:init(#{
+            {ok, Config} = barrel_embed_openai:init(#{
                 model => <<"text-embedding-3-large">>,
                 dimension => 3072
             }),
-            case barrel_vectordb_embed_openai:embed(<<"Test">>, Config) of
+            case barrel_embed_openai:embed(<<"Test">>, Config) of
                 {ok, Vector} ->
                     %% text-embedding-3-large produces 3072-dim vectors
                     ?assertEqual(3072, length(Vector));
@@ -277,7 +279,7 @@ test_provider_chain() ->
                                     %% Cleanup local if it was initialized
                                     lists:foreach(fun({Mod, Cfg}) ->
                                         case Mod of
-                                            barrel_vectordb_embed_local -> cleanup_local(Cfg);
+                                            barrel_embed_local -> cleanup_local(Cfg);
                                             _ -> ok
                                         end
                                     end, Providers)
@@ -299,7 +301,7 @@ test_provider_chain() ->
 check_local_available() ->
     %% Check if local provider can be initialized
     %% This verifies: Python available, sentence-transformers installed, embed script found
-    case barrel_vectordb_embed_local:init(local_config()) of
+    case barrel_embed_local:init(local_config()) of
         {ok, Config} ->
             cleanup_local(Config),
             true;
@@ -320,9 +322,9 @@ check_ollama_available() ->
 
 check_openai_available() ->
     %% Check if OpenAI API key is set and API responds
-    case barrel_vectordb_embed_openai:init(#{}) of
+    case barrel_embed_openai:init(#{}) of
         {ok, Config} ->
-            barrel_vectordb_embed_openai:available(Config);
+            barrel_embed_openai:available(Config);
         {error, _} ->
             false
     end.

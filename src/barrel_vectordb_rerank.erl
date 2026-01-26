@@ -146,7 +146,7 @@ rerank(Query, Documents, State) ->
 -spec rerank(binary(), [binary()], map(), rerank_state()) ->
     {ok, [rerank_result()]} | {error, term()}.
 rerank(Query, Documents, Options, #{port := Port, timeout := Timeout}) ->
-    case barrel_vectordb_python_queue:acquire(Timeout) of
+    case barrel_embed_python_queue:acquire(Timeout) of
         ok ->
             try
                 Request = #{
@@ -168,7 +168,7 @@ rerank(Query, Documents, Options, #{port := Port, timeout := Timeout}) ->
                         {error, Reason}
                 end
             after
-                barrel_vectordb_python_queue:release()
+                barrel_embed_python_queue:release()
             end;
         {error, timeout} ->
             {error, queue_timeout}
