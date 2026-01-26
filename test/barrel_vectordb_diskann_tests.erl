@@ -26,7 +26,8 @@ diskann_test_() ->
         {"consolidate removes deleted", fun test_consolidate/0},
         {"alpha rng stability", fun test_alpha_rng_stability/0},
         {"pq search test", fun test_pq_search/0},
-        {"pq insert test", fun test_pq_insert/0}
+        {"pq insert test", fun test_pq_insert/0},
+        {"assume normalized optimization", fun test_assume_normalized/0}
      ]
     }.
 
@@ -566,6 +567,52 @@ test_serialization() ->
     Results1 = barrel_vectordb_diskann:search(Index1, Query, 5),
     Results2 = barrel_vectordb_diskann:search(Index2, Query, 5),
     ?assertEqual(Results1, Results2).
+
+test_assume_normalized() ->
+    %% Test that assume_normalized produces same results as normal cosine
+    %% but uses optimized dot product path
+    rand:seed(exsss, {123, 456, 789}),
+    Vectors = [{integer_to_binary(I), random_vector(16)}
+               || I <- lists:seq(1, 100)],
+
+    %% Build index with assume_normalized = false (default)
+    ConfigDefault = #{
+        dimension => 16,
+        r => 8,
+        l_build => 30,
+        l_search => 30,
+        storage_mode => memory
+    },
+    {ok, IndexDefault} = barrel_vectordb_diskann:build(ConfigDefault, Vectors),
+
+    %% Build index with assume_normalized = true
+    ConfigNorm = ConfigDefault#{assume_normalized => true},
+    {ok, IndexNorm} = barrel_vectordb_diskann:build(ConfigNorm, Vectors),
+
+    %% Verify config is set correctly
+    InfoNorm = barrel_vectordb_diskann:info(IndexNorm),
+    ConfigInfo = maps:get(config, InfoNorm),
+    ?assertEqual(true, maps:get(assume_normalized, ConfigInfo)),
+
+    %% Search should return same results (vectors are normalized)
+    Query = random_vector(16),
+    ResultsDefault = barrel_vectordb_diskann:search(IndexDefault, Query, 10),
+    ResultsNorm = barrel_vectordb_diskann:search(IndexNorm, Query, 10),
+
+    %% Exact IDs may differ slightly due to graph structure, but top result should match
+    {TopId1, _} = hd(ResultsDefault),
+    {TopId2, _} = hd(ResultsNorm),
+    ?assertEqual(TopId1, TopId2),
+
+    %% Both should have 10 results
+    ?assertEqual(10, length(ResultsDefault)),
+    ?assertEqual(10, length(ResultsNorm)),
+
+    %% Recall should be similar (compare both against brute force)
+    RecallDefault = measure_recall(IndexDefault, Query, Vectors, 10),
+    RecallNorm = measure_recall(IndexNorm, Query, Vectors, 10),
+    ?assert(RecallDefault >= 0.8),
+    ?assert(RecallNorm >= 0.8).
 
 %%====================================================================
 %% Helpers

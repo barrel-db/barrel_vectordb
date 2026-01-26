@@ -79,7 +79,8 @@ run(Config) ->
         l_search => LSearch,
         alpha => 1.2,
         storage_mode => memory,
-        use_pq => false  %% Disable PQ in memory mode for better recall
+        use_pq => false,  %% Disable PQ in memory mode for better recall
+        assume_normalized => true  %% Benchmark uses normalized vectors
     },
     {DiskannBuildUs, {ok, DiskannIndex}} = timer:tc(fun() ->
         barrel_vectordb_diskann:build(DiskannConfig, Vectors)

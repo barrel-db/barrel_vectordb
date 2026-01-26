@@ -53,7 +53,8 @@
     l_search = 100 :: pos_integer(),      %% Query search width
     alpha = 1.2 :: float(),               %% Pruning factor (>1 for long-range)
     dimension :: pos_integer(),
-    distance_fn = cosine :: cosine | euclidean
+    distance_fn = cosine :: cosine | euclidean,
+    assume_normalized = false :: boolean() %% Skip norm computation for normalized vectors
 }).
 
 -record(diskann_index, {
@@ -114,6 +115,7 @@
 %%   - l_search: Query search width (default: 100)
 %%   - alpha: Pruning factor (default: 1.2)
 %%   - distance_fn: cosine | euclidean (default: cosine)
+%%   - assume_normalized: Skip norm computation for cosine (default: false)
 %%   - storage_mode: memory | disk (default: memory)
 %%   - base_path: Path for disk storage (required if storage_mode=disk)
 %%   - cache_max_size: Max vectors in LRU cache (default: 10000)
@@ -125,6 +127,7 @@ new(Options) ->
     Alpha = maps:get(alpha, Options, 1.2),
     Dimension = maps:get(dimension, Options, undefined),
     DistanceFn = maps:get(distance_fn, Options, cosine),
+    AssumeNormalized = maps:get(assume_normalized, Options, false),
     StorageMode = maps:get(storage_mode, Options, memory),
     BasePath = maps:get(base_path, Options, undefined),
     CacheMaxSize = maps:get(cache_max_size, Options, 10000),
@@ -141,7 +144,8 @@ new(Options) ->
                         l_search = LSearch,
                         alpha = Alpha,
                         dimension = Dimension,
-                        distance_fn = DistanceFn
+                        distance_fn = DistanceFn,
+                        assume_normalized = AssumeNormalized
                     },
                     %% Create ETS cache table for disk mode
                     CacheTable = case StorageMode of
@@ -617,7 +621,8 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
             l_search => Config#diskann_config.l_search,
             alpha => Config#diskann_config.alpha,
             dimension => Config#diskann_config.dimension,
-            distance_fn => Config#diskann_config.distance_fn
+            distance_fn => Config#diskann_config.distance_fn,
+            assume_normalized => Config#diskann_config.assume_normalized
         }
     }.
 
@@ -1445,10 +1450,23 @@ distance(Index, Id, QueryVec) ->
         _ -> distance_vec(Index#diskann_index.config, QueryVec, NodeVec)
     end.
 
+%% Fast path for pre-normalized vectors (common in embedding models)
+%% For ||v|| = 1: cosine_distance = 1 - dot(v1, v2)
+%% Eliminates 2 sqrt() calls and 6N multiplications/additions per distance
+distance_vec(#diskann_config{distance_fn = cosine, assume_normalized = true}, Vec1, Vec2) ->
+    1.0 - dot_product(Vec1, Vec2);
 distance_vec(#diskann_config{distance_fn = cosine}, Vec1, Vec2) ->
     cosine_distance(Vec1, Vec2);
 distance_vec(#diskann_config{distance_fn = euclidean}, Vec1, Vec2) ->
     euclidean_distance(Vec1, Vec2).
+
+%% Fast dot product for normalized vectors
+dot_product(Vec1, Vec2) ->
+    dot_product(Vec1, Vec2, 0.0).
+
+dot_product([], [], Acc) -> Acc;
+dot_product([A | R1], [B | R2], Acc) ->
+    dot_product(R1, R2, Acc + A * B).
 
 %% Optimized cosine distance - avoids redundant norm calculations
 %% For normalized vectors, this simplifies to 1 - dot(v1, v2)
