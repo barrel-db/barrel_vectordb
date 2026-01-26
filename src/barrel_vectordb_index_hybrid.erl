@@ -302,14 +302,18 @@ compact(#hybrid_index{hot_layer = Hot, cold_layer = Cold,
             end;
 
         {Vectors, undefined} ->
-            %% First compaction: build new DiskANN index
+            %% First compaction: build new DiskANN index with PQ
             DiskannConfig = #{
                 dimension => Dim,
                 distance_fn => DistFn,
                 r => maps:get(diskann_r, Config, 64),
                 l_build => maps:get(diskann_l_build, Config, 100),
                 l_search => maps:get(diskann_l_search, Config, 100),
-                alpha => maps:get(diskann_alpha, Config, 1.2)
+                alpha => maps:get(diskann_alpha, Config, 1.2),
+                %% Enable PQ for memory efficiency
+                use_pq => maps:get(use_pq, Config, true),
+                pq_m => maps:get(pq_m, Config, 8),
+                pq_k => maps:get(pq_k, Config, 256)
             },
             {ok, NewCold} = barrel_vectordb_diskann:build(DiskannConfig, Vectors),
 

@@ -68,6 +68,14 @@ run(Config) ->
     io:format("HNSW build:   ~.2f s~n", [HnswBuildUs / 1_000_000]),
 
     %% Build Hybrid index (insert + compact)
+    %% PQ only makes sense for large datasets (>= 10k vectors)
+    %% For smaller datasets, the quantization loss hurts more than memory savings help
+    UsePQ = NumVectors >= 10000,
+    PQK = case NumVectors < 50000 of
+        true -> 64;
+        false -> 256
+    end,
+    PQM = min(8, max(4, Dim div 8)),
     {HybridBuildUs, HybridIndex} = timer:tc(fun() ->
         {ok, Index0} = barrel_vectordb_index_hybrid:new(#{
             dimension => Dim,
@@ -76,7 +84,11 @@ run(Config) ->
             hnsw_ef_construction => 100,
             diskann_r => 16,
             diskann_l_build => 30,
-            diskann_alpha => 1.2
+            diskann_alpha => 1.2,
+            %% Only enable PQ for large datasets
+            use_pq => UsePQ,
+            pq_m => PQM,
+            pq_k => PQK
         }),
         Index1 = lists:foldl(
             fun({Id, Vec}, Acc) ->
@@ -89,7 +101,7 @@ run(Config) ->
         {ok, Compacted} = barrel_vectordb_index_hybrid:compact(Index1),
         Compacted
     end),
-    io:format("Hybrid build: ~.2f s (includes compaction)~n", [HybridBuildUs / 1_000_000]),
+    io:format("Hybrid build: ~.2f s (includes compaction + PQ training)~n", [HybridBuildUs / 1_000_000]),
 
     %% Memory usage (estimated)
     io:format("~n--- Memory Usage (Estimated) ---~n"),
@@ -219,15 +231,24 @@ estimate_hybrid_memory(Index, Dim) ->
     %% Hot layer: same as HNSW
     HotBytes = HotSize * (Dim + 4 + 8 + 16 * 16),
 
-    %% Cold layer (DiskANN): much smaller - just graph edges in memory
-    %% In production, vectors would be on SSD with PQ codes in RAM
-    %% For this benchmark, we estimate based on actual structure
-    ColdConfig = maps:get(cold_info, Info, #{}),
-    R = maps:get(r, maps:get(config, ColdConfig, #{}), 64),
+    %% Cold layer (DiskANN): check if PQ is enabled
+    ColdInfo = maps:get(cold_info, Info, #{}),
+    R = maps:get(r, maps:get(config, ColdInfo, #{}), 64),
+    PQInfo = maps:get(pq, ColdInfo, #{enabled => false}),
+    PQEnabled = maps:get(enabled, PQInfo, false),
 
-    %% Per cold vector: ID (16) + neighbor IDs (R * 16) + vector (Dim * 8)
-    %% In true DiskANN with PQ, vector would be ~32 bytes (PQ codes)
-    ColdVecBytes = 16 + R * 16 + Dim * 8,  %% Current impl keeps full vectors
+    %% Per cold vector: ID (16) + neighbor IDs (R * 16) + vector storage
+    %% With PQ: only M bytes for codes (in RAM), full vectors on disk
+    %% Without PQ: full vectors in RAM (Dim * 8)
+    ColdVecBytes = case PQEnabled of
+        true ->
+            %% With PQ: just codes in RAM (M bytes) + graph
+            PQM = maps:get(m, maps:get(m, PQInfo, #{}), 8),
+            16 + R * 16 + PQM;  %% ID + neighbors + PQ code
+        false ->
+            %% Without PQ: full vectors in RAM
+            16 + R * 16 + Dim * 8
+    end,
     ColdBytes = ColdSize * ColdVecBytes,
 
     HotBytes + ColdBytes.

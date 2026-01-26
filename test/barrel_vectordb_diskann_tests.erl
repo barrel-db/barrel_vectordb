@@ -24,7 +24,9 @@ diskann_test_() ->
         {"insert preserves recall", fun test_insert_preserves_recall/0},
         {"delete filters results", fun test_delete/0},
         {"consolidate removes deleted", fun test_consolidate/0},
-        {"alpha rng stability", fun test_alpha_rng_stability/0}
+        {"alpha rng stability", fun test_alpha_rng_stability/0},
+        {"pq search test", fun test_pq_search/0},
+        {"pq insert test", fun test_pq_insert/0}
      ]
     }.
 
@@ -255,6 +257,61 @@ test_alpha_rng_stability() ->
     %% Index should still work after cycles
     Results = barrel_vectordb_diskann:search(FinalIndex, random_vector(16), 5),
     ?assert(length(Results) >= 1).
+
+test_pq_search() ->
+    %% Build index with PQ enabled
+    %% Use smaller K (16) for faster tests - production would use 256
+    Vectors = [{integer_to_binary(I), random_vector(16)}
+               || I <- lists:seq(1, 50)],
+    Config = #{
+        dimension => 16,
+        r => 8,
+        l_build => 20,
+        l_search => 20,
+        alpha => 1.2,
+        use_pq => true,
+        pq_m => 2,       %% 16 / 2 = 8 dims per subspace
+        pq_k => 16       %% Small K for fast testing
+    },
+    {ok, Index} = barrel_vectordb_diskann:build(Config, Vectors),
+
+    %% Verify PQ is enabled
+    Info = barrel_vectordb_diskann:info(Index),
+    PQInfo = maps:get(pq, Info),
+    ?assertEqual(true, maps:get(enabled, PQInfo)),
+
+    %% Search should work with PQ
+    Query = random_vector(16),
+    Results = barrel_vectordb_diskann:search(Index, Query, 5),
+    ?assertEqual(5, length(Results)),
+
+    %% Check recall with PQ - expect some loss
+    Recall = measure_recall(Index, Query, Vectors, 5),
+    ?assert(Recall >= 0.2).
+
+test_pq_insert() ->
+    %% Build index with PQ, then insert more vectors
+    Vectors = [{integer_to_binary(I), random_vector(16)}
+               || I <- lists:seq(1, 50)],
+    Config = #{
+        dimension => 16,
+        r => 8,
+        l_build => 20,
+        use_pq => true,
+        pq_m => 2,
+        pq_k => 16
+    },
+    {ok, Index0} = barrel_vectordb_diskann:build(Config, Vectors),
+
+    %% Insert new vectors (should be PQ encoded)
+    {ok, Index1} = barrel_vectordb_diskann:insert(Index0, <<"new1">>, random_vector(16)),
+    {ok, Index2} = barrel_vectordb_diskann:insert(Index1, <<"new2">>, random_vector(16)),
+
+    ?assertEqual(52, barrel_vectordb_diskann:size(Index2)),
+
+    %% Search should still work
+    Results = barrel_vectordb_diskann:search(Index2, random_vector(16), 5),
+    ?assertEqual(5, length(Results)).
 
 %%====================================================================
 %% Helpers

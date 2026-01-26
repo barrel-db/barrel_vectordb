@@ -56,7 +56,9 @@
     nodes = #{} :: #{binary() => diskann_node()},
     vectors = #{} :: #{binary() => [float()]},
     deleted_set = sets:new() :: sets:set(binary()),
-    pq_state :: term() | undefined        %% Optional PQ for compression
+    pq_state :: term() | undefined,       %% Trained PQ for compression
+    pq_codes = #{} :: #{binary() => binary()},  %% Id -> PQ code (M bytes)
+    use_pq = false :: boolean()           %% Whether to use PQ for search
 }).
 
 -record(diskann_node, {
@@ -132,7 +134,17 @@ build(Options, Vectors) when length(Vectors) > 0 ->
             %% Pass 2: alpha > 1.0 (adds long-range edges for fast convergence)
             Index5 = vamana_pass(Index4, Alpha, L, R),
 
-            {ok, Index5};
+            %% Train and apply PQ if enabled and enough vectors
+            UsePQ = maps:get(use_pq, Options, false),
+            PQK = maps:get(pq_k, Options, 256),
+            Index6 = case UsePQ andalso length(Vectors) >= PQK of
+                true ->
+                    train_and_apply_pq(Index5, Options, Vectors);
+                false ->
+                    Index5
+            end,
+
+            {ok, Index6};
         {error, _} = Error ->
             Error
     end;
@@ -157,17 +169,28 @@ insert(#diskann_index{medoid_id = undefined} = Index, Id, Vector) ->
         Other ->
             {error, {dimension_mismatch, Dim, Other}}
     end;
-insert(#diskann_index{config = Config, medoid_id = S} = Index, Id, Vector) ->
+insert(#diskann_index{config = Config, medoid_id = S, use_pq = UsePQ,
+                      pq_state = PQState, pq_codes = PQCodes} = Index, Id, Vector) ->
     Dim = Config#diskann_config.dimension,
     case length(Vector) of
         Dim ->
             #diskann_config{l_build = L, alpha = Alpha, r = R} = Config,
+
+            %% Encode with PQ if enabled
+            NewPQCodes = case UsePQ andalso PQState =/= undefined of
+                true ->
+                    Code = barrel_vectordb_pq:encode(PQState, Vector),
+                    maps:put(Id, Code, PQCodes);
+                false ->
+                    PQCodes
+            end,
 
             %% Add vector to index
             Index1 = Index#diskann_index{
                 vectors = maps:put(Id, Vector, Index#diskann_index.vectors),
                 nodes = maps:put(Id, #diskann_node{id = Id, neighbors = []},
                                  Index#diskann_index.nodes),
+                pq_codes = NewPQCodes,
                 size = Index#diskann_index.size + 1
             },
 
@@ -214,12 +237,22 @@ search(Index, Query, K) ->
 -spec search(diskann_index(), [float()], pos_integer(), map()) -> [{binary(), float()}].
 search(#diskann_index{medoid_id = undefined}, _Query, _K, _Opts) ->
     [];
-search(#diskann_index{medoid_id = S, config = Config, deleted_set = DeletedSet} = Index,
+search(#diskann_index{medoid_id = S, config = Config, deleted_set = DeletedSet,
+                      use_pq = UsePQ, pq_state = PQState} = Index,
        Query, K, Opts) ->
     L = maps:get(l_search, Opts, Config#diskann_config.l_search),
 
-    %% Greedy search from medoid
-    {Results, _Visited} = greedy_search(Index, S, Query, K * 2, L),
+    %% Use PQ-based beam search if PQ is available
+    Results = case UsePQ andalso PQState =/= undefined of
+        true ->
+            %% Precompute distance tables for this query
+            DistTables = barrel_vectordb_pq:precompute_tables(PQState, Query),
+            beam_search_pq(Index, S, Query, DistTables, K * 2, L);
+        false ->
+            %% Standard greedy search
+            {Res, _Visited} = greedy_search(Index, S, Query, K * 2, L),
+            Res
+    end,
 
     %% Filter deleted nodes
     Filtered = [{D, Id} || {D, Id} <- Results,
@@ -237,7 +270,8 @@ size(#diskann_index{size = Size, deleted_set = Deleted}) ->
 %% @doc Get index info
 -spec info(diskann_index()) -> map().
 info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
-                    deleted_set = Deleted, nodes = Nodes}) ->
+                    deleted_set = Deleted, nodes = Nodes, use_pq = UsePQ,
+                    pq_state = PQState, pq_codes = PQCodes}) ->
     AvgDegree = case maps:size(Nodes) of
         0 -> 0.0;
         N ->
@@ -250,12 +284,23 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
             ),
             TotalDegree / N
     end,
+    PQInfo = case UsePQ andalso PQState =/= undefined of
+        true ->
+            #{
+                enabled => true,
+                m => barrel_vectordb_pq:info(PQState),
+                num_codes => maps:size(PQCodes)
+            };
+        false ->
+            #{enabled => false}
+    end,
     #{
         size => Size,
         active_size => Size - sets:size(Deleted),
         deleted_count => sets:size(Deleted),
         medoid => Medoid,
         avg_degree => AvgDegree,
+        pq => PQInfo,
         config => #{
             r => Config#diskann_config.r,
             l_build => Config#diskann_config.l_build,
@@ -354,6 +399,44 @@ consolidate_deletes_impl(Index, DeletedSet, Config, Nodes, Vectors) ->
         size = NewSize,
         medoid_id = NewMedoid
     }}.
+
+%%====================================================================
+%% Internal: PQ Training and Encoding
+%%====================================================================
+
+%% Train PQ on vectors and encode all vectors to PQ codes
+train_and_apply_pq(Index, Options, Vectors) ->
+    Dim = (Index#diskann_index.config)#diskann_config.dimension,
+    M = maps:get(pq_m, Options, 8),
+    K = maps:get(pq_k, Options, 256),
+
+    %% Dimension must be divisible by M
+    case Dim rem M of
+        0 ->
+            %% Create and train PQ
+            {ok, PQConfig} = barrel_vectordb_pq:new(#{
+                m => M,
+                k => K,
+                dimension => Dim
+            }),
+            VecList = [V || {_, V} <- Vectors],
+            {ok, TrainedPQ} = barrel_vectordb_pq:train(PQConfig, VecList),
+
+            %% Encode all vectors to PQ codes
+            PQCodes = maps:from_list([
+                {Id, barrel_vectordb_pq:encode(TrainedPQ, Vec)}
+                || {Id, Vec} <- Vectors
+            ]),
+
+            Index#diskann_index{
+                pq_state = TrainedPQ,
+                pq_codes = PQCodes,
+                use_pq = true
+            };
+        _ ->
+            %% Can't use PQ with this dimension
+            Index
+    end.
 
 %%====================================================================
 %% Internal: Vamana Build
@@ -534,6 +617,114 @@ greedy_loop(Index, Query, Candidates, Results, Visited, FurthestDist, K, L) ->
 
             greedy_loop(Index, Query, NewCandidates, NewResults, NewVisited, NewFurthestDist, K, L)
     end.
+
+%%====================================================================
+%% Internal: BeamSearch with PQ (Optimized for DiskANN)
+%%====================================================================
+
+%% Beam search using PQ distance tables for fast approximate distance
+%% Returns sorted results [{Distance, Id}]
+beam_search_pq(Index, StartId, Query, DistTables, K, L) ->
+    #diskann_index{pq_codes = PQCodes, vectors = Vectors} = Index,
+
+    %% Get PQ distance to start node
+    StartDist = case maps:find(StartId, PQCodes) of
+        {ok, Code} -> barrel_vectordb_pq:distance(DistTables, Code);
+        error -> infinity
+    end,
+
+    %% Candidates: min-heap of nodes to explore
+    Candidates = gb_trees:from_orddict([{{StartDist, StartId}, true}]),
+    %% Results: best L nodes found so far
+    Results = gb_trees:from_orddict([{{StartDist, StartId}, true}]),
+    %% Visited: nodes we've already expanded
+    Visited = sets:from_list([StartId]),
+    FurthestDist = StartDist,
+
+    %% Run beam search with PQ distances
+    PQResults = beam_search_pq_loop(Index, DistTables, PQCodes, Candidates,
+                                     Results, Visited, FurthestDist, K, L),
+
+    %% Rerank top results with full vectors for accuracy
+    rerank_with_full_vectors(PQResults, Query, Vectors, Index#diskann_index.config, K).
+
+beam_search_pq_loop(_Index, _DistTables, _PQCodes, {0, nil}, Results, _Visited, _FurthestDist, K, _L) ->
+    %% No more candidates
+    ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+    lists:sublist(ResultList, K);
+beam_search_pq_loop(Index, DistTables, PQCodes, Candidates, Results, Visited, FurthestDist, K, L) ->
+    %% Get closest candidate
+    {{CurrentDist, CurrentId}, _, RestCandidates} = gb_trees:take_smallest(Candidates),
+
+    %% If closest candidate is further than our furthest result, we're done
+    case CurrentDist > FurthestDist of
+        true ->
+            ResultList = [Item || {Item, _} <- gb_trees:to_list(Results)],
+            lists:sublist(ResultList, K);
+        false ->
+            %% Expand neighbors
+            Neighbors = get_neighbors(Index, CurrentId),
+            {NewCandidates, NewResults, NewVisited, NewFurthestDist} = lists:foldl(
+                fun(N, {CandAcc, ResAcc, VisAcc, FurthAcc}) ->
+                    case sets:is_element(N, VisAcc) of
+                        true ->
+                            {CandAcc, ResAcc, VisAcc, FurthAcc};
+                        false ->
+                            NewVisAcc = sets:add_element(N, VisAcc),
+                            %% Use PQ distance (fast O(M) lookup)
+                            D = case maps:find(N, PQCodes) of
+                                {ok, Code} -> barrel_vectordb_pq:distance(DistTables, Code);
+                                error -> infinity
+                            end,
+                            ResSize = gb_trees:size(ResAcc),
+                            ShouldAdd = D < FurthAcc orelse ResSize < L,
+                            case ShouldAdd of
+                                true ->
+                                    NewCandAcc = gb_trees:insert({D, N}, true, CandAcc),
+                                    NewResAcc0 = gb_trees:insert({D, N}, true, ResAcc),
+                                    %% Trim results if too many
+                                    NewResSize = gb_trees:size(NewResAcc0),
+                                    {NewResAcc, NewFurthAcc} = case NewResSize > L of
+                                        true ->
+                                            {_, _, Trimmed} = gb_trees:take_largest(NewResAcc0),
+                                            {{LastD, _}, _} = gb_trees:largest(Trimmed),
+                                            {Trimmed, LastD};
+                                        false ->
+                                            {{MaxD, _}, _} = gb_trees:largest(NewResAcc0),
+                                            {NewResAcc0, MaxD}
+                                    end,
+                                    {NewCandAcc, NewResAcc, NewVisAcc, NewFurthAcc};
+                                false ->
+                                    {CandAcc, ResAcc, NewVisAcc, FurthAcc}
+                            end
+                    end
+                end,
+                {RestCandidates, Results, Visited, FurthestDist},
+                Neighbors
+            ),
+
+            beam_search_pq_loop(Index, DistTables, PQCodes, NewCandidates,
+                                NewResults, NewVisited, NewFurthestDist, K, L)
+    end.
+
+%% Rerank top candidates using full vectors for accuracy
+rerank_with_full_vectors(PQResults, Query, Vectors, Config, K) ->
+    %% Compute exact distances for top candidates
+    Reranked = lists:map(
+        fun({_PQDist, Id}) ->
+            case maps:find(Id, Vectors) of
+                {ok, Vec} ->
+                    ExactDist = distance_vec(Config, Query, Vec),
+                    {ExactDist, Id};
+                error ->
+                    {infinity, Id}
+            end
+        end,
+        PQResults
+    ),
+    %% Sort by exact distance and take K
+    Sorted = lists:sort(Reranked),
+    lists:sublist(Sorted, K).
 
 %%====================================================================
 %% Internal: RobustPrune (Algorithm 2 from DiskANN paper)

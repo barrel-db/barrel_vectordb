@@ -225,13 +225,39 @@ split_subvectors(Vec, M, SubDim, Acc) when M > 0 ->
 merge_subvector_groups(Subvecs, Groups) ->
     lists:zipwith(fun(S, G) -> [S | G] end, Subvecs, Groups).
 
-%% K-means clustering
+%% K-means clustering with adaptive initialization
 kmeans(Vectors, K, MaxIter) ->
-    %% Initialize centroids using k-means++
-    InitCentroids = kmeans_plus_plus_init(Vectors, K),
-    kmeans_iterate(Vectors, InitCentroids, MaxIter).
+    N = length(Vectors),
+    %% Use simple random init for small datasets (faster), k-means++ for large
+    InitCentroids = case N < 100000 of
+        true -> random_init(Vectors, K);
+        false -> kmeans_plus_plus_init(Vectors, K)
+    end,
+    %% Adaptive iterations: fewer for small datasets
+    %% n < 10k: 5 iters, n >= 10k: 15 iters
+    Iterations = case N < 10000 of
+        true -> min(5, MaxIter);
+        false -> min(15, MaxIter)
+    end,
+    kmeans_iterate_early_stop(Vectors, InitCentroids, Iterations, infinity).
 
-%% K-means++ initialization for better convergence
+%% Simple random initialization (O(k) - very fast)
+random_init(Vectors, K) ->
+    N = length(Vectors),
+    VecArray = list_to_tuple(Vectors),
+    Indices = random_sample_indices(N, K, []),
+    [element(I, VecArray) || I <- Indices].
+
+random_sample_indices(_N, 0, Acc) ->
+    Acc;
+random_sample_indices(N, K, Acc) ->
+    I = rand:uniform(N),
+    case lists:member(I, Acc) of
+        true -> random_sample_indices(N, K, Acc);
+        false -> random_sample_indices(N, K - 1, [I | Acc])
+    end.
+
+%% K-means++ initialization for better convergence (O(n*k) - slower but better quality)
 kmeans_plus_plus_init(Vectors, K) ->
     %% Pick first centroid randomly
     N = length(Vectors),
@@ -262,9 +288,9 @@ sample_by_distance([_ | Vs], [D | Ds], Target, Acc) ->
 sample_by_distance([V], _, _, _) ->
     V.
 
-kmeans_iterate(_, Centroids, 0) ->
+kmeans_iterate_early_stop(_, Centroids, 0, _LastChange) ->
     Centroids;
-kmeans_iterate(Vectors, Centroids, Iter) ->
+kmeans_iterate_early_stop(Vectors, Centroids, Iter, LastChange) ->
     %% Assign each vector to nearest centroid
     Assignments = [assign_to_cluster(V, Centroids) || V <- Vectors],
 
@@ -274,11 +300,17 @@ kmeans_iterate(Vectors, Centroids, Iter) ->
     NewCentroids = [compute_centroid(C, lists:nth(I, Centroids))
                    || {I, C} <- lists:zip(lists:seq(1, K), Clusters)],
 
-    %% Check convergence
-    case centroids_converged(Centroids, NewCentroids) of
+    %% Compute change (total centroid movement)
+    Change = centroid_change(Centroids, NewCentroids),
+
+    %% Early stop if converged or change is increasing (local minimum passed)
+    case Change < 1.0e-6 orelse (LastChange =/= infinity andalso Change > LastChange * 0.99) of
         true -> NewCentroids;
-        false -> kmeans_iterate(Vectors, NewCentroids, Iter - 1)
+        false -> kmeans_iterate_early_stop(Vectors, NewCentroids, Iter - 1, Change)
     end.
+
+centroid_change(Old, New) ->
+    lists:sum([squared_euclidean(O, N) || {O, N} <- lists:zip(Old, New)]).
 
 assign_to_cluster(Vec, Centroids) ->
     Distances = [{I, squared_euclidean(Vec, C)}
@@ -319,15 +351,6 @@ compute_centroid(Vectors, _) ->
         Vectors
     ),
     [S / N || S <- Sums].
-
-centroids_converged(Old, New) ->
-    Threshold = 1.0e-6,
-    lists:all(
-        fun({O, N}) ->
-            squared_euclidean(O, N) < Threshold
-        end,
-        lists:zip(Old, New)
-    ).
 
 squared_euclidean(Vec1, Vec2) ->
     lists:sum([math:pow(A - B, 2) || {A, B} <- lists:zip(Vec1, Vec2)]).
