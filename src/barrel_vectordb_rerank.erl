@@ -36,10 +36,27 @@
 %%% == Configuration ==
 %%% ```
 %%% Config = #{
-%%%     python => "python3",                               %% Python executable
+%%%     venv => "/path/to/.venv",                          %% Virtualenv path (recommended)
+%%%     python => "python3",                               %% Python executable (if no venv)
 %%%     model => "cross-encoder/ms-marco-MiniLM-L-6-v2",   %% Model name
 %%%     timeout => 120000                                  %% Timeout in ms
 %%% }.
+%%% '''
+%%%
+%%% == Venv Support ==
+%%% When `venv' is specified, the server will:
+%%% - Use the Python executable from the venv
+%%% - Set VIRTUAL_ENV and PATH environment variables
+%%%
+%%% This allows sharing a venv with barrel_embed:
+%%% ```
+%%% VenvPath = "/path/to/.venv",
+%%% {ok, _} = barrel_vectordb:start_link(#{
+%%%     embedder => {local, #{venv => VenvPath}}
+%%% }),
+%%% {ok, Reranker} = barrel_vectordb_rerank:start_link(#{
+%%%     venv => VenvPath
+%%% }).
 %%% '''
 %%%
 %%% == Supported Models ==
@@ -152,6 +169,7 @@ init(Config) ->
     Python = maps:get(python, Config, ?DEFAULT_PYTHON),
     Model = maps:get(model, Config, ?DEFAULT_MODEL),
     Timeout = maps:get(timeout, Config, ?DEFAULT_TIMEOUT),
+    Venv = maps:get(venv, Config, undefined),
 
     case find_rerank_script() of
         {ok, Script} ->
@@ -160,10 +178,12 @@ init(Config) ->
                 {line, 10000000},
                 binary,
                 use_stdio,
-                exit_status
+                exit_status,
+                {env, build_env(Venv)}
             ],
+            PythonExe = get_python_exe(Python, Venv),
             try
-                Port = open_port({spawn_executable, Python}, PortOpts),
+                Port = open_port({spawn_executable, PythonExe}, PortOpts),
                 State = #state{port = Port, timeout = Timeout},
                 %% Get info to verify server started
                 Self = self(),
@@ -300,4 +320,26 @@ find_rerank_script() ->
             end
     end.
 
-%% @private - validate_model removed, barrel_vectordb_models is deprecated
+%% @private Build environment variables for Python port
+build_env(undefined) ->
+    [];
+build_env(Venv) ->
+    VenvBin = venv_bin_dir(Venv),
+    CurrentPath = os:getenv("PATH", ""),
+    [
+        {"VIRTUAL_ENV", Venv},
+        {"PATH", VenvBin ++ ":" ++ CurrentPath}
+    ].
+
+%% @private Get Python executable path
+get_python_exe(Python, undefined) ->
+    Python;
+get_python_exe(_Python, Venv) ->
+    filename:join(venv_bin_dir(Venv), "python").
+
+%% @private Get venv bin directory (cross-platform)
+venv_bin_dir(Venv) ->
+    case os:type() of
+        {win32, _} -> filename:join(Venv, "Scripts");
+        _ -> filename:join(Venv, "bin")
+    end.

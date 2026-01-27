@@ -45,6 +45,7 @@ RUN rebar3 get-deps
 # Copy source
 COPY src/ src/
 COPY include/ include/
+COPY c_src/ c_src/
 COPY priv/ priv/
 COPY config/ config/
 
