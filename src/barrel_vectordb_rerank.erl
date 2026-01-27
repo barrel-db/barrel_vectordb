@@ -101,8 +101,9 @@ init(Config) ->
 
     case ScriptPath of
         {ok, Script} ->
+            %% Use -u for unbuffered Python I/O - critical for port communication
             PortOpts = [
-                {args, [Script, Model]},
+                {args, ["-u", Script, Model]},
                 {line, 10000000},
                 binary,
                 use_stdio,
@@ -217,10 +218,21 @@ find_rerank_script() ->
 
 %% @private
 port_command_sync(Port, Request, Timeout) ->
+    %% Connect port to calling process to receive the response
+    %% This is needed because EUnit runs tests in separate processes
+    OldOwner = erlang:port_info(Port, connected),
+    Self = self(),
+    case OldOwner of
+        {connected, Self} ->
+            ok;
+        {connected, _Other} ->
+            true = erlang:port_connect(Port, Self)
+    end,
+
     Json = iolist_to_binary(json:encode(Request)),
     true = port_command(Port, [Json, "\n"]),
 
-    receive
+    Result = receive
         {Port, {data, {eol, Line}}} ->
             try
                 Response = json:decode(Line),
@@ -233,7 +245,17 @@ port_command_sync(Port, Request, Timeout) ->
             {error, {port_exited, Status}}
     after Timeout ->
         {error, timeout}
-    end.
+    end,
+
+    %% Restore original owner if we changed it
+    case OldOwner of
+        {connected, Self} ->
+            ok;
+        {connected, OldPid} when is_pid(OldPid) ->
+            catch erlang:port_connect(Port, OldPid)
+    end,
+
+    Result.
 
 %% @private
 validate_model(Model) ->
