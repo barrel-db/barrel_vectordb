@@ -48,10 +48,7 @@ handle(collection, <<"PUT">>, IsClustered, Req0, State) ->
     case read_json_body(Req0) of
         {ok, Body, Req1} ->
             case maybe_create_collection(IsClustered, Collection, Body) of
-                ok ->
-                    json_response(201, #{status => <<"created">>}, Req1, State);
-                {ok, _Meta} ->
-                    %% Clustered mode returns {ok, Meta}
+                {ok, _} ->
                     json_response(201, #{status => <<"created">>}, Req1, State);
                 {error, already_exists} ->
                     json_error(409, <<"already_exists">>, <<"Collection already exists">>, Req1, State);
@@ -266,7 +263,7 @@ maybe_create_collection(false, Collection, Body) ->
                     Config0#{diskann => DC}
             end,
             case barrel_vectordb:start_link(Config) of
-                {ok, _Pid} -> ok;
+                {ok, _Pid} -> {ok, created};
                 {error, _} = Error -> Error
             end;
         _Pid ->

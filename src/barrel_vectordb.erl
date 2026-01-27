@@ -194,7 +194,10 @@
     path => string(),
     dimensions => pos_integer(),
     embedder => embedder_config(),
-    hnsw => hnsw_config()
+    backend => hnsw | faiss | diskann,
+    hnsw => hnsw_config(),
+    faiss => faiss_config(),
+    diskann => diskann_config()
 }.
 %% Store configuration options.
 
@@ -213,10 +216,23 @@
 }.
 %% HNSW index parameters.
 
+-type faiss_config() :: #{
+    index_type => binary(),
+    nprobe => pos_integer()
+}.
+%% FAISS index parameters.
+
+-type diskann_config() :: #{
+    base_path => string() | binary(),
+    l => pos_integer(),
+    r => pos_integer()
+}.
+%% DiskANN index parameters.
+
 -export_type([
     store/0, id/0, text/0, vector/0, metadata/0,
     search_opts/0, search_result/0,
-    store_config/0, embedder_config/0, hnsw_config/0
+    store_config/0, embedder_config/0, hnsw_config/0, faiss_config/0, diskann_config/0
 ]).
 
 %%====================================================================
