@@ -644,10 +644,25 @@ build_collection_config(Params) ->
         undefined -> Config;
         Dim -> Config#{dimensions => Dim}
     end,
-    case maps:get(<<"embedder">>, Params, undefined) of
+    Config2 = case maps:get(<<"embedder">>, Params, undefined) of
         undefined -> Config1;
         EmbedConfig -> Config1#{embedder => parse_embedder_config(EmbedConfig)}
+    end,
+    %% Add backend config
+    Config3 = case maps:get(<<"backend">>, Params, undefined) of
+        undefined -> Config2;
+        Backend -> Config2#{backend => binary_to_backend(Backend)}
+    end,
+    case maps:get(<<"backend_config">>, Params, undefined) of
+        undefined -> Config3;
+        BackendConfig -> Config3#{backend_config => BackendConfig}
     end.
+
+%% @private Convert binary backend name to atom.
+binary_to_backend(<<"hnsw">>) -> hnsw;
+binary_to_backend(<<"faiss">>) -> faiss;
+binary_to_backend(<<"diskann">>) -> diskann;
+binary_to_backend(_) -> hnsw.
 
 %% @private Parse embedder config from JSON.
 parse_embedder_config(#{<<"type">> := <<"local">>} = Config) ->

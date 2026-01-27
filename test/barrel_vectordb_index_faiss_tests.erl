@@ -258,7 +258,9 @@ setup_faiss_store() ->
               integer_to_list(erlang:unique_integer([positive])),
 
     %% Mock embedder for deterministic tests
-    meck:new(barrel_vectordb_embed, [passthrough]),
+    (catch meck:unload(barrel_vectordb_embed)),
+    timer:sleep(10),
+    meck:new(barrel_vectordb_embed, [passthrough, no_link]),
     meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
         {ok, #{providers => [], dimension => 4, batch_size => 32}}
     end),

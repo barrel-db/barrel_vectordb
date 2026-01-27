@@ -59,6 +59,7 @@ ra_state_machine_test_() ->
         {"add node to empty state", fun test_add_node/0},
         {"remove node", fun test_remove_node/0},
         {"create collection", fun test_create_collection/0},
+        {"create collection with backend", fun test_create_collection_with_backend/0},
         {"delete collection", fun test_delete_collection/0}
      ]}.
 
@@ -103,6 +104,21 @@ test_create_collection() ->
         #{index => 1}, {create_collection, Name, Config, Placement}, State0),
     Collections = get_collections(State1),
     ?assert(maps:is_key(Name, Collections)).
+
+test_create_collection_with_backend() ->
+    State0 = barrel_vectordb_ra_sm:init(#{}),
+    Name = <<"test_collection_faiss">>,
+    Config = #{dimension => 768, shards => 2, replication_factor => 1,
+               backend => faiss, backend_config => #{index_type => <<"HNSW32">>}},
+    Placement = [{0, {barrel_vectordb, node()}, []}, {1, {barrel_vectordb, node()}, []}],
+    {State1, {ok, Meta}, _Effects} = barrel_vectordb_ra_sm:apply(
+        #{index => 1}, {create_collection, Name, Config, Placement}, State0),
+    Collections = get_collections(State1),
+    ?assert(maps:is_key(Name, Collections)),
+    %% Verify backend is stored in meta (element 8 is backend)
+    ?assertEqual(faiss, element(8, Meta)),
+    %% Verify backend_config is stored (element 9)
+    ?assertEqual(#{index_type => <<"HNSW32">>}, element(9, Meta)).
 
 test_delete_collection() ->
     State0 = barrel_vectordb_ra_sm:init(#{}),

@@ -52,11 +52,12 @@ setup_test() ->
         hnsw => #{m => 4, ef_construction => 20}
     },
 
-    %% Ensure meck is clean before starting
+    %% Ensure meck is clean before starting - be thorough
     (catch meck:unload(barrel_vectordb_embed)),
+    timer:sleep(10),  %% Allow meck to fully unload
 
     %% Start a mock embeddings server that just returns dummy vectors
-    meck:new(barrel_vectordb_embed, [non_strict]),
+    meck:new(barrel_vectordb_embed, [non_strict, no_link]),
     meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
         {ok, #{providers => [], dimension => 3, batch_size => 32}}
     end),

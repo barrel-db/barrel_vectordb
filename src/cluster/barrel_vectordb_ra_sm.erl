@@ -26,7 +26,9 @@
     num_shards :: pos_integer(),
     replication_factor :: pos_integer(),
     created_at :: integer(),
-    status :: creating | active | deleting
+    status :: creating | active | deleting,
+    backend = hnsw :: hnsw | faiss | diskann,
+    backend_config = #{} :: map()
 }).
 
 -record(shard_assignment, {
@@ -109,7 +111,9 @@ apply(_Meta, {create_collection, Name, Config, Placement}, State) ->
                 num_shards = maps:get(shards, Config, 1),
                 replication_factor = maps:get(replication_factor, Config, 1),
                 created_at = erlang:system_time(second),
-                status = creating
+                status = creating,
+                backend = maps:get(backend, Config, hnsw),
+                backend_config = maps:get(backend_config, Config, #{})
             },
             Collections = maps:put(Name, Meta, State#cluster_state.collections),
             %% Create shard assignments from placement

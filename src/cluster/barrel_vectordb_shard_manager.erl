@@ -119,7 +119,6 @@ init([]) ->
 
 handle_call({create_shards, CollectionName, CollectionMeta, Placement}, _From, State) ->
     LocalNodeId = barrel_vectordb_mesh:node_id(),
-    Dimension = element(3, CollectionMeta),  %% dimension field
 
     %% Find shards assigned to this node
     LocalShards = lists:filter(
@@ -136,7 +135,7 @@ handle_call({create_shards, CollectionName, CollectionMeta, Placement}, _From, S
                 LocalNodeId -> leader;
                 _ -> follower
             end,
-            case create_shard_store(State#state.data_dir, CollectionName, ShardIdx, Dimension) of
+            case create_shard_store(State#state.data_dir, CollectionName, ShardIdx, CollectionMeta) of
                 {ok, StoreName} ->
                     maps:put(ShardId, #{store => StoreName, role => Role}, Acc);
                 {error, _Reason} ->
@@ -207,7 +206,7 @@ handle_call(_Request, _From, State) ->
 
 handle_cast({update_assignments, CollectionName, Assignments}, State) ->
     LocalNodeId = barrel_vectordb_mesh:node_id(),
-    Dimension = get_collection_dimension(CollectionName),
+    CollectionMeta = get_collection_meta(CollectionName),
 
     NewShards = lists:foldl(
         fun({ShardIdx, Leader, Replicas}, Acc) ->
@@ -221,7 +220,7 @@ handle_cast({update_assignments, CollectionName, Assignments}, State) ->
             case {IsLocal, maps:get(ShardId, Acc, undefined)} of
                 {true, undefined} ->
                     %% New local shard, create it
-                    case create_shard_store(State#state.data_dir, CollectionName, ShardIdx, Dimension) of
+                    case create_shard_store(State#state.data_dir, CollectionName, ShardIdx, CollectionMeta) of
                         {ok, StoreName} ->
                             maps:put(ShardId, #{store => StoreName, role => Role}, Acc);
                         _ ->
@@ -275,7 +274,13 @@ terminate(_Reason, State) ->
 
 %% Internal functions
 
-create_shard_store(DataDir, CollectionName, ShardIdx, Dimension) ->
+create_shard_store(DataDir, CollectionName, ShardIdx, CollectionMeta) ->
+    %% Extract fields from collection_meta record
+    %% Record format: {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status, Backend, BackendConfig}
+    Dimension = element(3, CollectionMeta),
+    Backend = element(8, CollectionMeta),
+    BackendConfig = element(9, CollectionMeta),
+
     ShardName = iolist_to_binary([CollectionName, <<"_shard_">>, integer_to_binary(ShardIdx)]),
     StoreName = binary_to_atom(<<"barrel_vectordb_store_", ShardName/binary>>, utf8),
     StorePath = filename:join([DataDir, binary_to_list(CollectionName), "shard_" ++ integer_to_list(ShardIdx)]),
@@ -283,10 +288,23 @@ create_shard_store(DataDir, CollectionName, ShardIdx, Dimension) ->
     StoreConfig = #{
         name => StoreName,
         path => StorePath,
-        dimensions => Dimension
+        dimensions => Dimension,
+        backend => Backend
     },
 
-    case barrel_vectordb:start_link(StoreConfig) of
+    %% Add backend-specific config
+    StoreConfig1 = case Backend of
+        hnsw -> StoreConfig#{hnsw => BackendConfig};
+        faiss -> StoreConfig#{faiss => BackendConfig};
+        diskann ->
+            DC = case maps:is_key(base_path, BackendConfig) of
+                true -> BackendConfig;
+                false -> BackendConfig#{base_path => filename:join(StorePath, "diskann")}
+            end,
+            StoreConfig#{diskann => DC}
+    end,
+
+    case barrel_vectordb:start_link(StoreConfig1) of
         {ok, _Pid} ->
             {ok, StoreName};
         {error, {already_started, _}} ->
@@ -295,13 +313,18 @@ create_shard_store(DataDir, CollectionName, ShardIdx, Dimension) ->
             {error, Reason}
     end.
 
-get_collection_dimension(CollectionName) ->
+%% @private Get full collection metadata for a collection
+get_collection_meta(CollectionName) ->
     case barrel_vectordb_cluster_client:get_collections() of
         {ok, Collections} ->
             case maps:get(CollectionName, Collections, undefined) of
-                undefined -> 768;  %% Default
-                Meta -> element(3, Meta)  %% dimension field
+                undefined ->
+                    %% Return default meta structure
+                    %% {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status, Backend, BackendConfig}
+                    {collection_meta, CollectionName, 768, 1, 1, 0, active, hnsw, #{}};
+                Meta ->
+                    Meta
             end;
         _ ->
-            768
+            {collection_meta, CollectionName, 768, 1, 1, 0, active, hnsw, #{}}
     end.

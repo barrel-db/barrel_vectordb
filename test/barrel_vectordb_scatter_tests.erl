@@ -55,12 +55,20 @@ scatter_test_() ->
 %%====================================================================
 
 setup() ->
-    meck:new(barrel_vectordb_cluster_client, [passthrough]),
-    meck:new(barrel_vectordb_shard_manager, [passthrough]),
-    meck:new(barrel_vectordb_shard_locator, [passthrough]),
-    meck:new(barrel_vectordb_embed, [passthrough]),
-    meck:new(barrel_vectordb, [passthrough]),
-    meck:new(rpc, [unstick, passthrough]),
+    %% Ensure clean state
+    (catch meck:unload(barrel_vectordb_cluster_client)),
+    (catch meck:unload(barrel_vectordb_shard_manager)),
+    (catch meck:unload(barrel_vectordb_shard_locator)),
+    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_vectordb)),
+    (catch meck:unload(rpc)),
+    timer:sleep(10),
+    meck:new(barrel_vectordb_cluster_client, [passthrough, no_link]),
+    meck:new(barrel_vectordb_shard_manager, [passthrough, no_link]),
+    meck:new(barrel_vectordb_shard_locator, [passthrough, no_link]),
+    meck:new(barrel_vectordb_embed, [passthrough, no_link]),
+    meck:new(barrel_vectordb, [passthrough, no_link]),
+    meck:new(rpc, [unstick, passthrough, no_link]),
     ok.
 
 cleanup(_) ->

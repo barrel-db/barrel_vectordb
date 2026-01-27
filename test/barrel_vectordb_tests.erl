@@ -58,9 +58,10 @@ setup_test() ->
 
     %% Ensure meck is clean before starting
     (catch meck:unload(barrel_vectordb_embed)),
+    timer:sleep(10),
 
     %% Mock the embedder to return deterministic vectors
-    meck:new(barrel_vectordb_embed, [passthrough]),
+    meck:new(barrel_vectordb_embed, [passthrough, no_link]),
     meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
         {ok, #{providers => [], dimension => 3, batch_size => 32}}
     end),

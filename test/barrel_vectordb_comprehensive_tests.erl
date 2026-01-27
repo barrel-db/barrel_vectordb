@@ -84,9 +84,10 @@ setup_test() ->
 
     %% Ensure meck is clean
     (catch meck:unload(barrel_vectordb_embed)),
+    timer:sleep(10),
 
     %% Mock embedder with deterministic vectors based on text hash
-    meck:new(barrel_vectordb_embed, [passthrough]),
+    meck:new(barrel_vectordb_embed, [passthrough, no_link]),
     meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
         {ok, #{providers => [], dimension => 8, batch_size => 32}}
     end),

@@ -235,10 +235,14 @@ maybe_get_collection(false, Collection) ->
     end.
 
 maybe_create_collection(true, Collection, Body) ->
+    Backend = binary_to_backend(maps:get(<<"backend">>, Body, <<"hnsw">>)),
+    BackendConfig = maps:get(<<"backend_config">>, Body, #{}),
     Opts = #{
         dimension => maps:get(<<"dimensions">>, Body, 768),
         shards => maps:get(<<"num_shards">>, Body, 4),
-        replication_factor => maps:get(<<"replication_factor">>, Body, 2)
+        replication_factor => maps:get(<<"replication_factor">>, Body, 2),
+        backend => Backend,
+        backend_config => BackendConfig
     },
     barrel_vectordb:create_collection(Collection, Opts);
 maybe_create_collection(false, Collection, Body) ->
@@ -247,7 +251,20 @@ maybe_create_collection(false, Collection, Body) ->
         undefined ->
             Dimension = maps:get(<<"dimensions">>, Body, 768),
             Path = maps:get(<<"path">>, Body, default_path(Collection)),
-            Config = #{name => StoreName, path => Path, dimensions => Dimension},
+            Backend = binary_to_backend(maps:get(<<"backend">>, Body, <<"hnsw">>)),
+            BackendConfig = maps:get(<<"backend_config">>, Body, #{}),
+
+            Config0 = #{name => StoreName, path => Path, dimensions => Dimension, backend => Backend},
+            Config = case Backend of
+                hnsw -> Config0#{hnsw => BackendConfig};
+                faiss -> Config0#{faiss => BackendConfig};
+                diskann ->
+                    DC = case maps:is_key(<<"base_path">>, BackendConfig) of
+                        true -> BackendConfig;
+                        false -> BackendConfig#{base_path => filename:join(Path, "diskann")}
+                    end,
+                    Config0#{diskann => DC}
+            end,
             case barrel_vectordb:start_link(Config) of
                 {ok, _Pid} -> ok;
                 {error, _} = Error -> Error
@@ -255,6 +272,11 @@ maybe_create_collection(false, Collection, Body) ->
         _Pid ->
             {error, already_exists}
     end.
+
+binary_to_backend(<<"hnsw">>) -> hnsw;
+binary_to_backend(<<"faiss">>) -> faiss;
+binary_to_backend(<<"diskann">>) -> diskann;
+binary_to_backend(_) -> hnsw.
 
 maybe_delete_collection(true, Collection) ->
     barrel_vectordb:delete_collection(Collection);
@@ -390,14 +412,16 @@ format_node_id(Node) when is_atom(Node) ->
 
 %% @private Convert collection_meta record to JSON-serializable map
 format_collection_meta(Meta) when is_tuple(Meta), element(1, Meta) =:= collection_meta ->
-    %% collection_meta record: {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status}
+    %% collection_meta record: {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status, Backend, BackendConfig}
     #{
         <<"name">> => element(2, Meta),
         <<"dimension">> => element(3, Meta),
         <<"num_shards">> => element(4, Meta),
         <<"replication_factor">> => element(5, Meta),
         <<"created_at">> => element(6, Meta),
-        <<"status">> => atom_to_binary(element(7, Meta), utf8)
+        <<"status">> => atom_to_binary(element(7, Meta), utf8),
+        <<"backend">> => atom_to_binary(element(8, Meta), utf8),
+        <<"backend_config">> => element(9, Meta)
     };
 format_collection_meta(Meta) when is_map(Meta) ->
     %% Already a map, just ensure atoms are converted
