@@ -311,9 +311,31 @@ check_local_available() ->
 
 local_config() ->
     %% Allow custom Python path via BARREL_PYTHON env var
+    %% Falls back to .venv/bin/python if available
     case os:getenv("BARREL_PYTHON") of
-        false -> #{};
+        false ->
+            case find_venv_python() of
+                {ok, Python} -> #{python => Python};
+                not_found -> #{}
+            end;
         Python -> #{python => Python}
+    end.
+
+find_venv_python() ->
+    %% Try common venv paths relative to test run directory
+    VenvPaths = [
+        ".venv/bin/python",
+        "../.venv/bin/python",
+        "../../.venv/bin/python"
+    ],
+    find_first_file(VenvPaths).
+
+find_first_file([]) ->
+    not_found;
+find_first_file([Path | Rest]) ->
+    case filelib:is_file(Path) of
+        true -> {ok, Path};
+        false -> find_first_file(Rest)
     end.
 
 check_ollama_available() ->

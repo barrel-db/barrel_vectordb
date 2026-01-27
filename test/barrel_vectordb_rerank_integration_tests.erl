@@ -35,7 +35,8 @@ rerank_integration_test_() ->
                      {timeout, 60, {"Basic reranking", fun() -> test_rerank_basic(State) end}},
                      {timeout, 60, {"Rerank with top_k", fun() -> test_rerank_top_k(State) end}},
                      {timeout, 60, {"Rerank empty documents", fun() -> test_rerank_empty_docs(State) end}},
-                     {timeout, 60, {"Rerank single document", fun() -> test_rerank_single_doc(State) end}}
+                     {timeout, 60, {"Rerank single document", fun() -> test_rerank_single_doc(State) end}},
+                     {timeout, 60, {"Concurrent rerank requests", fun() -> test_rerank_concurrent(State) end}}
                  ]
          end
      end}.
@@ -48,11 +49,9 @@ setup() ->
     Python = get_python(),
     case check_python_deps(Python) of
         ok ->
-            %% Initialize the python queue (required for rerank concurrency control)
-            barrel_embed_python_queue:init(),
-            case barrel_vectordb_rerank:init(#{python => Python}) of
-                {ok, State} ->
-                    State;
+            case barrel_vectordb_rerank:start_link(#{python => Python}) of
+                {ok, Server} ->
+                    Server;
                 {error, Reason} ->
                     io:format(standard_error,
                               "~n*** Skipping rerank integration tests: ~p~n", [Reason]),
@@ -66,18 +65,18 @@ setup() ->
 
 cleanup(skip) ->
     ok;
-cleanup(State) ->
-    barrel_vectordb_rerank:stop(State).
+cleanup(Server) ->
+    barrel_vectordb_rerank:stop(Server).
 
 %%====================================================================
 %% Tests
 %%====================================================================
 
-test_rerank_init(State) ->
-    %% Just verify the state is valid from setup
-    ?assertEqual(true, barrel_vectordb_rerank:available(State)).
+test_rerank_init(Server) ->
+    %% Just verify the server is available from setup
+    ?assertEqual(true, barrel_vectordb_rerank:available(Server)).
 
-test_rerank_basic(State) ->
+test_rerank_basic(Server) ->
     Query = <<"What is machine learning?">>,
     Documents = [
         <<"Machine learning is a subset of artificial intelligence that enables systems to learn from data.">>,
@@ -85,7 +84,7 @@ test_rerank_basic(State) ->
         <<"Deep learning uses neural networks with many layers to process complex patterns.">>
     ],
 
-    {ok, Results} = barrel_vectordb_rerank:rerank(Query, Documents, State),
+    {ok, Results} = barrel_vectordb_rerank:rerank(Server, Query, Documents),
 
     %% Should return all 3 documents
     ?assertEqual(3, length(Results)),
@@ -101,7 +100,7 @@ test_rerank_basic(State) ->
 
     ok.
 
-test_rerank_top_k(State) ->
+test_rerank_top_k(Server) ->
     Query = <<"database query optimization">>,
     Documents = [
         <<"SQL databases use indexes to speed up queries.">>,
@@ -112,7 +111,7 @@ test_rerank_top_k(State) ->
     ],
 
     %% Request only top 2 results
-    {ok, Results} = barrel_vectordb_rerank:rerank(Query, Documents, #{top_k => 2}, State),
+    {ok, Results} = barrel_vectordb_rerank:rerank(Server, Query, Documents, #{top_k => 2}),
 
     %% Should return exactly 2 results
     ?assertEqual(2, length(Results)),
@@ -123,21 +122,21 @@ test_rerank_top_k(State) ->
 
     ok.
 
-test_rerank_empty_docs(State) ->
+test_rerank_empty_docs(Server) ->
     Query = <<"test query">>,
     Documents = [],
 
-    {ok, Results} = barrel_vectordb_rerank:rerank(Query, Documents, State),
+    {ok, Results} = barrel_vectordb_rerank:rerank(Server, Query, Documents),
 
     ?assertEqual([], Results),
 
     ok.
 
-test_rerank_single_doc(State) ->
+test_rerank_single_doc(Server) ->
     Query = <<"search query">>,
     Documents = [<<"This is the only document.">>],
 
-    {ok, Results} = barrel_vectordb_rerank:rerank(Query, Documents, State),
+    {ok, Results} = barrel_vectordb_rerank:rerank(Server, Query, Documents),
 
     ?assertEqual(1, length(Results)),
     [{0, Score}] = Results,
@@ -145,9 +144,49 @@ test_rerank_single_doc(State) ->
 
     ok.
 
+test_rerank_concurrent(Server) ->
+    %% Test that concurrent requests are handled correctly
+    Self = self(),
+    Query1 = <<"What is machine learning?">>,
+    Docs1 = [<<"ML is AI">>, <<"Python is a language">>],
+    Query2 = <<"What is database?">>,
+    Docs2 = [<<"SQL stores data">>, <<"Java is a language">>],
+
+    %% Spawn concurrent requests
+    spawn(fun() ->
+        Result = barrel_vectordb_rerank:rerank(Server, Query1, Docs1),
+        Self ! {1, Result}
+    end),
+    spawn(fun() ->
+        Result = barrel_vectordb_rerank:rerank(Server, Query2, Docs2),
+        Self ! {2, Result}
+    end),
+
+    %% Collect results
+    Results = receive_results(2, #{}),
+
+    %% Both should succeed
+    {ok, R1} = maps:get(1, Results),
+    {ok, R2} = maps:get(2, Results),
+
+    ?assertEqual(2, length(R1)),
+    ?assertEqual(2, length(R2)),
+
+    ok.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+receive_results(0, Acc) ->
+    Acc;
+receive_results(N, Acc) ->
+    receive
+        {Id, Result} ->
+            receive_results(N - 1, Acc#{Id => Result})
+    after 30000 ->
+        error(timeout_waiting_for_results)
+    end.
 
 %% @doc Get the Python executable to use.
 %% Tries project venv first, then falls back to system python.

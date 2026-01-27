@@ -240,25 +240,3 @@ Index2 = barrel_vectordb_bm25:add(Index1, <<"doc2">>, <<"The lazy dog">>).
 
 !!! note
     BM25 index is in-memory and not persisted. Rebuild from documents on startup.
-
-## Model Registry
-
-Query available models programmatically:
-
-```erlang
-%% List all model types
-barrel_vectordb_models:types().
-%% => [text, sparse, late_interaction, image, rerank]
-
-%% List models by type
-{ok, Models} = barrel_vectordb_models:list(text).
-
-%% Get model info
-{ok, Info} = barrel_vectordb_models:info(<<"BAAI/bge-base-en-v1.5">>).
-%% => #{name => ..., dimensions => 768, max_tokens => 512, ...}
-
-%% Get embedder config for a model
-{ok, Config} = barrel_vectordb_models:embedder_config(<<"BAAI/bge-base-en-v1.5">>).
-```
-
-See `priv/models.json` for the complete model catalog.

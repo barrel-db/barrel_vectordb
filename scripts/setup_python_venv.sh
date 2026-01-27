@@ -28,7 +28,7 @@ source "$VENV_DIR/bin/activate"
 
 echo "Installing dependencies..."
 pip install --upgrade pip
-pip install transformers torch sentence-transformers
+pip install transformers torch sentence-transformers requests
 
 # Optional: uvloop for better async performance
 pip install uvloop 2>/dev/null || echo "Note: uvloop not available (optional, improves async performance)"

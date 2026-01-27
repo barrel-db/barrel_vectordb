@@ -1,9 +1,13 @@
 %%%-------------------------------------------------------------------
-%%% @doc Cross-encoder reranking module
+%%% @doc Async cross-encoder reranking server with request multiplexing
 %%%
-%%% Provides reranking of search results using cross-encoder models.
+%%% A gen_server that manages communication with a Python cross-encoder
+%%% server. Supports concurrent requests by tracking request IDs and
+%%% routing responses back to the correct callers.
+%%%
 %%% Cross-encoders score query-document pairs directly, providing more
-%%% accurate relevance scores than bi-encoder similarity.
+%%% accurate relevance scores than bi-encoder similarity for reranking
+%%% candidate results.
 %%%
 %%% == Requirements ==
 %%% ```
@@ -12,19 +16,22 @@
 %%%
 %%% == Usage ==
 %%% ```
-%%% %% Initialize reranker
-%%% {ok, State} = barrel_vectordb_rerank:init(#{}).
+%%% %% Start the reranker
+%%% {ok, Server} = barrel_vectordb_rerank:start_link(#{}).
 %%%
-%%% %% Rerank search results
-%%% Query = <<"What is machine learning?">>,
-%%% Documents = [
-%%%     <<"Machine learning is a subset of AI...">>,
-%%%     <<"Deep learning uses neural networks...">>,
-%%%     <<"Python is a programming language...">>
-%%% ],
-%%% {ok, Ranked} = barrel_vectordb_rerank:rerank(Query, Documents, State),
-%%% %% Returns: [{0, 0.95}, {1, 0.82}, {2, 0.15}]
+%%% %% Make concurrent rerank requests
+%%% spawn(fun() -> barrel_vectordb_rerank:rerank(Server, Query1, Docs1) end).
+%%% spawn(fun() -> barrel_vectordb_rerank:rerank(Server, Query2, Docs2) end).
+%%%
+%%% %% Stop when done
+%%% barrel_vectordb_rerank:stop(Server).
 %%% '''
+%%%
+%%% == Request Multiplexing ==
+%%% Multiple Erlang processes can call rerank/3,4 concurrently.
+%%% Each request is assigned a unique ID and sent to Python. The
+%%% Python server includes the ID in its response, allowing this
+%%% gen_server to route responses to the correct waiting callers.
 %%%
 %%% == Configuration ==
 %%% ```
@@ -49,7 +56,7 @@
 %%%
 %%% %% Stage 2: Rerank top candidates
 %%% Docs = [maps:get(text, C) || C <- Candidates],
-%%% {ok, Ranked} = barrel_vectordb_rerank:rerank(Query, Docs, RerankerState),
+%%% {ok, Ranked} = barrel_vectordb_rerank:rerank(Server, Query, Docs),
 %%%
 %%% %% Get top 10 after reranking
 %%% Top10Indices = [Idx || {Idx, _Score} <- lists:sublist(Ranked, 10)],
@@ -59,49 +66,95 @@
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_vectordb_rerank).
+-behaviour(gen_server).
 
+%% API
 -export([
-    init/1,
+    start_link/1,
     rerank/3,
     rerank/4,
+    info/1,
+    info/2,
     available/1,
     stop/1
 ]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(DEFAULT_PYTHON, "python3").
 -define(DEFAULT_MODEL, "cross-encoder/ms-marco-MiniLM-L-6-v2").
 -define(DEFAULT_TIMEOUT, 120000).
 
--type rerank_state() :: #{
-    port := port(),
-    model := binary(),
-    timeout := pos_integer()
-}.
+-record(state, {
+    port :: port(),
+    pending = #{} :: #{integer() => {pid(), reference()}},
+    next_id = 1 :: integer(),
+    timeout :: timeout(),
+    buffer = <<>> :: binary(),
+    model :: binary()
+}).
 
 -type rerank_result() :: {Index :: non_neg_integer(), Score :: float()}.
-
--export_type([rerank_state/0, rerank_result/0]).
+-export_type([rerank_result/0]).
 
 %%====================================================================
 %% API
 %%====================================================================
 
-%% @doc Initialize the reranker.
--spec init(map()) -> {ok, rerank_state()} | {error, term()}.
+%% @doc Start the rerank server.
+-spec start_link(map()) -> {ok, pid()} | {error, term()}.
+start_link(Config) ->
+    gen_server:start_link(?MODULE, Config, []).
+
+%% @doc Rerank documents by relevance to query.
+%% Returns list of {Index, Score} tuples sorted by score descending.
+-spec rerank(pid(), binary(), [binary()]) ->
+    {ok, [rerank_result()]} | {error, term()}.
+rerank(Server, Query, Documents) ->
+    rerank(Server, Query, Documents, #{}).
+
+%% @doc Rerank documents with options.
+%% Options:
+%%   - top_k: Limit number of results returned
+%%   - timeout: Override default timeout
+-spec rerank(pid(), binary(), [binary()], map()) ->
+    {ok, [rerank_result()]} | {error, term()}.
+rerank(Server, Query, Documents, Options) ->
+    Timeout = maps:get(timeout, Options, ?DEFAULT_TIMEOUT),
+    gen_server:call(Server, {rerank, Query, Documents, Options}, Timeout).
+
+%% @doc Get model info.
+-spec info(pid()) -> {ok, map()} | {error, term()}.
+info(Server) ->
+    info(Server, ?DEFAULT_TIMEOUT).
+
+%% @doc Get model info with timeout.
+-spec info(pid(), timeout()) -> {ok, map()} | {error, term()}.
+info(Server, Timeout) ->
+    gen_server:call(Server, info, Timeout).
+
+%% @doc Check if reranker is available.
+-spec available(pid()) -> boolean().
+available(Server) ->
+    is_process_alive(Server).
+
+%% @doc Stop the reranker and close the port.
+-spec stop(pid()) -> ok.
+stop(Server) ->
+    gen_server:stop(Server).
+
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
+
 init(Config) ->
     Python = maps:get(python, Config, ?DEFAULT_PYTHON),
     Model = maps:get(model, Config, ?DEFAULT_MODEL),
     Timeout = maps:get(timeout, Config, ?DEFAULT_TIMEOUT),
 
-    %% Validate model against registry (warning only)
-    validate_model(Model),
-
-    %% Find the Python script
-    ScriptPath = find_rerank_script(),
-
-    case ScriptPath of
+    case find_rerank_script() of
         {ok, Script} ->
-            %% Use -u for unbuffered Python I/O - critical for port communication
             PortOpts = [
                 {args, ["-u", Script, Model]},
                 {line, 10000000},
@@ -111,90 +164,121 @@ init(Config) ->
             ],
             try
                 Port = open_port({spawn_executable, Python}, PortOpts),
-                case port_command_sync(Port, #{action => info}, Timeout) of
-                    {ok, #{<<"ok">> := true, <<"model">> := ModelName}} ->
-                        State = #{
-                            port => Port,
-                            model => ModelName,
-                            timeout => Timeout
-                        },
-                        {ok, State};
-                    {ok, #{<<"ok">> := false, <<"error">> := Err}} ->
-                        catch port_close(Port),
-                        {error, {python_error, Err}};
-                    {error, Reason} ->
-                        catch port_close(Port),
-                        {error, Reason}
+                State = #state{port = Port, timeout = Timeout},
+                %% Get info to verify server started
+                Self = self(),
+                From = {Self, make_ref()},
+                case send_request(info, #{}, From, State) of
+                    {noreply, State1} ->
+                        %% Wait for the info response
+                        receive
+                            {Port, {data, {eol, Line}}} ->
+                                case json:decode(Line) of
+                                    #{<<"ok">> := true, <<"model">> := ModelName} ->
+                                        %% Clear pending since we handled inline
+                                        {ok, State1#state{model = ModelName, pending = #{}}};
+                                    #{<<"ok">> := false, <<"error">> := Err} ->
+                                        port_close(Port),
+                                        {stop, {python_error, Err}}
+                                end
+                        after Timeout ->
+                            port_close(Port),
+                            {stop, timeout}
+                        end
                 end
             catch
                 error:PortReason ->
-                    {error, {port_open_failed, PortReason}}
+                    {stop, {port_open_failed, PortReason}}
             end;
-        {error, ScriptError} ->
-            {error, ScriptError}
+        {error, Reason} ->
+            {stop, Reason}
     end.
 
-%% @doc Rerank documents by relevance to query.
-%% Returns list of {Index, Score} tuples sorted by score descending.
--spec rerank(binary(), [binary()], rerank_state()) ->
-    {ok, [rerank_result()]} | {error, term()}.
-rerank(Query, Documents, State) ->
-    rerank(Query, Documents, #{}, State).
+handle_call({rerank, Query, Documents, Options}, From, State) ->
+    Request = #{query => Query, documents => Documents},
+    Request1 = case maps:get(top_k, Options, undefined) of
+        undefined -> Request;
+        TopK -> Request#{top_k => TopK}
+    end,
+    send_request(rerank, Request1, From, State);
 
-%% @doc Rerank documents with options.
-%% Options:
-%%   - top_k: Limit number of results returned
--spec rerank(binary(), [binary()], map(), rerank_state()) ->
-    {ok, [rerank_result()]} | {error, term()}.
-rerank(Query, Documents, Options, #{port := Port, timeout := Timeout}) ->
-    case barrel_embed_python_queue:acquire(Timeout) of
-        ok ->
-            try
-                Request = #{
-                    action => rerank,
-                    query => Query,
-                    documents => Documents
-                },
-                Request1 = case maps:get(top_k, Options, undefined) of
-                    undefined -> Request;
-                    TopK -> Request#{top_k => TopK}
-                end,
-                case port_command_sync(Port, Request1, Timeout) of
-                    {ok, #{<<"ok">> := true, <<"results">> := Results}} ->
-                        Parsed = [{maps:get(<<"index">>, R), maps:get(<<"score">>, R)} || R <- Results],
-                        {ok, Parsed};
-                    {ok, #{<<"ok">> := false, <<"error">> := Err}} ->
-                        {error, {python_error, Err}};
-                    {error, Reason} ->
-                        {error, Reason}
-                end
-            after
-                barrel_embed_python_queue:release()
-            end;
-        {error, timeout} ->
-            {error, queue_timeout}
-    end;
-rerank(_Query, _Documents, _Options, _State) ->
-    {error, not_initialized}.
+handle_call(info, From, State) ->
+    send_request(info, #{}, From, State).
 
-%% @doc Check if reranker is available.
--spec available(rerank_state() | map()) -> boolean().
-available(#{port := Port}) ->
-    erlang:port_info(Port) =/= undefined;
-available(_) ->
-    false.
+handle_cast(_Msg, State) ->
+    {noreply, State}.
 
-%% @doc Stop the reranker and close the port.
--spec stop(rerank_state()) -> ok.
-stop(#{port := Port}) ->
+handle_info({Port, {data, {eol, Line}}}, #state{port = Port, buffer = Buffer} = State) ->
+    %% Combine any buffered partial line with this line
+    FullLine = <<Buffer/binary, Line/binary>>,
+    handle_response(FullLine, State#state{buffer = <<>>});
+
+handle_info({Port, {data, {noeol, Chunk}}}, #state{port = Port, buffer = Buffer} = State) ->
+    %% Accumulate partial data
+    {noreply, State#state{buffer = <<Buffer/binary, Chunk/binary>>}};
+
+handle_info({Port, {exit_status, Status}}, #state{port = Port, pending = Pending} = State) ->
+    %% Fail all pending requests
+    maps:foreach(fun(_, From) ->
+        gen_server:reply(From, {error, {port_exited, Status}})
+    end, Pending),
+    {stop, {port_exited, Status}, State#state{pending = #{}}};
+
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, #state{port = Port}) ->
     catch port_close(Port),
-    ok;
-stop(_) ->
     ok.
 
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% @private
+send_request(Action, Params, From, #state{port = Port, pending = Pending, next_id = Id} = State) ->
+    Request = Params#{id => Id, action => Action},
+    Json = json:encode(Request),
+    port_command(Port, [Json, "\n"]),
+    NewPending = Pending#{Id => From},
+    {noreply, State#state{pending = NewPending, next_id = Id + 1}}.
+
+%% @private
+handle_response(Line, #state{pending = Pending} = State) ->
+    try
+        Response = json:decode(Line),
+        case maps:get(<<"id">>, Response, undefined) of
+            undefined ->
+                %% No ID in response, ignore
+                {noreply, State};
+            Id ->
+                case maps:take(Id, Pending) of
+                    {From, NewPending} ->
+                        Result = decode_response(Response),
+                        gen_server:reply(From, Result),
+                        {noreply, State#state{pending = NewPending}};
+                    error ->
+                        %% Unknown ID, ignore
+                        {noreply, State}
+                end
+        end
+    catch
+        _:_ ->
+            %% JSON decode failed, ignore
+            {noreply, State}
+    end.
+
+%% @private
+decode_response(#{<<"ok">> := true, <<"results">> := Results}) ->
+    {ok, [{maps:get(<<"index">>, R), maps:get(<<"score">>, R)} || R <- Results]};
+decode_response(#{<<"ok">> := true, <<"model">> := Model, <<"type">> := Type}) ->
+    {ok, #{model => Model, type => Type}};
+decode_response(#{<<"ok">> := true} = R) ->
+    {ok, R};
+decode_response(#{<<"ok">> := false, <<"error">> := Err}) ->
+    {error, {python_error, Err}};
+decode_response(_) ->
+    {error, invalid_response}.
 
 %% @private
 find_rerank_script() ->
@@ -216,60 +300,4 @@ find_rerank_script() ->
             end
     end.
 
-%% @private
-port_command_sync(Port, Request, Timeout) ->
-    %% Connect port to calling process to receive the response
-    %% This is needed because EUnit runs tests in separate processes
-    OldOwner = erlang:port_info(Port, connected),
-    Self = self(),
-    case OldOwner of
-        {connected, Self} ->
-            ok;
-        {connected, _Other} ->
-            true = erlang:port_connect(Port, Self)
-    end,
-
-    Json = iolist_to_binary(json:encode(Request)),
-    true = port_command(Port, [Json, "\n"]),
-
-    Result = receive
-        {Port, {data, {eol, Line}}} ->
-            try
-                Response = json:decode(Line),
-                {ok, Response}
-            catch
-                _:Reason ->
-                    {error, {json_decode_failed, Reason}}
-            end;
-        {Port, {exit_status, Status}} ->
-            {error, {port_exited, Status}}
-    after Timeout ->
-        {error, timeout}
-    end,
-
-    %% Restore original owner if we changed it
-    case OldOwner of
-        {connected, Self} ->
-            ok;
-        {connected, OldPid} when is_pid(OldPid) ->
-            catch erlang:port_connect(Port, OldPid)
-    end,
-
-    Result.
-
-%% @private
-validate_model(Model) ->
-    ModelBin = to_binary(Model),
-    case barrel_vectordb_models:is_known(ModelBin) of
-        true -> ok;
-        false ->
-            error_logger:warning_msg(
-                "Model ~s is not in the registry. "
-                "It may still work if it's a valid reranking model.~n",
-                [ModelBin]
-            )
-    end.
-
-%% @private
-to_binary(S) when is_binary(S) -> S;
-to_binary(S) when is_list(S) -> list_to_binary(S).
+%% @private - validate_model removed, barrel_vectordb_models is deprecated

@@ -531,38 +531,6 @@ Stats = barrel_vectordb_bm25:stats(Index2).
 
 **Note:** BM25 index is in-memory and not persisted. Rebuild from documents on startup.
 
-## Model Registry
-
-Query available models programmatically.
-
-```erlang
-%% List all model types
-barrel_vectordb_models:types().
-%% => [text, sparse, late_interaction, image, rerank]
-
-%% List models by type
-{ok, Models} = barrel_vectordb_models:list(text).
-%% => [#{name => <<"BAAI/bge-base-en-v1.5">>, dimensions => 768, ...}, ...]
-
-%% Get model info
-{ok, Info} = barrel_vectordb_models:info(<<"BAAI/bge-base-en-v1.5">>).
-%% => #{name => ..., dimensions => 768, max_tokens => 512, ...}
-
-%% Get default model for a type
-{ok, Default} = barrel_vectordb_models:default(text).
-%% => #{name => <<"BAAI/bge-base-en-v1.5">>, ...}
-
-%% Check if model is known
-barrel_vectordb_models:is_known(<<"BAAI/bge-base-en-v1.5">>).
-%% => true
-
-%% Get embedder config for a model
-{ok, Config} = barrel_vectordb_models:embedder_config(<<"BAAI/bge-base-en-v1.5">>).
-%% => {local, #{model => <<"BAAI/bge-base-en-v1.5">>, dimension => 768}}
-```
-
-See `priv/models.json` for the complete model catalog.
-
 ## Search Options
 
 | Option | Default | Description |
