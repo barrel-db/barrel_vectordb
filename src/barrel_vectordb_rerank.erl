@@ -92,7 +92,7 @@
     next_id = 1 :: integer(),
     timeout :: timeout(),
     buffer = <<>> :: binary(),
-    model :: binary()
+    model :: binary() | undefined
 }).
 
 -type rerank_result() :: {Index :: non_neg_integer(), Score :: float()}.
