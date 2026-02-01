@@ -155,6 +155,7 @@ barrel_vectordb_mesh:create_collection(<<"my_collection">>, #{
 ```
 
 Each shard automatically gets its own isolated DiskANN index with:
+
 - Own vector files on disk (`StorePath/diskann/`)
 - Own graph structure (disk + ETS cache)
 - Own hot layer for fast writes
