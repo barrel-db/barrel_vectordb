@@ -408,3 +408,108 @@ For 1M documents with average 100 terms each:
 - Postings: ~5 GB
 - Block-max: ~100 MB
 - ID mapping: ~50 MB
+
+## Testing
+
+The BM25 implementation includes tests for formula correctness and relevance quality.
+
+### Running BM25 Tests
+
+```bash
+# Formula correctness tests (11 tests)
+rebar3 eunit --module=barrel_vectordb_bm25_formula_tests
+
+# Corpus-based relevance tests (10 tests)
+rebar3 eunit --module=barrel_vectordb_bm25_corpus_tests
+
+# Both modules
+rebar3 eunit --module=barrel_vectordb_bm25_formula_tests,barrel_vectordb_bm25_corpus_tests
+
+# All BM25 tests (includes memory backend tests)
+rebar3 eunit --module=barrel_vectordb_bm25_tests,barrel_vectordb_bm25_disk_tests,barrel_vectordb_bm25_formula_tests,barrel_vectordb_bm25_corpus_tests
+```
+
+### Formula Correctness Tests
+
+Located in `test/barrel_vectordb_bm25_formula_tests.erl`, these tests verify the BM25 scoring formula with hand-calculated expected values:
+
+| Test | Description |
+|------|-------------|
+| `single_term_single_doc` | Verifies basic BM25 score calculation |
+| `multi_term_score` | Scores should sum across query terms |
+| `tf_impact` | Higher TF should increase score |
+| `idf_impact` | Rare terms should have higher IDF contribution |
+| `doc_length_normalization` | Shorter docs favored with equal TF |
+| `k1_parameter` | k1=0 saturates TF immediately, k1=high allows more TF effect |
+| `b_parameter` | b=0 no length normalization, b=1 full normalization |
+| `tf_saturation` | Score(TF=10) < 2 × Score(TF=5) due to diminishing returns |
+| `edge_cases` | Empty queries, missing terms, single doc corpus |
+| `hand_calculated_example` | Full worked example from documentation |
+| `backend_consistency` | Memory and disk backends produce identical scores |
+
+### Corpus-Based Relevance Tests
+
+Located in `test/barrel_vectordb_bm25_corpus_tests.erl`, these tests evaluate search quality using IR metrics:
+
+**Test Corpus:** 100 documents across 5 topic clusters:
+
+- Erlang/OTP (docs 1-20)
+- Python/Data Science (docs 21-40)
+- Java/Enterprise (docs 41-60)
+- Distributed Systems (docs 61-80)
+- General Programming (docs 81-100)
+
+**Test Queries:** 20 queries with relevance judgments covering:
+
+- Single-term topic queries
+- Multi-term queries
+- Cross-topic queries
+- Rare term queries (high IDF)
+- Common term queries (low IDF)
+
+**Metrics Evaluated:**
+
+| Test | Description |
+|------|-------------|
+| `precision_at_5` | P@5 averaged across all queries |
+| `precision_at_10` | P@10 averaged across all queries |
+| `recall_at_10` | R@10 for highly relevant documents |
+| `ndcg_at_10` | Normalized DCG with graded relevance |
+| `relevant_in_top_k` | At least one relevant doc in top 5 for topic queries |
+| `ranking_order` | Results sorted by descending score |
+| `cross_topic_queries` | Queries matching multiple topic clusters |
+| `rare_term_queries` | High IDF queries return correct results |
+| `memory_disk_consistency` | Both backends produce similar results |
+
+### Test Data Files
+
+| File | Description |
+|------|-------------|
+| `test/data/bm25_test_corpus.terms` | 100 documents in Erlang term format |
+| `test/data/bm25_test_queries.terms` | 20 queries with relevance judgments |
+
+### Adding Custom Test Documents
+
+The corpus file uses Erlang term format:
+
+```erlang
+%% test/data/bm25_test_corpus.terms
+[
+    {<<"doc1">>, <<"Your document text here">>},
+    {<<"doc2">>, <<"Another document">>},
+    ...
+].
+```
+
+Query judgments specify relevant and partially relevant documents:
+
+```erlang
+%% test/data/bm25_test_queries.terms
+[
+    {<<"query text">>, #{
+        relevant => [1, 2, 3],      %% Highly relevant doc numbers
+        partial => [10, 15]         %% Partially relevant
+    }},
+    ...
+].
+```
