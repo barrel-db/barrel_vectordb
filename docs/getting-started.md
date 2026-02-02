@@ -124,7 +124,7 @@ barrel_vectordb:start_link(#{
     name => my_store,              %% Store name (required)
     path => "/var/data/vectors",   %% RocksDB path
     dimensions => 768,             %% Vector dimensions (default: 768)
-    backend => hnsw,               %% Index backend: hnsw (default) or faiss
+    backend => hnsw,               %% Index backend: hnsw (default), faiss, or diskann
     embedder => EmbedderConfig,    %% Embedding provider (optional)
     hnsw => #{                     %% HNSW index parameters
         m => 16,
@@ -192,6 +192,35 @@ High-performance FAISS backend via [barrel_faiss](https://gitlab.enki.io/barrel-
 | Insert speed | Baseline | 1.6-3x faster |
 | Search speed | Baseline | 2x faster |
 | Delete speed | Fast (native) | Slower (soft delete) |
+
+### DiskANN
+
+SSD-optimized Vamana graph for billion-scale vector search with minimal memory.
+
+```erlang
+{ok, _} = barrel_vectordb:start_link(#{
+    name => my_store,
+    path => "/tmp/vectors",
+    backend => diskann,
+    diskann => #{
+        r => 64,                    %% Max out-degree
+        l_build => 100,             %% Build search width
+        l_search => 100,            %% Query search width
+        storage_mode => disk,       %% memory | disk
+        hot_enabled => true         %% Enable hot layer for fast writes
+    }
+}).
+```
+
+| Feature | HNSW | FAISS | DiskANN |
+|---------|------|-------|---------|
+| Dependencies | None | barrel_faiss NIF | None |
+| Memory usage | ~4KB/vector | Medium | ~530B/vector (disk mode) |
+| Insert speed | Fast | 1.6-3x faster | Slower (batch optimized) |
+| Search speed | ~0.25ms | 2x faster | ~1ms |
+| Best for | Small-medium | GPU, batch queries | Large-scale, memory-constrained |
+
+See [DiskANN documentation](features.md#diskann-index) for detailed configuration.
 
 ## Next Steps
 
