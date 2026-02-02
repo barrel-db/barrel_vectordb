@@ -269,13 +269,18 @@ bench_hybrid_search(#{store := Store, dimension := Dim} = Ctx) ->
     Vector = random_vector(Dim),
     %% Add a vector for hybrid search
     ok = barrel_vectordb:add_vector(Store, <<"hybrid_test">>, Query, #{}, Vector),
-    {ok, _Results} = barrel_vectordb:search_hybrid(Store, Query, #{
+    case barrel_vectordb:search_hybrid(Store, Query, #{
         k => 10,
         bm25_weight => 0.5,
         vector_weight => 0.5,
         fusion => rrf
-    }),
-    {1, #{}}.
+    }) of
+        {ok, _Results} ->
+            {1, #{}};
+        {error, embedder_not_configured} ->
+            %% Skip hybrid search if no embedder configured (expected in benchmarks)
+            {1, #{skipped => true, reason => no_embedder}}
+    end.
 
 bench_large_index_search(#{store := Store, large_index_size := LargeSize} = Ctx) ->
     %% Build large index first
