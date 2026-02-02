@@ -38,12 +38,16 @@
     peek/2,
     search/3,
     search_vector/3,
+    search_bm25/3,
+    search_hybrid/3,
     embed/2,
     embed_batch/2,
     stats/1,
     count/1,
     embedder_info/1,
-    checkpoint/1
+    checkpoint/1,
+    bm25_info/1,
+    bm25_compact/1
 ]).
 
 %% gen_batch_server callbacks
@@ -60,7 +64,10 @@
     index_module :: module(),             %% Index backend module
     dimension :: pos_integer(),
     embed_state :: map(),
-    config :: map()
+    config :: map(),
+    %% BM25 support
+    bm25_index :: term() | undefined,     %% BM25 index state
+    bm25_backend :: memory | disk | none  %% BM25 backend type
 }).
 
 %%====================================================================
@@ -153,6 +160,28 @@ search(Store, Query, Opts) ->
 search_vector(Store, Vector, Opts) ->
     gen_batch_server:call(Store, {search_vector, Vector, Opts}, ?LONG_TIMEOUT).
 
+%% @doc Search with BM25 text query.
+%% Opts: #{k => integer()}
+-spec search_bm25(atom() | pid(), binary(), map()) -> {ok, [{binary(), float()}]} | {error, term()}.
+search_bm25(Store, Query, Opts) ->
+    gen_batch_server:call(Store, {search_bm25, Query, Opts}, ?LONG_TIMEOUT).
+
+%% @doc Hybrid search combining BM25 and vector search.
+%% Opts: #{k => integer(), bm25_weight => float(), vector_weight => float(), fusion => rrf | linear}
+-spec search_hybrid(atom() | pid(), binary(), map()) -> {ok, [map()]} | {error, term()}.
+search_hybrid(Store, Query, Opts) ->
+    gen_batch_server:call(Store, {search_hybrid, Query, Opts}, ?LONG_TIMEOUT).
+
+%% @doc Get BM25 index information.
+-spec bm25_info(atom() | pid()) -> {ok, map()} | {error, bm25_not_enabled}.
+bm25_info(Store) ->
+    gen_batch_server:call(Store, bm25_info).
+
+%% @doc Trigger BM25 index compaction (disk backend only).
+-spec bm25_compact(atom() | pid()) -> ok | {error, term()}.
+bm25_compact(Store) ->
+    gen_batch_server:call(Store, bm25_compact, ?LONG_TIMEOUT).
+
 %% @doc Embed single text.
 -spec embed(atom() | pid(), binary()) -> {ok, [float()]} | {error, term()}.
 embed(Store, Text) ->
@@ -219,20 +248,29 @@ init({Name, Config}) ->
                     %% Load or create vector index
                     case load_or_create_index(Db, CfHandles, Dimension, IndexConfig, IndexModule) of
                         {ok, Index} ->
-                            State = #state{
-                                name = Name,
-                                db = Db,
-                                cf_vectors = maps:get(vectors, CfHandles),
-                                cf_metadata = maps:get(metadata, CfHandles),
-                                cf_text = maps:get(text, CfHandles),
-                                cf_hnsw = maps:get(hnsw, CfHandles),
-                                index = Index,
-                                index_module = IndexModule,
-                                dimension = Dimension,
-                                embed_state = EmbedState,
-                                config = Config
-                            },
-                            {ok, State};
+                            %% Initialize BM25 index if configured
+                            BM25Backend = maps:get(bm25_backend, Config, none),
+                            case init_bm25(DbPath, BM25Backend, Config) of
+                                {ok, BM25Index} ->
+                                    State = #state{
+                                        name = Name,
+                                        db = Db,
+                                        cf_vectors = maps:get(vectors, CfHandles),
+                                        cf_metadata = maps:get(metadata, CfHandles),
+                                        cf_text = maps:get(text, CfHandles),
+                                        cf_hnsw = maps:get(hnsw, CfHandles),
+                                        index = Index,
+                                        index_module = IndexModule,
+                                        dimension = Dimension,
+                                        embed_state = EmbedState,
+                                        config = Config,
+                                        bm25_index = BM25Index,
+                                        bm25_backend = BM25Backend
+                                    },
+                                    {ok, State};
+                                {error, BM25Error} ->
+                                    {stop, {bm25_init_failed, BM25Error}}
+                            end;
                         {error, IndexError} ->
                             {stop, {index_init_failed, IndexError}}
                     end;
@@ -400,6 +438,35 @@ process_single_op({call, From, checkpoint}, #state{db = Db, cf_hnsw = CfHnsw,
                                                     index = Index, index_module = Mod} = State) ->
     _ = persist_index_meta(Db, CfHnsw, Index, Mod),
     {{reply, From, ok}, State};
+
+%% BM25 search
+process_single_op({call, From, {search_bm25, Query, Opts}}, State) ->
+    Result = do_search_bm25(State, Query, Opts),
+    {{reply, From, Result}, State};
+
+%% Hybrid search (BM25 + vector)
+process_single_op({call, From, {search_hybrid, Query, Opts}}, State) ->
+    case do_embed(Query, State) of
+        {ok, Vector} ->
+            Result = do_search_hybrid(State, Query, Opts, Vector),
+            {{reply, From, Result}, State};
+        {error, _} = Error ->
+            {{reply, From, Error}, State}
+    end;
+
+%% BM25 info
+process_single_op({call, From, bm25_info}, State) ->
+    Result = do_bm25_info(State),
+    {{reply, From, Result}, State};
+
+%% BM25 compaction
+process_single_op({call, From, bm25_compact}, State) ->
+    case do_bm25_compact(State) of
+        {ok, NewState} ->
+            {{reply, From, ok}, NewState};
+        {error, _} = Error ->
+            {{reply, From, Error}, State}
+    end;
 
 process_single_op({call, From, _Unknown}, State) ->
     {{reply, From, {error, unknown_request}}, State}.
@@ -716,7 +783,8 @@ do_embed_batch(Texts, #state{embed_state = EmbedState}) ->
 %% Add a document
 do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
                                           cf_metadata = CfM, cf_text = CfT,
-                                          index = Index, index_module = Mod} = State) ->
+                                          index = Index, index_module = Mod,
+                                          bm25_index = BM25Index} = State) ->
     VectorBin = encode_vector(Vector),
     MetadataBin = term_to_binary(Metadata),
 
@@ -730,7 +798,13 @@ do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,
         {ok, NewIndex} ->
             case rocksdb:write_batch(Db, Batch, []) of
                 ok ->
-                    {ok, State#state{index = NewIndex}};
+                    %% Also add to BM25 index if enabled
+                    case bm25_add(BM25Index, Id, Text) of
+                        {ok, NewBM25Index} ->
+                            {ok, State#state{index = NewIndex, bm25_index = NewBM25Index}};
+                        {error, Reason} ->
+                            {error, {bm25_error, Reason}}
+                    end;
                 {error, Reason} ->
                     {error, {db_error, Reason}}
             end;
@@ -761,7 +835,8 @@ do_get(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM, cf_text = CfT}) 
 
 %% Delete a document
 do_delete(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
-                     cf_text = CfT, cf_hnsw = CfH, index = Index, index_module = Mod} = State) ->
+                     cf_text = CfT, cf_hnsw = CfH, index = Index, index_module = Mod,
+                     bm25_index = BM25Index} = State) ->
     {ok, Batch} = rocksdb:batch(),
     ok = rocksdb:batch_delete(Batch, CfV, Id),
     ok = rocksdb:batch_delete(Batch, CfM, Id),
@@ -771,7 +846,14 @@ do_delete(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
     case rocksdb:write_batch(Db, Batch, []) of
         ok ->
             case Mod:delete(Index, Id) of
-                {ok, NewIndex} -> {ok, State#state{index = NewIndex}};
+                {ok, NewIndex} ->
+                    %% Also remove from BM25 index if enabled
+                    case bm25_remove(BM25Index, Id) of
+                        {ok, NewBM25Index} ->
+                            {ok, State#state{index = NewIndex, bm25_index = NewBM25Index}};
+                        {error, Reason} ->
+                            {error, {bm25_error, Reason}}
+                    end;
                 {error, Reason} -> {error, Reason}
             end;
         {error, Reason} ->
@@ -931,3 +1013,184 @@ encode_vector(Vector) when is_list(Vector) ->
 
 decode_vector(Binary) ->
     [F || <<F:32/float-little>> <= Binary].
+
+%%====================================================================
+%% Internal Functions - BM25
+%%====================================================================
+
+%% Initialize BM25 index based on backend type
+init_bm25(_DbPath, none, _Config) ->
+    {ok, undefined};
+init_bm25(_DbPath, memory, Config) ->
+    BM25Config = maps:get(bm25, Config, #{}),
+    Index = barrel_vectordb_bm25:new(BM25Config),
+    {ok, Index};
+init_bm25(DbPath, disk, Config) ->
+    BM25Config = maps:get(bm25_disk, Config, #{}),
+    BasePath = maps:get(base_path, BM25Config, filename:join(DbPath, "bm25")),
+    FinalConfig = BM25Config#{base_path => BasePath},
+    %% Try to open existing index or create new
+    case filelib:is_dir(BasePath) of
+        true ->
+            barrel_vectordb_bm25_disk:open(BasePath);
+        false ->
+            barrel_vectordb_bm25_disk:new(FinalConfig)
+    end.
+
+%% Add document to BM25 index
+bm25_add(undefined, _Id, _Text) ->
+    {ok, undefined};
+bm25_add(Index, Id, Text) when is_map(Index) ->
+    %% In-memory BM25 (returns new index, not {ok, Index})
+    NewIndex = barrel_vectordb_bm25:add(Index, Id, Text),
+    {ok, NewIndex};
+bm25_add(Index, Id, Text) ->
+    %% Disk BM25 (returns {ok, NewIndex})
+    barrel_vectordb_bm25_disk:add(Index, Id, Text).
+
+%% Remove document from BM25 index
+bm25_remove(undefined, _Id) ->
+    {ok, undefined};
+bm25_remove(Index, Id) when is_map(Index) ->
+    %% In-memory BM25
+    NewIndex = barrel_vectordb_bm25:remove(Index, Id),
+    {ok, NewIndex};
+bm25_remove(Index, Id) ->
+    %% Disk BM25
+    case barrel_vectordb_bm25_disk:remove(Index, Id) of
+        {ok, NewIndex} -> {ok, NewIndex};
+        {error, not_found} -> {ok, Index};
+        {error, _} = Error -> Error
+    end.
+
+%% Search BM25 index
+do_search_bm25(#state{bm25_index = undefined}, _Query, _Opts) ->
+    {error, bm25_not_enabled};
+do_search_bm25(#state{bm25_index = Index, bm25_backend = memory}, Query, Opts) ->
+    K = maps:get(k, Opts, 10),
+    Results = barrel_vectordb_bm25:search(Index, Query, K),
+    {ok, Results};
+do_search_bm25(#state{bm25_index = Index, bm25_backend = disk}, Query, Opts) ->
+    K = maps:get(k, Opts, 10),
+    Results = barrel_vectordb_bm25_disk:search(Index, Query, K),
+    {ok, Results}.
+
+%% Hybrid search combining BM25 and vector results
+do_search_hybrid(#state{bm25_index = undefined}, _Query, _Opts, _State) ->
+    {error, bm25_not_enabled};
+do_search_hybrid(#state{} = State, Query, Opts, Vector) ->
+    K = maps:get(k, Opts, 10),
+    BM25Weight = maps:get(bm25_weight, Opts, 0.5),
+    VectorWeight = maps:get(vector_weight, Opts, 0.5),
+    Fusion = maps:get(fusion, Opts, rrf),
+
+    %% Get BM25 results
+    {ok, BM25Results} = do_search_bm25(State, Query, Opts#{k => K * 2}),
+
+    %% Get vector results
+    {ok, VectorResults} = do_search(Vector, Opts#{k => K * 2}, State),
+
+    %% Merge results using RRF or linear combination
+    Merged = case Fusion of
+        rrf ->
+            rrf_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight);
+        linear ->
+            linear_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight)
+    end,
+
+    {ok, Merged}.
+
+%% Reciprocal Rank Fusion
+rrf_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight) ->
+    RRFk = 60,  %% Standard RRF constant
+
+    %% Build rank maps
+    BM25Ranks = build_rank_map([Id || {Id, _} <- BM25Results]),
+    VectorRanks = build_rank_map([maps:get(key, R) || R <- VectorResults]),
+
+    %% Get all unique IDs
+    AllIds = sets:to_list(sets:union(
+        sets:from_list(maps:keys(BM25Ranks)),
+        sets:from_list(maps:keys(VectorRanks))
+    )),
+
+    %% Compute RRF scores
+    Scores = lists:map(fun(Id) ->
+        BM25Rank = maps:get(Id, BM25Ranks, 1000),
+        VectorRank = maps:get(Id, VectorRanks, 1000),
+        BM25RRF = BM25Weight / (RRFk + BM25Rank),
+        VectorRRF = VectorWeight / (RRFk + VectorRank),
+        {Id, BM25RRF + VectorRRF}
+    end, AllIds),
+
+    %% Sort and take top K
+    Sorted = lists:sort(fun({_, S1}, {_, S2}) -> S1 > S2 end, Scores),
+    TopK = lists:sublist(Sorted, K),
+
+    %% Build result maps (without metadata for now)
+    [#{key => Id, score => Score} || {Id, Score} <- TopK].
+
+%% Linear combination of scores
+linear_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight) ->
+    %% Normalize BM25 scores
+    BM25Max = case BM25Results of
+        [] -> 1.0;
+        _ -> lists:max([S || {_, S} <- BM25Results])
+    end,
+    BM25Normalized = [{Id, S / max(BM25Max, 0.001)} || {Id, S} <- BM25Results],
+
+    %% Get vector scores (already normalized 0-1)
+    VectorScores = [{maps:get(key, R), maps:get(score, R)} || R <- VectorResults],
+
+    %% Build score maps
+    BM25Map = maps:from_list(BM25Normalized),
+    VectorMap = maps:from_list(VectorScores),
+
+    %% Get all unique IDs
+    AllIds = sets:to_list(sets:union(
+        sets:from_list(maps:keys(BM25Map)),
+        sets:from_list(maps:keys(VectorMap))
+    )),
+
+    %% Compute combined scores
+    Scores = lists:map(fun(Id) ->
+        BM25Score = maps:get(Id, BM25Map, 0.0),
+        VectorScore = maps:get(Id, VectorMap, 0.0),
+        {Id, BM25Weight * BM25Score + VectorWeight * VectorScore}
+    end, AllIds),
+
+    %% Sort and take top K
+    Sorted = lists:sort(fun({_, S1}, {_, S2}) -> S1 > S2 end, Scores),
+    TopK = lists:sublist(Sorted, K),
+
+    [#{key => Id, score => Score} || {Id, Score} <- TopK].
+
+%% Build rank map from ordered list
+build_rank_map(Ids) ->
+    {Map, _} = lists:foldl(fun(Id, {Acc, Rank}) ->
+        {Acc#{Id => Rank}, Rank + 1}
+    end, {#{}, 1}, Ids),
+    Map.
+
+%% Get BM25 info
+do_bm25_info(#state{bm25_index = undefined}) ->
+    {error, bm25_not_enabled};
+do_bm25_info(#state{bm25_index = Index, bm25_backend = memory}) ->
+    Stats = barrel_vectordb_bm25:stats(Index),
+    {ok, Stats#{backend => memory}};
+do_bm25_info(#state{bm25_index = Index, bm25_backend = disk}) ->
+    Info = barrel_vectordb_bm25_disk:info(Index),
+    {ok, Info#{backend => disk}}.
+
+%% Compact BM25 index (disk backend only)
+do_bm25_compact(#state{bm25_index = undefined}) ->
+    {error, bm25_not_enabled};
+do_bm25_compact(#state{bm25_backend = memory}) ->
+    {error, memory_backend_no_compaction};
+do_bm25_compact(#state{bm25_index = Index, bm25_backend = disk} = State) ->
+    case barrel_vectordb_bm25_disk:compact(Index) of
+        {ok, NewIndex} ->
+            {ok, State#state{bm25_index = NewIndex}};
+        {error, _} = Error ->
+            Error
+    end.
