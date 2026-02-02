@@ -229,6 +229,7 @@ search_hybrid(Collection, Query, Opts, EmbedderInfo) ->
     BM25Weight = maps:get(bm25_weight, Opts, 0.5),
     VectorWeight = maps:get(vector_weight, Opts, 0.5),
     Fusion = maps:get(fusion, Opts, rrf),
+    RRFk = maps:get(rrf_k, Opts, 60),  %% Configurable RRF constant
     ShardK = K * 2,
     ShardOpts = Opts#{k => ShardK, collection => Collection},
 
@@ -243,7 +244,7 @@ search_hybrid(Collection, Query, Opts, EmbedderInfo) ->
                     {AllBM25, AllVector} = gather_hybrid_results(Results),
                     %% Merge results using fusion algorithm
                     Merged = case Fusion of
-                        rrf -> rrf_merge(AllBM25, AllVector, K, BM25Weight, VectorWeight);
+                        rrf -> rrf_merge(AllBM25, AllVector, K, BM25Weight, VectorWeight, RRFk);
                         linear -> linear_merge(AllBM25, AllVector, K, BM25Weight, VectorWeight)
                     end,
                     {ok, Merged};
@@ -405,9 +406,8 @@ gather_hybrid_results(Results) ->
     {gather_bm25_results([AllBM25]), gather_results(AllVector)}.
 
 %% RRF (Reciprocal Rank Fusion) merge algorithm
-rrf_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight) ->
-    RRFk = 60,  %% Standard RRF constant
-
+%% RRFk is the ranking constant (default 60, higher values = less emphasis on top ranks)
+rrf_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight, RRFk) ->
     %% Build rank maps
     BM25Ranks = build_rank_map([Id || {Id, _} <- BM25Results]),
     VectorRanks = build_rank_map([maps:get(key, R) || R <- VectorResults]),

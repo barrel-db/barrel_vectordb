@@ -23,6 +23,7 @@
     add/3,
     remove/2,
     search/3,
+    search_with_metrics/3,
     get_vector/2,
     encode/2,
     stats/1,
@@ -374,6 +375,14 @@ remove(Index, DocId) ->
 %% @doc Search the index
 -spec search(bm25_disk_index(), binary(), pos_integer()) -> [{binary(), float()}].
 search(Index, Query, K) ->
+    {Results, _Metrics} = search_with_metrics(Index, Query, K),
+    Results.
+
+%% @doc Search the index and return metrics for debugging/tuning
+%% Returns {Results, Metrics} where Metrics includes block skip statistics
+-spec search_with_metrics(bm25_disk_index(), binary(), pos_integer()) ->
+    {[{binary(), float()}], map()}.
+search_with_metrics(Index, Query, K) ->
     #bm25_disk_index{
         config = Config,
         total_docs = TotalDocs,
@@ -381,7 +390,7 @@ search(Index, Query, K) ->
     } = Index,
 
     case TotalDocs of
-        0 -> [];
+        0 -> {[], #{blocks_total => 0, blocks_scanned => 0, blocks_skipped => 0}};
         _ ->
             %% Tokenize query
             QueryTerms = tokenize(Query, Config),
@@ -396,8 +405,8 @@ search(Index, Query, K) ->
             %% Search hot layer
             HotResults = search_hot_layer(Index, TermIntIds, AvgDL),
 
-            %% Search disk layer using Block-Max MaxScore
-            DiskResults = search_disk_layer(Index, TermIntIds, AvgDL, K),
+            %% Search disk layer using Block-Max MaxScore (with metrics)
+            {DiskResults, DiskMetrics} = search_disk_layer_with_metrics(Index, TermIntIds, AvgDL, K),
 
             %% Merge results
             MergedResults = merge_search_results(HotResults, DiskResults),
@@ -407,7 +416,17 @@ search(Index, Query, K) ->
             TopK = lists:sublist(Sorted, K),
 
             %% Convert back to string IDs
-            [{get_doc_string_id(Index, DocIntId), Score} || {DocIntId, Score} <- TopK]
+            Results = [{get_doc_string_id(Index, DocIntId), Score} || {DocIntId, Score} <- TopK],
+
+            %% Add additional metrics
+            Metrics = DiskMetrics#{
+                query_terms => maps:size(TermIntIds),
+                hot_results => length(HotResults),
+                disk_results => length(DiskResults),
+                total_results => length(TopK)
+            },
+
+            {Results, Metrics}
     end.
 
 %% @doc Get sparse vector representation of a document
@@ -887,7 +906,7 @@ score_document_hot(Index, DocIntId, TermIntIds, DocLength, AvgDL, N, Config) ->
         TermIntIds
     ).
 
-search_disk_layer(Index, TermIntIds, AvgDL, K) ->
+search_disk_layer_with_metrics(Index, TermIntIds, AvgDL, K) ->
     #bm25_disk_index{
         config = Config,
         blockmax_index = BlockMaxIndex,
@@ -898,7 +917,7 @@ search_disk_layer(Index, TermIntIds, AvgDL, K) ->
     case maps:size(BlockMaxIndex) of
         0 ->
             %% No disk data yet
-            [];
+            {[], #{blocks_total => 0, blocks_scanned => 0, blocks_skipped => 0}};
         _ ->
             %% Get blocks for each query term
             TermBlocks = maps:fold(
@@ -913,75 +932,90 @@ search_disk_layer(Index, TermIntIds, AvgDL, K) ->
             ),
 
             case TermBlocks of
-                [] -> [];
+                [] -> {[], #{blocks_total => 0, blocks_scanned => 0, blocks_skipped => 0}};
                 _ ->
-                    %% Use Block-Max MaxScore algorithm
-                    maxscore_search(Index, TermBlocks, AvgDL, TotalDocs, K, Config, FileHandle)
+                    %% Count total blocks
+                    TotalBlocks = lists:sum([length(Blocks) || {_, Blocks} <- TermBlocks]),
+                    %% Use Block-Max MaxScore algorithm with metrics
+                    {Results, Scanned, Skipped} = maxscore_search_with_metrics(
+                        Index, TermBlocks, AvgDL, TotalDocs, K, Config, FileHandle),
+                    Metrics = #{
+                        blocks_total => TotalBlocks,
+                        blocks_scanned => Scanned,
+                        blocks_skipped => Skipped,
+                        skip_rate => case TotalBlocks of
+                            0 -> 0.0;
+                            _ -> Skipped / TotalBlocks * 100
+                        end
+                    },
+                    {Results, Metrics}
             end
     end.
 
-%% Block-Max MaxScore search algorithm
-maxscore_search(_Index, [], _AvgDL, _N, _K, _Config, _FileHandle) ->
-    [];
-maxscore_search(Index, TermBlocks, AvgDL, N, K, Config, FileHandle) ->
+%% Block-Max MaxScore search algorithm with metrics tracking
+maxscore_search_with_metrics(_Index, [], _AvgDL, _N, _K, _Config, _FileHandle) ->
+    {[], 0, 0};
+maxscore_search_with_metrics(Index, TermBlocks, AvgDL, N, K, Config, FileHandle) ->
     #bm25_disk_config{k1 = K1, b = B} = Config,
 
-    %% Sort terms by max impact (highest first) for better pruning
-    SortedTermBlocks = lists:sort(
-        fun({_, Blocks1}, {_, Blocks2}) ->
-            Max1 = lists:max([maps:get(max_impact, Blk) || Blk <- Blocks1]),
-            Max2 = lists:max([maps:get(max_impact, Blk) || Blk <- Blocks2]),
-            Max1 >= Max2
+    %% Compute IDF for each term upfront
+    TermBlocksWithIDF = lists:map(
+        fun({TermIntId, Blocks}) ->
+            DF = get_term_doc_freq(Index, TermIntId),
+            IDF = math:log((N - DF + 0.5) / (DF + 0.5) + 1),
+            MaxImpact = lists:max([maps:get(max_impact, Blk) || Blk <- Blocks]),
+            {TermIntId, Blocks, IDF, MaxImpact}
         end,
         TermBlocks
     ),
 
-    %% Initialize result heap (min-heap of size K)
-    %% Simple implementation: keep sorted list
-    Results = [],
-    Threshold = 0.0,
-
-    %% Process each term's blocks
-    {FinalResults, _} = lists:foldl(
-        fun({TermIntId, Blocks}, {AccResults, AccThreshold}) ->
-            %% Get document frequency for IDF
-            DF = get_term_doc_freq(Index, TermIntId),
-            IDF = math:log((N - DF + 0.5) / (DF + 0.5) + 1),
-
-            %% Process blocks that can beat threshold
-            process_blocks(Blocks, TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
-                           AccResults, AccThreshold, K)
+    %% Sort by IDF * MaxImpact
+    SortedTermBlocks = lists:sort(
+        fun({_, _, IDF1, Max1}, {_, _, IDF2, Max2}) ->
+            (IDF1 * Max1) >= (IDF2 * Max2)
         end,
-        {Results, Threshold},
+        TermBlocksWithIDF
+    ),
+
+    %% Process with metrics tracking
+    {FinalResults, _, Scanned, Skipped} = lists:foldl(
+        fun({TermIntId, Blocks, IDF, _MaxImpact}, {AccResults, AccThreshold, AccScanned, AccSkipped}) ->
+            {NewResults, NewThreshold, BlocksScanned, BlocksSkipped} =
+                process_blocks_with_metrics(Blocks, TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
+                                            AccResults, AccThreshold, K, 0, 0),
+            {NewResults, NewThreshold, AccScanned + BlocksScanned, AccSkipped + BlocksSkipped}
+        end,
+        {[], 0.0, 0, 0},
         SortedTermBlocks
     ),
 
-    FinalResults.
+    {FinalResults, Scanned, Skipped}.
 
-process_blocks([], _TermIntId, _IDF, _AvgDL, _K1, _B, _FileHandle, _Index,
-               Results, Threshold, _K) ->
-    {Results, Threshold};
-process_blocks([Block | Rest], TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
-               Results, Threshold, K) ->
+process_blocks_with_metrics([], _TermIntId, _IDF, _AvgDL, _K1, _B, _FileHandle, _Index,
+                            Results, Threshold, _K, Scanned, Skipped) ->
+    {Results, Threshold, Scanned, Skipped};
+process_blocks_with_metrics([Block | Rest], TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
+                            Results, Threshold, K, Scanned, Skipped) ->
     #{max_impact := MaxImpact, offset := Offset, size := Size} = Block,
 
     %% Skip block if max impact can't beat threshold
     case MaxImpact * IDF < Threshold of
         true ->
-            process_blocks(Rest, TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
-                           Results, Threshold, K);
+            %% Block skipped
+            process_blocks_with_metrics(Rest, TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
+                                        Results, Threshold, K, Scanned, Skipped + 1);
         false ->
-            %% Read and score postings in this block
+            %% Read and score postings
             case barrel_vectordb_bm25_disk_file:read_postings(FileHandle, Offset, Size) of
                 {ok, Postings} ->
                     {NewResults, NewThreshold} = score_postings(
                         Postings, TermIntId, IDF, AvgDL, K1, B, Index,
                         Results, Threshold, K),
-                    process_blocks(Rest, TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
-                                   NewResults, NewThreshold, K);
+                    process_blocks_with_metrics(Rest, TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
+                                                NewResults, NewThreshold, K, Scanned + 1, Skipped);
                 {error, _} ->
-                    process_blocks(Rest, TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
-                                   Results, Threshold, K)
+                    process_blocks_with_metrics(Rest, TermIntId, IDF, AvgDL, K1, B, FileHandle, Index,
+                                                Results, Threshold, K, Scanned, Skipped)
             end
     end.
 

@@ -1083,6 +1083,7 @@ do_search_hybrid(#state{} = State, Query, Opts, Vector) ->
     BM25Weight = maps:get(bm25_weight, Opts, 0.5),
     VectorWeight = maps:get(vector_weight, Opts, 0.5),
     Fusion = maps:get(fusion, Opts, rrf),
+    RRFk = maps:get(rrf_k, Opts, 60),  %% Configurable RRF constant
 
     %% Get BM25 results
     {ok, BM25Results} = do_search_bm25(State, Query, Opts#{k => K * 2}),
@@ -1093,7 +1094,7 @@ do_search_hybrid(#state{} = State, Query, Opts, Vector) ->
     %% Merge results using RRF or linear combination
     Merged = case Fusion of
         rrf ->
-            rrf_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight);
+            rrf_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight, RRFk);
         linear ->
             linear_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight)
     end,
@@ -1101,8 +1102,8 @@ do_search_hybrid(#state{} = State, Query, Opts, Vector) ->
     {ok, Merged}.
 
 %% Reciprocal Rank Fusion
-rrf_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight) ->
-    RRFk = 60,  %% Standard RRF constant
+%% RRFk is the ranking constant (default 60, higher values = less emphasis on top ranks)
+rrf_merge(BM25Results, VectorResults, K, BM25Weight, VectorWeight, RRFk) ->
 
     %% Build rank maps
     BM25Ranks = build_rank_map([Id || {Id, _} <- BM25Results]),
