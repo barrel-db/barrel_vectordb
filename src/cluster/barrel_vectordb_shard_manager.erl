@@ -276,10 +276,12 @@ terminate(_Reason, State) ->
 
 create_shard_store(DataDir, CollectionName, ShardIdx, CollectionMeta) ->
     %% Extract fields from collection_meta record
-    %% Record format: {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status, Backend, BackendConfig}
+    %% Record format: {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status, Backend, BackendConfig, BM25Backend, BM25Config}
     Dimension = element(3, CollectionMeta),
     Backend = element(8, CollectionMeta),
     BackendConfig = element(9, CollectionMeta),
+    BM25Backend = element(10, CollectionMeta),
+    BM25Config = element(11, CollectionMeta),
 
     ShardName = iolist_to_binary([CollectionName, <<"_shard_">>, integer_to_binary(ShardIdx)]),
     StoreName = binary_to_atom(<<"barrel_vectordb_store_", ShardName/binary>>, utf8),
@@ -289,7 +291,8 @@ create_shard_store(DataDir, CollectionName, ShardIdx, CollectionMeta) ->
         name => StoreName,
         path => StorePath,
         dimensions => Dimension,
-        backend => Backend
+        backend => Backend,
+        bm25_backend => BM25Backend
     },
 
     %% Add backend-specific config
@@ -304,7 +307,21 @@ create_shard_store(DataDir, CollectionName, ShardIdx, CollectionMeta) ->
             StoreConfig#{diskann => DC}
     end,
 
-    case barrel_vectordb:start_link(StoreConfig1) of
+    %% Add BM25 config if enabled
+    StoreConfig2 = case BM25Backend of
+        none ->
+            StoreConfig1;
+        memory ->
+            StoreConfig1#{bm25 => BM25Config};
+        disk ->
+            BM25DiskConfig = case maps:is_key(base_path, BM25Config) of
+                true -> BM25Config;
+                false -> BM25Config#{base_path => filename:join(StorePath, "bm25")}
+            end,
+            StoreConfig1#{bm25_disk => BM25DiskConfig}
+    end,
+
+    case barrel_vectordb:start_link(StoreConfig2) of
         {ok, _Pid} ->
             {ok, StoreName};
         {error, {already_started, _}} ->
@@ -320,11 +337,18 @@ get_collection_meta(CollectionName) ->
             case maps:get(CollectionName, Collections, undefined) of
                 undefined ->
                     %% Return default meta structure
-                    %% {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status, Backend, BackendConfig}
-                    {collection_meta, CollectionName, 768, 1, 1, 0, active, hnsw, #{}};
+                    %% {collection_meta, Name, Dimension, NumShards, RF, CreatedAt, Status, Backend, BackendConfig, BM25Backend, BM25Config}
+                    {collection_meta, CollectionName, 768, 1, 1, 0, active, hnsw, #{}, none, #{}};
                 Meta ->
-                    Meta
+                    %% Ensure backward compatibility with old records that don't have BM25 fields
+                    case tuple_size(Meta) of
+                        9 ->
+                            %% Old format without BM25 fields
+                            erlang:append_element(erlang:append_element(Meta, none), #{});
+                        _ ->
+                            Meta
+                    end
             end;
         _ ->
-            {collection_meta, CollectionName, 768, 1, 1, 0, active, hnsw, #{}}
+            {collection_meta, CollectionName, 768, 1, 1, 0, active, hnsw, #{}, none, #{}}
     end.

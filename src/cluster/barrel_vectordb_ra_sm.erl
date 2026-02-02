@@ -28,7 +28,9 @@
     created_at :: integer(),
     status :: creating | active | deleting,
     backend = hnsw :: hnsw | faiss | diskann,
-    backend_config = #{} :: map()
+    backend_config = #{} :: map(),
+    bm25_backend = none :: none | memory | disk,
+    bm25_config = #{} :: map()
 }).
 
 -record(shard_assignment, {
@@ -113,7 +115,9 @@ apply(_Meta, {create_collection, Name, Config, Placement}, State) ->
                 created_at = erlang:system_time(second),
                 status = creating,
                 backend = maps:get(backend, Config, hnsw),
-                backend_config = maps:get(backend_config, Config, #{})
+                backend_config = maps:get(backend_config, Config, #{}),
+                bm25_backend = maps:get(bm25_backend, Config, none),
+                bm25_config = maps:get(bm25_config, Config, #{})
             },
             Collections = maps:put(Name, Meta, State#cluster_state.collections),
             %% Create shard assignments from placement

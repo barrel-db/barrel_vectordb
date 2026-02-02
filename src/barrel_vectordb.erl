@@ -109,7 +109,9 @@
     cluster_get/2,
     cluster_delete/2,
     cluster_search/3,
-    cluster_search_vector/3
+    cluster_search_vector/3,
+    cluster_search_bm25/3,
+    cluster_search_hybrid/3
 ]).
 
 %% API - Document Operations
@@ -129,7 +131,9 @@
 %% API - Search
 -export([
     search/3,
-    search_vector/3
+    search_vector/3,
+    search_bm25/3,
+    search_hybrid/3
 ]).
 
 %% API - Embedding
@@ -525,6 +529,52 @@ search(Store, Query, Opts) when is_binary(Query) ->
 search_vector(Store, Vector, Opts) when is_list(Vector) ->
     barrel_vectordb_server:search_vector(Store, Vector, Opts).
 
+%% @doc Search for similar documents using BM25 text search.
+%%
+%% Performs keyword-based BM25 text search. Requires BM25 backend to be
+%% enabled in the store configuration.
+%%
+%% == Example ==
+%% ```
+%% {ok, Results} = barrel_vectordb:search_bm25(my_store, <<"erlang programming">>, #{
+%%     k => 10
+%% }),
+%% [{DocId, Score} | _] = Results.
+%% '''
+%%
+%% @param Store Store name or pid
+%% @param Query Text query for BM25 search
+%% @param Opts Search options (k)
+%% @returns `{ok, Results}' list of `{DocId, Score}' tuples sorted by BM25 score
+-spec search_bm25(store(), text(), search_opts()) ->
+    {ok, [{id(), float()}]} | {error, term()}.
+search_bm25(Store, Query, Opts) when is_binary(Query) ->
+    barrel_vectordb_server:search_bm25(Store, Query, Opts).
+
+%% @doc Hybrid search combining BM25 and vector search.
+%%
+%% Performs both BM25 text search and vector similarity search,
+%% then combines the results using a fusion algorithm (RRF or linear).
+%%
+%% == Example ==
+%% ```
+%% {ok, Results} = barrel_vectordb:search_hybrid(my_store, <<"erlang">>, #{
+%%     k => 10,
+%%     bm25_weight => 0.5,
+%%     vector_weight => 0.5,
+%%     fusion => rrf  %% or 'linear'
+%% }).
+%% '''
+%%
+%% @param Store Store name or pid
+%% @param Query Text query
+%% @param Opts Search options (k, bm25_weight, vector_weight, fusion)
+%% @returns `{ok, Results}' list of result maps sorted by combined score
+-spec search_hybrid(store(), text(), search_opts()) ->
+    {ok, [search_result()]} | {error, term()}.
+search_hybrid(Store, Query, Opts) when is_binary(Query) ->
+    barrel_vectordb_server:search_hybrid(Store, Query, Opts).
+
 %%====================================================================
 %% Embedding API
 %%====================================================================
@@ -875,6 +925,60 @@ cluster_search_vector(Collection, Vector, Opts) when is_binary(Collection), is_l
         true ->
             OptsWithCollection = Opts#{collection => Collection},
             barrel_vectordb_shard_router:route_search_vector(Collection, Vector, OptsWithCollection, #{});
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc BM25 text search across a cluster collection.
+%%
+%% Scatter-gather BM25 search across all shards.
+%% Requires BM25 backend to be enabled in the collection configuration.
+%%
+%% == Example ==
+%% ```
+%% {ok, Results} = barrel_vectordb:cluster_search_bm25(<<"articles">>, <<"erlang">>, #{k => 10}).
+%% '''
+%%
+%% @param Collection Collection name
+%% @param Query Text query for BM25 search
+%% @param Opts Search options (k)
+%% @returns `{ok, Results}' list of `{DocId, Score}' tuples
+-spec cluster_search_bm25(binary(), text(), search_opts()) -> {ok, [{id(), float()}]} | {error, term()}.
+cluster_search_bm25(Collection, Query, Opts) when is_binary(Collection), is_binary(Query) ->
+    case is_clustered() of
+        true ->
+            OptsWithCollection = Opts#{collection => Collection},
+            barrel_vectordb_scatter:search_bm25(Collection, Query, OptsWithCollection);
+        false ->
+            {error, not_clustered}
+    end.
+
+%% @doc Hybrid search (BM25 + vector) across a cluster collection.
+%%
+%% Scatter-gather hybrid search across all shards.
+%% Requires both BM25 backend and embedder to be configured.
+%%
+%% == Example ==
+%% ```
+%% {ok, Results} = barrel_vectordb:cluster_search_hybrid(<<"articles">>, <<"erlang">>, #{
+%%     k => 10,
+%%     bm25_weight => 0.5,
+%%     vector_weight => 0.5,
+%%     fusion => rrf
+%% }).
+%% '''
+%%
+%% @param Collection Collection name
+%% @param Query Text query
+%% @param Opts Search options (k, bm25_weight, vector_weight, fusion)
+%% @returns `{ok, Results}' list of result maps
+-spec cluster_search_hybrid(binary(), text(), search_opts()) -> {ok, [search_result()]} | {error, term()}.
+cluster_search_hybrid(Collection, Query, Opts) when is_binary(Collection), is_binary(Query) ->
+    case is_clustered() of
+        true ->
+            EmbedderInfo = get_collection_embedder(Collection),
+            OptsWithCollection = Opts#{collection => Collection},
+            barrel_vectordb_scatter:search_hybrid(Collection, Query, OptsWithCollection, EmbedderInfo);
         false ->
             {error, not_clustered}
     end.
