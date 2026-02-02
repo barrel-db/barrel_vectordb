@@ -60,6 +60,8 @@ nav:
     - Quick Start: getting-started.md
     - Embedding Models: embeddings.md
   - Guides:
+    - Features: features.md
+    - BM25 Text Search: bm25-disk.md
     - Clustering: clustering.md
     - Multi-Tenant Gateway: gateway.md
     - Docker Deployment: deployment.md
