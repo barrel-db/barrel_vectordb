@@ -148,6 +148,72 @@ handle(search, <<"POST">>, IsClustered, Req0, State) ->
             json_error(400, <<"bad_request">>, <<"Invalid JSON body">>, Req1, State)
     end;
 
+%% BM25 Search
+handle(search_bm25, <<"POST">>, IsClustered, Req0, State) ->
+    Collection = cowboy_req:binding(collection, Req0),
+    case read_json_body(Req0) of
+        {ok, Body, Req1} ->
+            Query = maps:get(<<"query">>, Body, undefined),
+            case Query of
+                undefined ->
+                    json_error(400, <<"bad_request">>, <<"'query' field required">>, Req1, State);
+                QueryVal when is_binary(QueryVal) ->
+                    K = maps:get(<<"k">>, Body, 10),
+                    Opts = #{k => K},
+                    Result = maybe_search_bm25(IsClustered, Collection, QueryVal, Opts),
+                    case Result of
+                        {ok, Results} ->
+                            FormattedResults = format_bm25_results(Results),
+                            json_response(200, #{results => FormattedResults}, Req1, State);
+                        {error, no_bm25_index} ->
+                            json_error(400, <<"no_bm25_index">>, <<"BM25 index not configured for this collection">>, Req1, State);
+                        {error, Reason} ->
+                            json_error(500, <<"error">>, format_error(Reason), Req1, State)
+                    end;
+                _ ->
+                    json_error(400, <<"bad_request">>, <<"'query' must be a string">>, Req1, State)
+            end;
+        {error, Req1} ->
+            json_error(400, <<"bad_request">>, <<"Invalid JSON body">>, Req1, State)
+    end;
+
+%% Hybrid Search (BM25 + Vector)
+handle(search_hybrid, <<"POST">>, IsClustered, Req0, State) ->
+    Collection = cowboy_req:binding(collection, Req0),
+    case read_json_body(Req0) of
+        {ok, Body, Req1} ->
+            Query = maps:get(<<"query">>, Body, undefined),
+            case Query of
+                undefined ->
+                    json_error(400, <<"bad_request">>, <<"'query' field required">>, Req1, State);
+                QueryVal when is_binary(QueryVal) ->
+                    K = maps:get(<<"k">>, Body, 10),
+                    BM25Weight = maps:get(<<"bm25_weight">>, Body, 0.5),
+                    VectorWeight = maps:get(<<"vector_weight">>, Body, 0.5),
+                    Fusion = binary_to_fusion(maps:get(<<"fusion">>, Body, <<"rrf">>)),
+                    Opts = #{
+                        k => K,
+                        bm25_weight => BM25Weight,
+                        vector_weight => VectorWeight,
+                        fusion => Fusion
+                    },
+                    Result = maybe_search_hybrid(IsClustered, Collection, QueryVal, Opts),
+                    case Result of
+                        {ok, Results} ->
+                            FormattedResults = format_hybrid_results(Results),
+                            json_response(200, #{results => FormattedResults}, Req1, State);
+                        {error, no_bm25_index} ->
+                            json_error(400, <<"no_bm25_index">>, <<"BM25 index not configured for this collection">>, Req1, State);
+                        {error, Reason} ->
+                            json_error(500, <<"error">>, format_error(Reason), Req1, State)
+                    end;
+                _ ->
+                    json_error(400, <<"bad_request">>, <<"'query' must be a string">>, Req1, State)
+            end;
+        {error, Req1} ->
+            json_error(400, <<"bad_request">>, <<"Invalid JSON body">>, Req1, State)
+    end;
+
 %% Reshard collection
 
 handle(reshard, <<"POST">>, true, Req0, State) ->
@@ -275,6 +341,10 @@ binary_to_backend(<<"faiss">>) -> faiss;
 binary_to_backend(<<"diskann">>) -> diskann;
 binary_to_backend(_) -> hnsw.
 
+binary_to_fusion(<<"rrf">>) -> rrf;
+binary_to_fusion(<<"linear">>) -> linear;
+binary_to_fusion(_) -> rrf.
+
 maybe_delete_collection(true, Collection) ->
     barrel_vectordb:delete_collection(Collection);
 maybe_delete_collection(false, Collection) ->
@@ -319,6 +389,18 @@ maybe_search_vector(true, Collection, Vector, Opts) ->
 maybe_search_vector(false, Collection, Vector, Opts) ->
     StoreName = collection_to_store(Collection),
     barrel_vectordb:search_vector(StoreName, Vector, Opts).
+
+maybe_search_bm25(true, Collection, Query, Opts) ->
+    barrel_vectordb:cluster_search_bm25(Collection, Query, Opts);
+maybe_search_bm25(false, Collection, Query, Opts) ->
+    StoreName = collection_to_store(Collection),
+    barrel_vectordb:search_bm25(StoreName, Query, Opts).
+
+maybe_search_hybrid(true, Collection, Query, Opts) ->
+    barrel_vectordb:cluster_search_hybrid(Collection, Query, Opts);
+maybe_search_hybrid(false, Collection, Query, Opts) ->
+    StoreName = collection_to_store(Collection),
+    barrel_vectordb:search_hybrid(StoreName, Query, Opts).
 
 %% Internal helpers
 
@@ -437,3 +519,32 @@ format_json_value(Val) when is_boolean(Val) -> Val;
 format_json_value(Val) when is_list(Val) -> [format_json_value(V) || V <- Val];
 format_json_value(Val) when is_map(Val) -> maps:map(fun(_, V) -> format_json_value(V) end, Val);
 format_json_value(Val) -> iolist_to_binary(io_lib:format("~p", [Val])).
+
+%% @private Format BM25 search results
+%% Input: [{DocId, Score}]
+%% Output: [#{id => DocId, score => Score}]
+format_bm25_results(Results) when is_list(Results) ->
+    [#{<<"id">> => Id, <<"score">> => Score} || {Id, Score} <- Results].
+
+%% @private Format hybrid search results
+%% Input may be [{DocId, Score}] or [#{id => ..., score => ...}]
+format_hybrid_results(Results) when is_list(Results) ->
+    lists:map(fun format_hybrid_result/1, Results).
+
+format_hybrid_result({Id, Score}) ->
+    #{<<"id">> => Id, <<"score">> => Score};
+format_hybrid_result(#{id := Id, score := Score} = Result) ->
+    Base = #{<<"id">> => Id, <<"score">> => Score},
+    case maps:get(bm25_score, Result, undefined) of
+        undefined -> Base;
+        BM25Score ->
+            VectorScore = maps:get(vector_score, Result, 0.0),
+            Base#{<<"bm25_score">> => BM25Score, <<"vector_score">> => VectorScore}
+    end;
+format_hybrid_result(Result) when is_map(Result) ->
+    maps:fold(
+        fun(K, V, Acc) when is_atom(K) ->
+            Acc#{atom_to_binary(K, utf8) => format_json_value(V)};
+           (K, V, Acc) ->
+            Acc#{K => format_json_value(V)}
+        end, #{}, Result).

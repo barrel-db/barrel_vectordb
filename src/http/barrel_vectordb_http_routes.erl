@@ -65,5 +65,7 @@ collection_routes(Prefix) ->
         {<<Prefix/binary, "/collections/:collection/docs/:id">>, barrel_vectordb_http_handlers, #{action => doc}},
 
         %% Search
-        {<<Prefix/binary, "/collections/:collection/search">>, barrel_vectordb_http_handlers, #{action => search}}
+        {<<Prefix/binary, "/collections/:collection/search">>, barrel_vectordb_http_handlers, #{action => search}},
+        {<<Prefix/binary, "/collections/:collection/search/bm25">>, barrel_vectordb_http_handlers, #{action => search_bm25}},
+        {<<Prefix/binary, "/collections/:collection/search/hybrid">>, barrel_vectordb_http_handlers, #{action => search_hybrid}}
     ].

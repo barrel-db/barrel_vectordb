@@ -197,6 +197,102 @@ POST /vectordb/collections/:collection/search
 }
 ```
 
+#### BM25 Search
+
+Keyword-based search using BM25 ranking. Requires `bm25_backend` to be configured for the collection.
+
+```
+POST /vectordb/collections/:collection/search/bm25
+```
+
+**Request Body:**
+
+```json
+{
+  "query": "erlang programming",
+  "k": 10
+}
+```
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "id": "doc-456",
+      "score": 2.45
+    },
+    {
+      "id": "doc-789",
+      "score": 1.82
+    }
+  ]
+}
+```
+
+| Status | Error Code | Description |
+|--------|------------|-------------|
+| 200 | - | Search completed successfully |
+| 400 | `bad_request` | Missing or invalid query |
+| 400 | `no_bm25_index` | BM25 not configured for collection |
+
+#### Hybrid Search
+
+Combined BM25 keyword search and vector semantic search with score fusion.
+
+```
+POST /vectordb/collections/:collection/search/hybrid
+```
+
+**Request Body:**
+
+```json
+{
+  "query": "erlang concurrency",
+  "k": 10,
+  "bm25_weight": 0.5,
+  "vector_weight": 0.5,
+  "fusion": "rrf"
+}
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | string | required | Search query text |
+| `k` | integer | 10 | Number of results to return |
+| `bm25_weight` | float | 0.5 | Weight for BM25 scores (0-1) |
+| `vector_weight` | float | 0.5 | Weight for vector scores (0-1) |
+| `fusion` | string | "rrf" | Fusion algorithm: `rrf` or `linear` |
+
+**Fusion Algorithms:**
+
+- `rrf` - Reciprocal Rank Fusion (recommended): Combines rankings using `1/(k + rank)` formula
+- `linear` - Linear combination: Weighted sum of normalized scores
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "id": "doc-456",
+      "score": 0.85,
+      "bm25_score": 2.45,
+      "vector_score": 0.92
+    }
+  ]
+}
+```
+
+| Status | Error Code | Description |
+|--------|------------|-------------|
+| 200 | - | Search completed successfully |
+| 400 | `bad_request` | Missing or invalid query |
+| 400 | `no_bm25_index` | BM25 not configured for collection |
+
 ### Cluster Status
 
 #### Get Cluster Status
