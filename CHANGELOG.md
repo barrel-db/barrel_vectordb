@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-02-03
+
+### Added
+
+- **BM25 Disk Backend**: RocksDB-based persistent BM25 index with Block-Max MaxScore algorithm
+  - Disk-native storage using RocksDB column families for term posting lists
+  - Block-Max indexing for faster query evaluation with early termination
+  - MaxScore optimization that skips low-scoring documents
+  - Configurable block size (default: 128 documents per block)
+  - Full persistence with automatic recovery on restart
+  - New module: `barrel_vectordb_bm25_disk`
+
+- **BM25 Cluster Integration**: Distributed BM25 search with scatter-gather
+  - Scatter queries across shards, gather and merge results
+  - IDF synchronization across cluster for consistent scoring
+  - Global document statistics for accurate term weighting
+  - Works with both memory and disk backends
+
+- **BM25 HTTP Endpoints**: REST API for BM25 and hybrid search
+  - `POST /vectordb/collections/:collection/search/bm25` - Keyword search
+  - `POST /vectordb/collections/:collection/search/hybrid` - Combined BM25 + vector search
+  - Fusion algorithms: RRF (Reciprocal Rank Fusion) and linear combination
+  - Configurable weights for BM25 and vector components
+
+- **BM25 Formula Correctness Tests**: Verification suite with hand-calculated expected scores
+  - 11 formula tests covering TF/IDF impact, parameter effects, edge cases
+  - 100-document test corpus across 5 topic clusters
+  - 20 test queries with relevance judgments
+  - IR evaluation metrics: Precision@K, Recall@K, nDCG@10
+
+- **BM25 Performance Benchmarks**: Benchmark suite for BM25 backends
+  - Memory vs disk backend comparison
+  - Index build, search, and update performance metrics
+
+### Fixed
+
+- Fix hybrid_search benchmark to handle missing embedder gracefully
+
 ## [1.4.0] - 2026-01-18
 
 ### Added
