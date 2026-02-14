@@ -1,6 +1,21 @@
+<div align="center">
+
 # barrel_vectordb
 
-Erlang vector database for semantic search.
+**High-performance vector database for Erlang with HNSW, FAISS, DiskANN, and BM25 backends**
+
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/Status-Alpha-orange.svg)]()
+
+[Documentation](https://docs.barrel-db.eu/vectordb) |
+[Examples](./examples) |
+[barrel-db.eu](https://barrel-db.eu)
+
+</div>
+
+---
+
+> **Alpha Software** - API may change. Feedback welcome via [GitLab Issues](https://gitlab.enki.io/barrel-db/barrel_vectordb/-/issues).
 
 ## Quick Start
 
@@ -677,6 +692,17 @@ See [docs/gateway.md](docs/gateway.md) for full documentation.
 
 See the API documentation for detailed architecture information.
 
+## Support
+
+| Channel | For |
+|---------|-----|
+| [GitLab Issues](https://gitlab.enki.io/barrel-db/barrel_vectordb/-/issues) | Bug reports, feature requests |
+| [Email](mailto:support@barrel-db.eu) | Commercial inquiries |
+
 ## License
 
-Apache-2.0
+Apache-2.0. See [LICENSE](LICENSE) for details.
+
+---
+
+Built by [Enki Multimedia](https://enki-multimedia.eu) | [barrel-db.eu](https://barrel-db.eu)

@@ -1,14 +1,14 @@
 site_name: Barrel VectorDB
 site_description: Embeddable vector database with HNSW indexing and semantic search
-site_url: https://barrel-db.gitlab.io/barrel_vectordb
+site_url: https://docs.barrel-db.eu/vectordb
 repo_url: https://gitlab.enki.io/barrel-db/barrel_vectordb
 repo_name: barrel-db/barrel_vectordb
 edit_uri: edit/main/
 
 theme:
   name: material
-  logo: assets/logo.png
-  favicon: assets/favicon.png
+  logo: assets/logo.svg
+  favicon: assets/favicon.svg
   font:
     text: Roboto
     code: Roboto Mono
