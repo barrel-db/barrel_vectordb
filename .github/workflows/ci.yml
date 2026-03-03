@@ -29,10 +29,37 @@ jobs:
 
       - name: Run EUnit tests
         run: |
+          # Core tests
           rebar3 eunit --module=barrel_vectordb_tests
           rebar3 eunit --module=barrel_vectordb_store_tests
           rebar3 eunit --module=barrel_vectordb_hnsw_tests
           rebar3 eunit --module=barrel_vectordb_comprehensive_tests
+          rebar3 eunit --module=barrel_vectordb_backend_tests
+          rebar3 eunit --module=barrel_vectordb_index_tests
+          rebar3 eunit --module=barrel_vectordb_distance_tests
+          rebar3 eunit --module=barrel_vectordb_pq_tests
+          rebar3 eunit --module=barrel_vectordb_diskann_tests
+          rebar3 eunit --module=barrel_vectordb_diskann_file_tests
+          rebar3 eunit --module=barrel_vectordb_scatter_tests
+          rebar3 eunit --module=barrel_vectordb_library_tests
+          # BM25 tests
+          rebar3 eunit --module=barrel_vectordb_bm25_tests
+          rebar3 eunit --module=barrel_vectordb_bm25_disk_tests
+          rebar3 eunit --module=barrel_vectordb_bm25_disk_file_tests
+          rebar3 eunit --module=barrel_vectordb_bm25_formula_tests
+          rebar3 eunit --module=barrel_vectordb_bm25_corpus_tests
+          # Gateway tests
+          rebar3 eunit --module=barrel_vectordb_gateway_keys_tests
+          rebar3 eunit --module=barrel_vectordb_gateway_prefix_tests
+          rebar3 eunit --module=barrel_vectordb_gateway_quotas_tests
+          rebar3 eunit --module=barrel_vectordb_gateway_rate_tests
+          rebar3 eunit --module=barrel_vectordb_system_db_tests
+          # HTTP tests
+          rebar3 eunit --module=barrel_vectordb_http_handlers_tests
+          # Cluster tests
+          rebar3 eunit --module=barrel_vectordb_cluster_tests
+          # Rerank unit tests
+          rebar3 eunit --module=barrel_vectordb_rerank_tests
 
       - name: Coverage
         run: rebar3 cover --verbose
