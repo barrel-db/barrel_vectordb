@@ -31,14 +31,29 @@ bm25_api_test_() ->
          [
              {"bm25 search returns results", fun() -> test_bm25_api_search(State) end},
              {"bm25 search empty results", fun() -> test_bm25_api_empty(State) end},
-             {"bm25 search no index", fun() -> test_bm25_api_no_index(State) end},
-             {"hybrid search returns results", fun() -> test_hybrid_api_search(State) end},
-             {"hybrid search with weights", fun() -> test_hybrid_api_weights(State) end}
+             {"bm25 search no index", fun() -> test_bm25_api_no_index(State) end}
          ]
      end}.
 
+%% Test Hybrid search with Python embedder
+hybrid_api_test_() ->
+    {setup,
+     fun setup_hybrid_store/0,
+     fun cleanup_hybrid_store/1,
+     fun(State) ->
+         case State of
+             skip ->
+                 [];
+             _ ->
+                 [
+                     {timeout, 60, {"hybrid search returns results", fun() -> test_hybrid_api_search(State) end}},
+                     {timeout, 60, {"hybrid search with weights", fun() -> test_hybrid_api_weights(State) end}}
+                 ]
+         end
+     end}.
+
 %%====================================================================
-%% Setup/Cleanup
+%% Setup/Cleanup for BM25 tests
 %%====================================================================
 
 setup_store() ->
@@ -84,6 +99,111 @@ cleanup_store(#{tmp_dir := TmpDir, store := Store, no_index_store := NoIndexStor
     barrel_vectordb:stop(Store),
     barrel_vectordb:stop(NoIndexStore),
     cleanup_tmp_dir(TmpDir).
+
+%%====================================================================
+%% Setup/Cleanup for Hybrid tests (requires Python embedder)
+%%====================================================================
+
+setup_hybrid_store() ->
+    case check_local_available() of
+        false ->
+            io:format("~n  SKIPPED: Python/sentence-transformers not available~n"),
+            skip;
+        true ->
+            TmpDir = make_tmp_dir(),
+            StoreName = test_http_hybrid_store,
+            EmbedderConfig = embedder_config(),
+
+            %% Start store with embedder and BM25
+            {ok, _} = barrel_vectordb:start_link(#{
+                name => StoreName,
+                path => TmpDir,
+                dimensions => 384,  %% all-MiniLM-L6-v2 produces 384D vectors
+                embedder => EmbedderConfig,
+                bm25_backend => memory
+            }),
+
+            %% Add test documents using embedder
+            ok = barrel_vectordb:add(StoreName, <<"doc1">>, <<"erlang programming functional concurrent">>, #{}),
+            ok = barrel_vectordb:add(StoreName, <<"doc2">>, <<"python programming scripting data">>, #{}),
+            ok = barrel_vectordb:add(StoreName, <<"doc3">>, <<"erlang otp distributed fault tolerant">>, #{}),
+            ok = barrel_vectordb:add(StoreName, <<"doc4">>, <<"java enterprise spring framework">>, #{}),
+            ok = barrel_vectordb:add(StoreName, <<"doc5">>, <<"erlang beam virtual machine">>, #{}),
+
+            #{
+                tmp_dir => TmpDir,
+                store => StoreName
+            }
+    end.
+
+cleanup_hybrid_store(skip) ->
+    ok;
+cleanup_hybrid_store(#{tmp_dir := TmpDir, store := Store}) ->
+    barrel_vectordb:stop(Store),
+    cleanup_tmp_dir(TmpDir).
+
+%%====================================================================
+%% Helpers for Python embedder
+%%====================================================================
+
+check_local_available() ->
+    Parent = self(),
+    Ref = make_ref(),
+    Pid = spawn(fun() ->
+        Result = case barrel_embed_local:init(local_config()) of
+            {ok, #{server := Server}} ->
+                %% Cleanup the embed server process
+                exit(Server, shutdown),
+                true;
+            {ok, _Config} ->
+                true;
+            {error, _} ->
+                false
+        end,
+        Parent ! {Ref, Result}
+    end),
+    receive
+        {Ref, Result} -> Result
+    after 30000 ->
+        exit(Pid, kill),
+        false
+    end.
+
+local_config() ->
+    BaseConfig = case os:getenv("BARREL_PYTHON") of
+        false ->
+            case find_venv_python() of
+                {ok, Python} -> #{python => Python};
+                not_found -> #{}
+            end;
+        Python -> #{python => Python}
+    end,
+    %% Use small model for faster tests
+    BaseConfig#{model => "sentence-transformers/all-MiniLM-L6-v2"}.
+
+embedder_config() ->
+    %% Store expects {local, Config} format
+    {local, local_config()}.
+
+find_venv_python() ->
+    VenvPaths = [
+        ".venv/bin/python",
+        "../.venv/bin/python",
+        "../../.venv/bin/python"
+    ],
+    find_first_file(VenvPaths).
+
+find_first_file([]) ->
+    not_found;
+find_first_file([Path | Rest]) ->
+    case filelib:is_file(Path) of
+        true -> {ok, Path};
+        false -> find_first_file(Rest)
+    end.
+
+%%====================================================================
+%% Common Helpers
+%%====================================================================
 
 make_tmp_dir() ->
     N = erlang:unique_integer([positive]),
@@ -183,15 +303,24 @@ test_bm25_api_no_index(#{no_index_store := NoIndexStore}) ->
     Result = barrel_vectordb:search_bm25(NoIndexStore, <<"erlang">>, #{k => 10}),
     ?assertEqual({error, bm25_not_enabled}, Result).
 
+%%====================================================================
+%% Hybrid API Tests
+%%====================================================================
+
 test_hybrid_api_search(#{store := Store}) ->
-    %% Hybrid search requires embedder for vector component
-    %% Without embedder, it returns error
+    %% Hybrid search with embedder configured
     Result = barrel_vectordb:search_hybrid(Store, <<"erlang programming">>, #{k => 10}),
-    %% Should return error since no embedder configured
-    ?assertMatch({error, _}, Result).
+    ?assertMatch({ok, _}, Result),
+    {ok, Results} = Result,
+    ?assert(is_list(Results)),
+    ?assert(length(Results) > 0),
+    %% Results should have erlang-related docs ranked high
+    [First | _] = Results,
+    ?assert(is_map(First)),
+    ?assert(maps:is_key(key, First) orelse maps:is_key(id, First)).
 
 test_hybrid_api_weights(#{store := Store}) ->
-    %% Hybrid search requires embedder - expect error without one
+    %% Hybrid search with custom weights
     Opts = #{
         k => 5,
         bm25_weight => 0.7,
@@ -199,7 +328,10 @@ test_hybrid_api_weights(#{store := Store}) ->
         fusion => rrf
     },
     Result = barrel_vectordb:search_hybrid(Store, <<"erlang">>, Opts),
-    ?assertMatch({error, _}, Result).
+    ?assertMatch({ok, _}, Result),
+    {ok, Results} = Result,
+    ?assert(is_list(Results)),
+    ?assert(length(Results) =< 5).  %% respects k limit
 
 %%====================================================================
 %% Helper Functions (copied from handlers for testing)

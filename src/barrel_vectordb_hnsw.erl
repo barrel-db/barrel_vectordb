@@ -490,7 +490,10 @@ dot_product_int8_acc(<<A1:8/signed, A2:8/signed, A3:8/signed, A4:8/signed,
     dot_product_int8_acc(RestA, RestB, Acc + Sum);
 dot_product_int8_acc(<<A:8/signed, RestA/binary>>, <<B:8/signed, RestB/binary>>, Acc) ->
     dot_product_int8_acc(RestA, RestB, Acc + A * B);
-dot_product_int8_acc(<<>>, <<>>, Acc) -> Acc.
+dot_product_int8_acc(<<>>, <<>>, Acc) -> Acc;
+%% Handle mismatched vector lengths gracefully (return accumulated value)
+dot_product_int8_acc(<<>>, _, Acc) -> Acc;
+dot_product_int8_acc(_, <<>>, Acc) -> Acc.
 
 %% Euclidean sum of squares for int8 vectors - optimized 4 bytes at a time
 euclidean_sum_sq_int8(A, B, QS, NS, Acc) ->
@@ -511,7 +514,10 @@ euclidean_sum_sq_int8_acc(<<A:8/signed, RestA/binary>>, <<B:8/signed, RestB/bina
                           ScaleQ, ScaleN, Acc) ->
     Diff = A * ScaleQ - B * ScaleN,
     euclidean_sum_sq_int8_acc(RestA, RestB, ScaleQ, ScaleN, Acc + Diff * Diff);
-euclidean_sum_sq_int8_acc(<<>>, <<>>, _ScaleQ, _ScaleN, Acc) -> Acc.
+euclidean_sum_sq_int8_acc(<<>>, <<>>, _ScaleQ, _ScaleN, Acc) -> Acc;
+%% Handle mismatched vector lengths gracefully
+euclidean_sum_sq_int8_acc(<<>>, _, _ScaleQ, _ScaleN, Acc) -> Acc;
+euclidean_sum_sq_int8_acc(_, <<>>, _ScaleQ, _ScaleN, Acc) -> Acc.
 
 %%====================================================================
 %% Internal: Search with Priority Queue (gb_trees)
