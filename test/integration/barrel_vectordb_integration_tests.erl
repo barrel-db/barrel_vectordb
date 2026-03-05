@@ -27,12 +27,12 @@ integration_test_() ->
        {"local: embed single text", {timeout, 60, fun test_local_embed/0}},
        {"local: embed batch", {timeout, 60, fun test_local_batch/0}},
        {"local: custom model", {timeout, 60, fun test_local_custom_model/0}},
-       {"ollama: embed single text", fun test_ollama_embed/0},
-       {"ollama: embed batch", fun test_ollama_batch/0},
-       {"ollama: custom model", fun test_ollama_custom_model/0},
-       {"openai: embed single text", fun test_openai_embed/0},
-       {"openai: embed batch", fun test_openai_batch/0},
-       {"openai: custom model", fun test_openai_custom_model/0},
+       {"ollama: embed single text", {timeout, 30, fun test_ollama_embed/0}},
+       {"ollama: embed batch", {timeout, 30, fun test_ollama_batch/0}},
+       {"ollama: custom model", {timeout, 30, fun test_ollama_custom_model/0}},
+       {"openai: embed single text", {timeout, 30, fun test_openai_embed/0}},
+       {"openai: embed batch", {timeout, 30, fun test_openai_batch/0}},
+       {"openai: custom model", {timeout, 30, fun test_openai_custom_model/0}},
        {"provider chain fallback", {timeout, 60, fun test_provider_chain/0}}
       ]
      }
