@@ -175,7 +175,13 @@
     filter => fun((metadata()) -> boolean()),
     include_text => boolean(),
     include_metadata => boolean(),
-    ef_search => pos_integer()
+    ef_search => pos_integer(),
+    %% Hybrid search options
+    bm25_weight => float(),
+    vector_weight => float(),
+    fusion => rrf | linear,
+    %% Cluster options (internal use)
+    collection => binary()
 }.
 %% Options for search operations.
 %% - `k': Number of results to return (default: 5)
@@ -195,13 +201,17 @@
 
 -type store_config() :: #{
     name := atom(),
-    path => string(),
+    path => string() | binary(),
     dimensions => pos_integer(),
     embedder => embedder_config(),
     backend => hnsw | faiss | diskann,
     hnsw => hnsw_config(),
     faiss => faiss_config(),
-    diskann => diskann_config()
+    diskann => diskann_config(),
+    %% BM25 options
+    bm25_backend => memory | disk | none,
+    bm25 => map(),
+    bm25_disk => map()
 }.
 %% Store configuration options.
 

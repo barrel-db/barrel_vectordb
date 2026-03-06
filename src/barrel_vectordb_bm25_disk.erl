@@ -220,7 +220,7 @@ close(#bm25_disk_index{file_handle = FileHandle, id_db = IdDb,
     end,
 
     %% Close RocksDB if standalone
-    case Standalone andalso IdDb =/= undefined of
+    _ = case Standalone andalso IdDb =/= undefined of
         true -> rocksdb:close(IdDb);
         false -> ok
     end,

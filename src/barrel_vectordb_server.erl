@@ -848,12 +848,8 @@ do_delete(Id, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
             case Mod:delete(Index, Id) of
                 {ok, NewIndex} ->
                     %% Also remove from BM25 index if enabled
-                    case bm25_remove(BM25Index, Id) of
-                        {ok, NewBM25Index} ->
-                            {ok, State#state{index = NewIndex, bm25_index = NewBM25Index}};
-                        {error, Reason} ->
-                            {error, {bm25_error, Reason}}
-                    end;
+                    {ok, NewBM25Index} = bm25_remove(BM25Index, Id),
+                    {ok, State#state{index = NewIndex, bm25_index = NewBM25Index}};
                 {error, Reason} -> {error, Reason}
             end;
         {error, Reason} ->
@@ -1059,8 +1055,7 @@ bm25_remove(Index, Id) ->
     %% Disk BM25
     case barrel_vectordb_bm25_disk:remove(Index, Id) of
         {ok, NewIndex} -> {ok, NewIndex};
-        {error, not_found} -> {ok, Index};
-        {error, _} = Error -> Error
+        {error, not_found} -> {ok, Index}
     end.
 
 %% Search BM25 index
