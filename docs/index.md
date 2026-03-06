@@ -137,6 +137,6 @@ ok = barrel_vectordb:add(my_store, <<"doc2">>, <<"Goodbye world">>, #{}).
 
 ## Community & Support
 
-- [:fontawesome-brands-gitlab: GitLab Repository](https://gitlab.enki.io/barrel-db/barrel_vectordb)
+- [:fontawesome-brands-github: GitHub Repository](https://github.com/barrel-db/barrel_vectordb)
 - [:material-file-document: Erlang API](api/erlang.md)
-- [:material-bug: Report Issues](https://gitlab.enki.io/barrel-db/barrel_vectordb/-/issues)
+- [:material-bug: Report Issues](https://github.com/barrel-db/barrel_vectordb/issues)
