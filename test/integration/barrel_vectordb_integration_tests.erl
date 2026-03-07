@@ -384,9 +384,8 @@ check_openai_available() ->
 check_ollama_model_available(Model) ->
     application:ensure_all_started(hackney),
     case hackney:request(get, <<"http://localhost:11434/api/tags">>, [], <<>>,
-                         [{recv_timeout, 5000}]) of
-        {ok, 200, _, ClientRef} ->
-            {ok, Body} = hackney:body(ClientRef),
+                         [{recv_timeout, 5000}, with_body]) of
+        {ok, 200, _, Body} ->
             try
                 #{<<"models">> := Models} = json:decode(Body),
                 lists:any(fun(#{<<"name">> := Name}) ->
