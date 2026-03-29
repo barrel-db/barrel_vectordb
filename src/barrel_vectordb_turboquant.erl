@@ -167,7 +167,14 @@ decode(#tq_config{dimension = Dim, rotation_matrix = RotMat,
     apply_qjl_correction(Vector, QJLSigns, QJLMat, QJLDim).
 
 %% @doc Precompute distance lookup tables for a query vector
-%% This enables fast asymmetric distance computation
+%% This enables fast asymmetric distance computation (ADC)
+%%
+%% Full ADC table format per pair:
+%%   QRSq (32-bit float) + NumLevels * CosTerm (32-bit floats)
+%% where CosTerm_i = 2 * r_q * cos(theta_q - angle_center_i)
+%%
+%% Distance formula: d^2 = r_q^2 + r_d^2 - 2*r_q*r_d*cos(theta_diff)
+%%                       = QRSq + r_d^2 - CosTerm * r_d
 -spec precompute_tables(tq_config(), [float()]) -> distance_tables().
 precompute_tables(#tq_config{dimension = Dim, bits = Bits,
                              rotation_matrix = RotMat, angle_levels = Levels}, Query)
@@ -175,45 +182,42 @@ precompute_tables(#tq_config{dimension = Dim, bits = Bits,
     %% Rotate query
     RotatedQuery = apply_rotation(RotMat, Query),
 
-    %% For each pair, precompute distances to all possible quantized values
+    %% For each pair, precompute query radius squared and cos terms
     NumLevels = 1 bsl Bits,
     NumPairs = Dim div 2,
 
-    %% Create lookup tables: for each pair, for each angle level,
-    %% store partial squared distances
+    %% Create lookup tables: for each pair, store QRSq and cos terms
     Tables = lists:map(
         fun(PairIdx) ->
             Offset = PairIdx * 2,
             QX = lists:nth(Offset + 1, RotatedQuery),
             QY = lists:nth(Offset + 2, RotatedQuery),
+            QR = math:sqrt(QX * QX + QY * QY),
+            QRSq = QR * QR,
             QTheta = math:atan2(QY, QX),
 
-            %% For each possible radius bucket and angle, compute distance
-            %% Simplified: store cos(angle_diff) for angle-based lookup
-            %% The query radius QR = sqrt(QX^2 + QY^2) is used implicitly
-            %% in the full distance computation
-            _ = QX * QX + QY * QY,  %% QR^2 would be used in full ADC
-            lists:map(
+            %% Precompute 2 * r_q * cos(theta_q - angle_center) for each level
+            CosTerms = lists:map(
                 fun(AngleIdx) ->
-                    %% Get center angle for this bucket
                     CenterAngle = lists:nth(AngleIdx + 1, Levels),
-                    %% Approximate squared distance contribution
-                    %% d^2 = r_q^2 + r_d^2 - 2*r_q*r_d*cos(theta_q - theta_d)
-                    %% We store cos(angle_diff) for lookup
                     AngleDiff = QTheta - CenterAngle,
-                    math:cos(AngleDiff)
+                    2.0 * QR * math:cos(AngleDiff)
                 end,
                 lists:seq(0, NumLevels - 1)
-            )
+            ),
+            {QRSq, CosTerms}
         end,
         lists:seq(0, NumPairs - 1)
     ),
 
-    %% Pack tables as binary (NumPairs * NumLevels floats)
-    << <<F:32/float-little>> || Row <- Tables, F <- Row >>.
+    %% Pack tables as binary: for each pair, QRSq followed by NumLevels cos terms
+    << <<QRSq:32/float-little, (<< <<CT:32/float-little>> || CT <- CosTerms >>)/binary>>
+       || {QRSq, CosTerms} <- Tables >>.
 
 %% @doc Compute asymmetric distance using precomputed tables
-%% Tables contain precomputed cos(angle_diff) values for each pair and angle bucket
+%% Full ADC with correct polar distance formula:
+%%   d^2 = r_q^2 + r_d^2 - 2*r_q*r_d*cos(theta_diff)
+%%       = QRSq + r_d^2 - CosTerm * r_d
 %%
 %% Performance note: This ADC computation can be moved to C/NIF for better
 %% performance if needed, similar to barrel_vectordb_hnsw distance functions.
@@ -221,7 +225,8 @@ precompute_tables(#tq_config{dimension = Dim, bits = Bits,
 -spec distance(distance_tables(), tq_code()) -> float().
 distance(Tables, <<?TQ_VERSION:8, Bits:8, _Flags:16, Rest/binary>>) ->
     NumLevels = 1 bsl Bits,
-    TableRowSize = NumLevels * 4,  %% 4 bytes per float32
+    %% Table row size: QRSq (1 float) + NumLevels cos terms
+    TableRowSize = (1 + NumLevels) * 4,
 
     %% Calculate sizes from table size
     TablesSize = byte_size(Tables),
@@ -237,10 +242,9 @@ distance(Tables, <<?TQ_VERSION:8, Bits:8, _Flags:16, Rest/binary>>) ->
     Radii = [dequantize_radius(R) || <<R:16/unsigned-little>> <= RadiusBin],
     AngleIndices = unpack_bits(AngleBin, Bits, NumPairs),
 
-    %% Compute distance using ADC (Asymmetric Distance Computation)
-    %% For each pair: d² contribution ≈ r² * (1 - cos(angle_diff))
-    %% This approximates the squared distance in polar coordinates
-    compute_adc_distance(Tables, Radii, AngleIndices, NumLevels, 0, 0.0).
+    %% Compute distance using full ADC (Asymmetric Distance Computation)
+    %% For each pair: d^2 = QRSq + DR^2 - CosTerm * DR
+    compute_full_adc_distance(Tables, Radii, AngleIndices, NumLevels, 0, 0.0).
 
 %% @doc Batch encode multiple vectors
 -spec batch_encode(tq_config(), [[float()]]) -> [tq_code()].
@@ -627,18 +631,26 @@ apply_qjl_correction(Vector, _QJLSigns, _QJLMatrix, _QJLDim) ->
     %% This is a refinement step that improves accuracy
     Vector.
 
-%% ADC (Asymmetric Distance Computation) using precomputed tables
-compute_adc_distance(_Tables, [], [], _NumLevels, _PairIdx, Acc) ->
+%% Full ADC (Asymmetric Distance Computation) using precomputed tables
+%% Table format per pair: QRSq (1 float) + NumLevels cos terms
+%% Distance: d^2 = QRSq + DR^2 - CosTerm * DR
+compute_full_adc_distance(_Tables, [], [], _NumLevels, _PairIdx, Acc) ->
     math:sqrt(max(0.0, Acc));
-compute_adc_distance(Tables, [R | RestR], [AngleIdx | RestA], NumLevels, PairIdx, Acc) ->
-    %% Look up cos value from table
-    TableRowSize = NumLevels * 4,
-    Offset = PairIdx * TableRowSize + AngleIdx * 4,
-    <<_:Offset/binary, CosVal:32/float-little, _/binary>> = Tables,
+compute_full_adc_distance(Tables, [DR | RestR], [AngleIdx | RestA], NumLevels, PairIdx, Acc) ->
+    %% Table row size: QRSq (1 float) + NumLevels cos terms
+    TableRowSize = (1 + NumLevels) * 4,
 
-    %% Approximate squared distance contribution
-    %% Using: d^2 ~ r^2 * (1 - cos(angle_diff))
-    %% This is a simplified approximation
-    ContribSq = R * R * max(0.0, 1.0 - CosVal),
+    %% Look up QRSq and CosTerm from table
+    RowOffset = PairIdx * TableRowSize,
+    <<_:RowOffset/binary, QRSq:32/float-little, CosTermsBin/binary>> = Tables,
 
-    compute_adc_distance(Tables, RestR, RestA, NumLevels, PairIdx + 1, Acc + ContribSq).
+    %% Get the CosTerm for this angle index
+    CosTermOffset = AngleIdx * 4,
+    <<_:CosTermOffset/binary, CosTerm:32/float-little, _/binary>> = CosTermsBin,
+
+    %% Full polar distance formula: d^2 = r_q^2 + r_d^2 - 2*r_q*r_d*cos(theta_diff)
+    %% CosTerm already contains 2 * r_q * cos(theta_diff)
+    DRSq = DR * DR,
+    ContribSq = QRSq + DRSq - CosTerm * DR,
+
+    compute_full_adc_distance(Tables, RestR, RestA, NumLevels, PairIdx + 1, Acc + ContribSq).

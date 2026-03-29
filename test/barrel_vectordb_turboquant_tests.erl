@@ -23,6 +23,8 @@ turboquant_test_() ->
         {"reconstruction error is bounded", fun test_reconstruction_error/0},
         {"precompute tables works", fun test_precompute_tables/0},
         {"distance approximates true distance", fun test_distance_accuracy/0},
+        {"full ADC distance accuracy", fun test_full_adc_accuracy/0},
+        {"ADC relative error bounded", fun test_adc_error_bound/0},
         {"batch encode works", fun test_batch_encode/0},
         {"rotation matrix is orthogonal", fun test_rotation_orthogonal/0},
         {"deterministic with same seed", fun test_deterministic_seed/0},
@@ -134,11 +136,11 @@ test_precompute_tables() ->
     Query = random_vector(32),
     Tables = barrel_vectordb_turboquant:precompute_tables(Config, Query),
 
-    %% Tables should be NumPairs * NumLevels * 4 bytes
+    %% Tables should be NumPairs * (1 + NumLevels) * 4 bytes
     %% NumPairs = 32/2 = 16
     %% NumLevels = 2^3 = 8
-    %% Expected: 16 * 8 * 4 = 512 bytes
-    ?assertEqual(512, byte_size(Tables)).
+    %% Expected: 16 * (1 + 8) * 4 = 576 bytes
+    ?assertEqual(576, byte_size(Tables)).
 
 test_distance_accuracy() ->
     %% TurboQuant distance should approximate true distance
@@ -167,6 +169,52 @@ test_distance_accuracy() ->
     %% The simplified ADC is not accurate, this tests the mechanism works
     AvgRelError = lists:sum(Errors) / length(Errors),
     ?assert(is_float(AvgRelError)).
+
+test_full_adc_accuracy() ->
+    %% Full ADC should have reasonable accuracy
+    %% Test average relative error < 10% over many random vector pairs
+    {ok, Config} = barrel_vectordb_turboquant:new(#{bits => 3, dimension => 64, seed => 42}),
+
+    Errors = lists:map(
+        fun(I) ->
+            %% Use deterministic vectors for reproducibility
+            rand:seed(exsss, {I * 17, I * 31, I * 47}),
+            V1 = random_vector(64),
+            V2 = random_vector(64),
+
+            TrueDist = euclidean_distance(V1, V2),
+            Tables = barrel_vectordb_turboquant:precompute_tables(Config, V1),
+            Code2 = barrel_vectordb_turboquant:encode(Config, V2),
+            TQDist = barrel_vectordb_turboquant:distance(Tables, Code2),
+
+            case TrueDist < 0.01 of
+                true -> 0.0;  %% Skip near-zero distances
+                false -> abs(TrueDist - TQDist) / TrueDist
+            end
+        end,
+        lists:seq(1, 100)
+    ),
+
+    AvgRelError = lists:sum(Errors) / length(Errors),
+    %% Full ADC with correct polar formula should have < 10% average error
+    ?assert(AvgRelError < 0.10).
+
+test_adc_error_bound() ->
+    %% Test single case with known vectors to verify error bound
+    {ok, Config} = barrel_vectordb_turboquant:new(#{bits => 3, dimension => 32, seed => 123}),
+
+    %% Create specific test vectors
+    V1 = [0.1 * I || I <- lists:seq(1, 32)],
+    V2 = [-0.1 * I + 0.5 || I <- lists:seq(1, 32)],
+
+    TrueDist = euclidean_distance(V1, V2),
+    Tables = barrel_vectordb_turboquant:precompute_tables(Config, V1),
+    Code2 = barrel_vectordb_turboquant:encode(Config, V2),
+    TQDist = barrel_vectordb_turboquant:distance(Tables, Code2),
+
+    RelError = abs(TrueDist - TQDist) / TrueDist,
+    %% Single case should have < 15% relative error
+    ?assert(RelError < 0.15).
 
 test_batch_encode() ->
     {ok, Config} = barrel_vectordb_turboquant:new(#{bits => 3, dimension => 32}),
