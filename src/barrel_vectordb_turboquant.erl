@@ -54,7 +54,9 @@
     rotation_matrix :: binary(),      %% Cached D x D orthogonal rotation matrix
     qjl_matrix :: binary(),           %% D x qjl_dim random +-1 matrix for QJL
     qjl_dim :: pos_integer(),         %% QJL projection dimension (default: D)
-    angle_levels :: [float()]         %% Quantization levels for angles
+    angle_levels :: [float()],        %% Quantization levels for angles
+    qjl_iterations :: non_neg_integer(), %% QJL correction iterations (default: 5)
+    qjl_learning_rate :: float()      %% QJL gradient learning rate (default: 0.1)
 }).
 
 -type tq_config() :: #tq_config{}.
@@ -76,12 +78,16 @@
 %%   qjl_bits - QJL error correction bits (default: 1)
 %%   dimension - vector dimension (required, must be even)
 %%   seed - random seed for rotation matrix (default: 42)
+%%   qjl_iterations - QJL correction iterations (default: 5)
+%%   qjl_learning_rate - QJL gradient learning rate (default: 0.1)
 -spec new(map()) -> {ok, tq_config()} | {error, term()}.
 new(Options) ->
     Bits = maps:get(bits, Options, 3),
     QJLBits = maps:get(qjl_bits, Options, 1),
     Dimension = maps:get(dimension, Options, undefined),
     Seed = maps:get(seed, Options, 42),
+    QJLIterations = maps:get(qjl_iterations, Options, 5),
+    QJLLearningRate = maps:get(qjl_learning_rate, Options, 0.1),
 
     case validate_config(Bits, Dimension) of
         ok ->
@@ -104,7 +110,9 @@ new(Options) ->
                 rotation_matrix = RotationMatrix,
                 qjl_matrix = QJLMatrix,
                 qjl_dim = QJLDim,
-                angle_levels = AngleLevels
+                angle_levels = AngleLevels,
+                qjl_iterations = QJLIterations,
+                qjl_learning_rate = QJLLearningRate
             }};
         {error, _} = Error ->
             Error
@@ -141,7 +149,8 @@ encode(#tq_config{dimension = Dim}, Vector) ->
 %% @doc Decode TurboQuant code back to approximate vector
 -spec decode(tq_config(), tq_code()) -> [float()].
 decode(#tq_config{dimension = Dim, rotation_matrix = RotMat,
-                  angle_levels = Levels, qjl_matrix = QJLMat, qjl_dim = QJLDim},
+                  angle_levels = Levels, qjl_matrix = QJLMat, qjl_dim = QJLDim,
+                  qjl_iterations = QJLIter, qjl_learning_rate = QJLLR},
        <<?TQ_VERSION:8, Bits:8, _Flags:16, Rest/binary>>) ->
     %% Calculate sizes
     NumPairs = Dim div 2,
@@ -163,8 +172,8 @@ decode(#tq_config{dimension = Dim, rotation_matrix = RotMat,
     %% Apply inverse rotation
     Vector = apply_inverse_rotation(RotMat, RotatedVec),
 
-    %% Apply QJL correction (sign-based refinement)
-    apply_qjl_correction(Vector, QJLSigns, QJLMat, QJLDim).
+    %% Apply QJL correction (sign-based iterative refinement)
+    apply_qjl_correction(Vector, QJLSigns, QJLMat, QJLDim, QJLIter, QJLLR).
 
 %% @doc Precompute distance lookup tables for a query vector
 %% This enables fast asymmetric distance computation (ADC)
@@ -254,7 +263,8 @@ batch_encode(Config, Vectors) ->
 %% @doc Get configuration info
 -spec info(tq_config()) -> map().
 info(#tq_config{bits = Bits, qjl_bits = QJLBits, dimension = Dim,
-                rotation_seed = Seed, qjl_dim = QJLDim}) ->
+                rotation_seed = Seed, qjl_dim = QJLDim,
+                qjl_iterations = QJLIter, qjl_learning_rate = QJLLR}) ->
     NumPairs = Dim div 2,
     %% Calculate bytes per vector
     HeaderBytes = 4,
@@ -269,6 +279,8 @@ info(#tq_config{bits = Bits, qjl_bits = QJLBits, dimension = Dim,
         qjl_bits => QJLBits,
         dimension => Dim,
         rotation_seed => Seed,
+        qjl_iterations => QJLIter,
+        qjl_learning_rate => QJLLR,
         bytes_per_vector => TotalBytes,
         compression_ratio => (Dim * 4) / TotalBytes,  %% vs float32
         training_required => false
@@ -624,12 +636,136 @@ compute_qjl_dot_acc(QJLMatrix, <<V:64/float-little, RestV/binary>>, Dim, RowIdx,
     Sign = if SignBit =:= 1 -> 1.0; true -> -1.0 end,
     compute_qjl_dot_acc(QJLMatrix, RestV, Dim, RowIdx, ColIdx + 1, Acc + Sign * V).
 
-%% Apply QJL error correction
-apply_qjl_correction(Vector, _QJLSigns, _QJLMatrix, _QJLDim) ->
-    %% Simplified: no correction applied
-    %% Full implementation would adjust vector based on sign mismatches
-    %% This is a refinement step that improves accuracy
-    Vector.
+%% Apply QJL error correction via iterative sign-constrained refinement
+%% For each iteration:
+%%   1. Compute current signs: sign(QJL * v_approx)
+%%   2. Compare with stored signs to find mismatches
+%%   3. Adjust vector toward satisfying sign constraints via gradient
+apply_qjl_correction(Vector, _StoredSigns, _QJLMatrix, _QJLDim, 0, _LR) ->
+    %% No iterations, return original vector
+    Vector;
+apply_qjl_correction(Vector, StoredSigns, QJLMatrix, QJLDim, Iterations, LR) ->
+    %% Convert vector to binary for efficient processing
+    VecBin = << <<V:64/float-little>> || V <- Vector >>,
+    Dim = length(Vector),
+
+    %% Run iterative refinement
+    FinalVecBin = qjl_iterate(VecBin, StoredSigns, QJLMatrix, Dim, QJLDim, Iterations, LR),
+
+    %% Convert back to list
+    [V || <<V:64/float-little>> <= FinalVecBin].
+
+qjl_iterate(VecBin, _StoredSigns, _QJLMatrix, _Dim, _QJLDim, 0, _LR) ->
+    VecBin;
+qjl_iterate(VecBin, StoredSigns, QJLMatrix, Dim, QJLDim, Iter, LR) ->
+    %% Compute current signs and gradient
+    Gradient = compute_qjl_gradient(VecBin, StoredSigns, QJLMatrix, Dim, QJLDim),
+
+    %% Normalize gradient to prevent overshooting
+    NormGradient = normalize_gradient(Gradient, VecBin),
+
+    %% Apply normalized gradient with learning rate
+    NewVecBin = apply_gradient(VecBin, NormGradient, LR),
+
+    qjl_iterate(NewVecBin, StoredSigns, QJLMatrix, Dim, QJLDim, Iter - 1, LR).
+
+%% Normalize gradient relative to vector magnitude
+normalize_gradient(GradientBin, VecBin) ->
+    VecNorm = compute_binary_norm(VecBin),
+    GradNorm = compute_binary_norm(GradientBin),
+    case GradNorm < 1.0e-10 of
+        true ->
+            GradientBin;  %% No gradient to apply
+        false ->
+            %% Scale gradient to be proportional to vector magnitude
+            Scale = VecNorm / (GradNorm * 10.0),  %% 10x dampening factor
+            scale_gradient(GradientBin, Scale)
+    end.
+
+compute_binary_norm(Bin) ->
+    SumSq = compute_binary_norm_acc(Bin, 0.0),
+    math:sqrt(SumSq).
+
+compute_binary_norm_acc(<<>>, Acc) ->
+    Acc;
+compute_binary_norm_acc(<<V:64/float-little, Rest/binary>>, Acc) ->
+    compute_binary_norm_acc(Rest, Acc + V * V).
+
+scale_gradient(GradientBin, Scale) ->
+    << <<(G * Scale):64/float-little>> || <<G:64/float-little>> <= GradientBin >>.
+
+%% Compute gradient from sign mismatches
+%% For each mismatch at row i: add target_sign * QJL_row_i to gradient
+compute_qjl_gradient(VecBin, StoredSigns, QJLMatrix, Dim, QJLDim) ->
+    %% Initialize zero gradient
+    Gradient = lists:duplicate(Dim, 0.0),
+
+    %% For each QJL row, check if sign matches
+    compute_qjl_gradient_rows(VecBin, StoredSigns, QJLMatrix, Dim, QJLDim, 0, Gradient).
+
+compute_qjl_gradient_rows(_VecBin, _StoredSigns, _QJLMatrix, _Dim, QJLDim, RowIdx, Gradient)
+  when RowIdx >= QJLDim ->
+    %% Convert gradient to binary
+    << <<G:64/float-little>> || G <- Gradient >>;
+compute_qjl_gradient_rows(VecBin, StoredSigns, QJLMatrix, Dim, QJLDim, RowIdx, Gradient) ->
+    %% Compute dot product of QJL row with vector
+    DotProd = compute_qjl_dot(QJLMatrix, VecBin, Dim, RowIdx),
+
+    %% Get current and stored signs
+    CurrentSign = if DotProd >= 0 -> 1; true -> -1 end,
+    StoredSign = get_stored_sign(StoredSigns, RowIdx),
+
+    %% If signs mismatch, add QJL row to gradient (scaled by target sign)
+    NewGradient = case CurrentSign =:= StoredSign of
+        true ->
+            Gradient;  %% No update needed
+        false ->
+            %% Add target_sign * QJL_row to gradient
+            add_qjl_row_to_gradient(QJLMatrix, Dim, RowIdx, StoredSign, Gradient)
+    end,
+
+    compute_qjl_gradient_rows(VecBin, StoredSigns, QJLMatrix, Dim, QJLDim, RowIdx + 1, NewGradient).
+
+%% Get stored sign at index (1 for positive, -1 for negative)
+get_stored_sign(StoredSigns, RowIdx) ->
+    ByteIdx = RowIdx div 8,
+    BitOffset = 7 - (RowIdx rem 8),
+    <<_:ByteIdx/binary, Byte:8, _/binary>> = StoredSigns,
+    SignBit = (Byte bsr BitOffset) band 1,
+    if SignBit =:= 1 -> 1; true -> -1 end.
+
+%% Add target_sign * QJL_row to gradient
+add_qjl_row_to_gradient(QJLMatrix, Dim, RowIdx, TargetSign, Gradient) ->
+    add_qjl_row_elements(QJLMatrix, Dim, RowIdx, TargetSign, Gradient, 0, []).
+
+add_qjl_row_elements(_QJLMatrix, Dim, _RowIdx, _TargetSign, [], _ColIdx, Acc)
+  when length(Acc) =:= Dim ->
+    lists:reverse(Acc);
+add_qjl_row_elements(_QJLMatrix, _Dim, _RowIdx, _TargetSign, [], _ColIdx, Acc) ->
+    lists:reverse(Acc);
+add_qjl_row_elements(QJLMatrix, Dim, RowIdx, TargetSign, [G | RestG], ColIdx, Acc) ->
+    %% Get QJL sign at (RowIdx, ColIdx)
+    BitIdx = RowIdx * Dim + ColIdx,
+    ByteIdx = BitIdx div 8,
+    BitOffset = 7 - (BitIdx rem 8),
+    <<_:ByteIdx/binary, Byte:8, _/binary>> = QJLMatrix,
+    QJLSignBit = (Byte bsr BitOffset) band 1,
+    QJLSign = if QJLSignBit =:= 1 -> 1.0; true -> -1.0 end,
+
+    %% Add contribution to gradient
+    NewG = G + TargetSign * QJLSign,
+    add_qjl_row_elements(QJLMatrix, Dim, RowIdx, TargetSign, RestG, ColIdx + 1, [NewG | Acc]).
+
+%% Apply gradient to vector: v_new = v + lr * gradient
+apply_gradient(VecBin, GradientBin, LR) ->
+    apply_gradient_elements(VecBin, GradientBin, LR, <<>>).
+
+apply_gradient_elements(<<>>, <<>>, _LR, Acc) ->
+    Acc;
+apply_gradient_elements(<<V:64/float-little, RestV/binary>>,
+                        <<G:64/float-little, RestG/binary>>, LR, Acc) ->
+    NewV = V + LR * G,
+    apply_gradient_elements(RestV, RestG, LR, <<Acc/binary, NewV:64/float-little>>).
 
 %% Full ADC (Asymmetric Distance Computation) using precomputed tables
 %% Table format per pair: QRSq (1 float) + NumLevels cos terms
