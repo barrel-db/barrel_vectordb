@@ -1,30 +1,18 @@
 /**
- * barrel_vectordb_distance_nif.c
+ * barrel_vectordb_distance.c
  *
  * NIF implementation for SIMD-accelerated vector distance computation.
  * Supports AVX2 on x86_64 and NEON on ARM (if available).
  */
 
-#include <erl_nif.h>
-#include <string.h>
-#include <math.h>
-
-/* Check for SIMD availability */
-#if defined(__AVX2__)
-    #include <immintrin.h>
-    #define USE_AVX2 1
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-    #include <arm_neon.h>
-    #define USE_NEON 1
-#endif
-
-/* Resource type for binary vectors */
-static ErlNifResourceType* binary_vector_resource;
+#include "barrel_vectordb_nif_common.h"
 
 /* ============================================================
  * Fallback (scalar) implementations
+ * Used when SIMD is not available, or for norm calculation
  * ============================================================ */
 
+#if !defined(USE_AVX2) && !defined(USE_NEON)
 static double dot_product_scalar(const float* a, const float* b, int n) {
     double sum = 0.0;
     for (int i = 0; i < n; i++) {
@@ -41,6 +29,7 @@ static double euclidean_distance_sq_scalar(const float* a, const float* b, int n
     }
     return sum;
 }
+#endif
 
 static double norm_scalar(const float* a, int n) {
     double sum = 0.0;
@@ -183,10 +172,9 @@ static double do_euclidean_distance_sq(const float* a, const float* b, int n) {
 
 /**
  * dot_product(Binary1, Binary2) -> float()
- *
- * Compute dot product of two binary vectors (32-bit floats, little-endian).
  */
-static ERL_NIF_TERM nif_dot_product(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_dot_product(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary bin1, bin2;
 
     if (!enif_inspect_binary(env, argv[0], &bin1) ||
@@ -209,10 +197,9 @@ static ERL_NIF_TERM nif_dot_product(ErlNifEnv* env, int argc, const ERL_NIF_TERM
 
 /**
  * cosine_distance(Binary1, Binary2) -> float()
- *
- * Compute cosine distance: 1 - cos(a, b) = 1 - (a.b)/(|a||b|)
  */
-static ERL_NIF_TERM nif_cosine_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_cosine_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary bin1, bin2;
 
     if (!enif_inspect_binary(env, argv[0], &bin1) ||
@@ -245,11 +232,9 @@ static ERL_NIF_TERM nif_cosine_distance(ErlNifEnv* env, int argc, const ERL_NIF_
 
 /**
  * cosine_distance_normalized(Binary1, Binary2) -> float()
- *
- * Compute cosine distance for pre-normalized vectors: 1 - a.b
- * Faster when vectors are already unit length.
  */
-static ERL_NIF_TERM nif_cosine_distance_normalized(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_cosine_distance_normalized(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary bin1, bin2;
 
     if (!enif_inspect_binary(env, argv[0], &bin1) ||
@@ -273,10 +258,9 @@ static ERL_NIF_TERM nif_cosine_distance_normalized(ErlNifEnv* env, int argc, con
 
 /**
  * euclidean_distance(Binary1, Binary2) -> float()
- *
- * Compute Euclidean distance: sqrt(sum((a_i - b_i)^2))
  */
-static ERL_NIF_TERM nif_euclidean_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_euclidean_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary bin1, bin2;
 
     if (!enif_inspect_binary(env, argv[0], &bin1) ||
@@ -299,11 +283,10 @@ static ERL_NIF_TERM nif_euclidean_distance(ErlNifEnv* env, int argc, const ERL_N
 }
 
 /**
- * list_to_binary_vector(List) -> binary()
- *
- * Convert Erlang list of floats to binary vector (32-bit floats, little-endian).
+ * to_binary(List) -> binary()
  */
-static ERL_NIF_TERM nif_list_to_binary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_to_binary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     unsigned int len;
 
     if (!enif_get_list_length(env, argv[0], &len)) {
@@ -318,7 +301,7 @@ static ERL_NIF_TERM nif_list_to_binary(ErlNifEnv* env, int argc, const ERL_NIF_T
 
     ERL_NIF_TERM list = argv[0];
     ERL_NIF_TERM head, tail;
-    int i = 0;
+    unsigned int i = 0;
 
     while (enif_get_list_cell(env, list, &head, &tail)) {
         double val;
@@ -338,11 +321,10 @@ static ERL_NIF_TERM nif_list_to_binary(ErlNifEnv* env, int argc, const ERL_NIF_T
 }
 
 /**
- * binary_to_list_vector(Binary) -> [float()]
- *
- * Convert binary vector back to Erlang list of floats.
+ * from_binary(Binary) -> [float()]
  */
-static ERL_NIF_TERM nif_binary_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_from_binary(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary bin;
 
     if (!enif_inspect_binary(env, argv[0], &bin) || bin.size % sizeof(float) != 0) {
@@ -366,51 +348,3 @@ static ERL_NIF_TERM nif_binary_to_list(ErlNifEnv* env, int argc, const ERL_NIF_T
 
     return list;
 }
-
-/**
- * simd_info() -> #{backend => avx2 | neon | scalar}
- *
- * Return information about which SIMD backend is being used.
- */
-static ERL_NIF_TERM nif_simd_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    ERL_NIF_TERM backend;
-
-#ifdef USE_AVX2
-    backend = enif_make_atom(env, "avx2");
-#elif defined(USE_NEON)
-    backend = enif_make_atom(env, "neon");
-#else
-    backend = enif_make_atom(env, "scalar");
-#endif
-
-    ERL_NIF_TERM keys[] = {enif_make_atom(env, "backend")};
-    ERL_NIF_TERM values[] = {backend};
-    ERL_NIF_TERM map;
-    enif_make_map_from_arrays(env, keys, values, 1, &map);
-
-    return map;
-}
-
-/* ============================================================
- * NIF initialization
- * ============================================================ */
-
-static ErlNifFunc nif_funcs[] = {
-    {"nif_dot_product", 2, nif_dot_product, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_cosine_distance", 2, nif_cosine_distance, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_cosine_distance_normalized", 2, nif_cosine_distance_normalized, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_euclidean_distance", 2, nif_euclidean_distance, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_to_binary", 1, nif_list_to_binary, 0},  /* Fast conversion, no dirty needed */
-    {"nif_from_binary", 1, nif_binary_to_list, 0},  /* Fast conversion, no dirty needed */
-    {"nif_simd_info", 0, nif_simd_info, 0}  /* Instant, no dirty needed */
-};
-
-static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
-    return 0;
-}
-
-static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, ERL_NIF_TERM load_info) {
-    return 0;
-}
-
-ERL_NIF_INIT(barrel_vectordb_distance, nif_funcs, load, NULL, upgrade, NULL)

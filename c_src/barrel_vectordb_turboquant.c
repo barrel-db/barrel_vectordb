@@ -1,5 +1,5 @@
 /**
- * barrel_vectordb_turboquant_nif.c
+ * barrel_vectordb_turboquant.c
  *
  * SIMD-accelerated NIF implementation for TurboQuant ADC (Asymmetric Distance Computation).
  * Supports AVX2 on x86_64 and NEON on ARM (if available).
@@ -9,65 +9,11 @@
  *   distance = sqrt(sum(contrib))
  */
 
-#include <erl_nif.h>
-#include <string.h>
-#include <math.h>
-#include <stdint.h>
-
-/* Check for SIMD availability */
-#if defined(__AVX2__)
-    #include <immintrin.h>
-    #define USE_AVX2 1
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-    #include <arm_neon.h>
-    #define USE_NEON 1
-#endif
+#include "barrel_vectordb_nif_common.h"
 
 /* TurboQuant code header format */
 #define TQ_VERSION 1
 #define TQ_HEADER_SIZE 4
-
-/* ============================================================
- * Helper Functions
- * ============================================================ */
-
-/**
- * Dequantize radius from 16-bit log-scale encoding.
- * Matches the Erlang dequantize_radius/1 function.
- */
-static inline float dequantize_radius(uint16_t quant) {
-    if (quant == 0) return 0.0f;
-    float t = (float)quant / 65535.0f * logf(11.0f);
-    return expf(t) - 1.0f;
-}
-
-/**
- * Unpack N-bit integers from packed binary.
- * @param packed   Input packed binary data
- * @param bits     Bits per value (2-4)
- * @param count    Number of values to unpack
- * @param out      Output array (must be pre-allocated)
- */
-static void unpack_bits(const uint8_t* packed, int bits, int count, uint32_t* out) {
-    uint32_t buffer = 0;
-    int buffer_bits = 0;
-    int byte_idx = 0;
-    uint32_t mask = (1 << bits) - 1;
-
-    for (int i = 0; i < count; i++) {
-        /* Load more bytes into buffer if needed */
-        while (buffer_bits < bits) {
-            buffer = (buffer << 8) | packed[byte_idx++];
-            buffer_bits += 8;
-        }
-
-        /* Extract value */
-        int extra_bits = buffer_bits - bits;
-        out[i] = (buffer >> extra_bits) & mask;
-        buffer_bits = extra_bits;
-        buffer &= (1 << buffer_bits) - 1;
-    }
-}
 
 /* ============================================================
  * Scalar Implementation (used when SIMD not available)
@@ -76,7 +22,7 @@ static void unpack_bits(const uint8_t* packed, int bits, int count, uint32_t* ou
 #if !defined(USE_AVX2) && !defined(USE_NEON)
 static double adc_distance_scalar(
     const float* tables,
-    int table_row_floats,  /* (1 + num_levels) */
+    int table_row_floats,
     const uint16_t* radii,
     const uint32_t* angle_indices,
     int num_pairs
@@ -84,23 +30,20 @@ static double adc_distance_scalar(
     double acc = 0.0;
 
     for (int i = 0; i < num_pairs; i++) {
-        /* Look up table row for this pair */
         const float* row = tables + i * table_row_floats;
         float qr_sq = row[0];
         float cos_term = row[1 + angle_indices[i]];
 
-        /* Dequantize radius */
         float dr = dequantize_radius(radii[i]);
         float dr_sq = dr * dr;
 
-        /* ADC contribution: QRSq + DR^2 - CosTerm * DR */
         double contrib = (double)qr_sq + (double)dr_sq - (double)cos_term * (double)dr;
         acc += contrib;
     }
 
     return sqrt(acc > 0.0 ? acc : 0.0);
 }
-#endif /* !USE_AVX2 && !USE_NEON */
+#endif
 
 /* ============================================================
  * AVX2 Implementation
@@ -119,7 +62,6 @@ static double adc_distance_avx2(
 
     /* Process 8 pairs at a time */
     for (; i + 7 < num_pairs; i += 8) {
-        /* Dequantize 8 radii */
         float dr_vals[8];
         for (int j = 0; j < 8; j++) {
             dr_vals[j] = dequantize_radius(radii[i + j]);
@@ -127,14 +69,12 @@ static double adc_distance_avx2(
         __m256 dr = _mm256_loadu_ps(dr_vals);
         __m256 dr_sq = _mm256_mul_ps(dr, dr);
 
-        /* Gather QRSq values */
         float qr_sq_vals[8];
         for (int j = 0; j < 8; j++) {
             qr_sq_vals[j] = tables[(i + j) * table_row_floats];
         }
         __m256 qr_sq = _mm256_loadu_ps(qr_sq_vals);
 
-        /* Gather CosTerm values using angle indices */
         float cos_vals[8];
         for (int j = 0; j < 8; j++) {
             const float* row = tables + (i + j) * table_row_floats;
@@ -142,9 +82,8 @@ static double adc_distance_avx2(
         }
         __m256 cos_term = _mm256_loadu_ps(cos_vals);
 
-        /* Compute: QRSq + DR^2 - CosTerm * DR */
         __m256 contrib = _mm256_add_ps(qr_sq, dr_sq);
-        contrib = _mm256_fnmadd_ps(cos_term, dr, contrib);  /* contrib - cos_term * dr */
+        contrib = _mm256_fnmadd_ps(cos_term, dr, contrib);
 
         acc = _mm256_add_ps(acc, contrib);
     }
@@ -188,7 +127,6 @@ static double adc_distance_neon(
 
     /* Process 4 pairs at a time */
     for (; i + 3 < num_pairs; i += 4) {
-        /* Dequantize 4 radii */
         float dr_vals[4];
         for (int j = 0; j < 4; j++) {
             dr_vals[j] = dequantize_radius(radii[i + j]);
@@ -196,14 +134,12 @@ static double adc_distance_neon(
         float32x4_t dr = vld1q_f32(dr_vals);
         float32x4_t dr_sq = vmulq_f32(dr, dr);
 
-        /* Gather QRSq values (NEON has no gather, use scalar) */
         float qr_sq_vals[4];
         for (int j = 0; j < 4; j++) {
             qr_sq_vals[j] = tables[(i + j) * table_row_floats];
         }
         float32x4_t qr_sq = vld1q_f32(qr_sq_vals);
 
-        /* Gather CosTerm values */
         float cos_vals[4];
         for (int j = 0; j < 4; j++) {
             const float* row = tables + (i + j) * table_row_floats;
@@ -211,9 +147,8 @@ static double adc_distance_neon(
         }
         float32x4_t cos_term = vld1q_f32(cos_vals);
 
-        /* Compute: QRSq + DR^2 - CosTerm * DR */
         float32x4_t contrib = vaddq_f32(qr_sq, dr_sq);
-        contrib = vmlsq_f32(contrib, cos_term, dr);  /* contrib - cos_term * dr */
+        contrib = vmlsq_f32(contrib, cos_term, dr);
 
         acc = vaddq_f32(acc, contrib);
     }
@@ -260,11 +195,10 @@ static double do_adc_distance(
  * ============================================================ */
 
 /**
- * adc_distance(Tables, Code, Bits) -> float()
- *
- * Compute ADC distance using precomputed tables and encoded vector.
+ * tq_adc_distance(Tables, Code, Bits) -> float()
  */
-static ERL_NIF_TERM nif_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_tq_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary tables_bin, code_bin;
     int bits;
 
@@ -290,7 +224,7 @@ static ERL_NIF_TERM nif_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TER
 
     /* Calculate dimensions from table size */
     int num_levels = 1 << bits;
-    int table_row_floats = 1 + num_levels;  /* QRSq + NumLevels cos terms */
+    int table_row_floats = 1 + num_levels;
     int table_row_bytes = table_row_floats * sizeof(float);
 
     if (tables_bin.size % table_row_bytes != 0) {
@@ -329,11 +263,10 @@ static ERL_NIF_TERM nif_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TER
 }
 
 /**
- * batch_adc_distance(Tables, Codes, Bits) -> [float()]
- *
- * Compute ADC distance for multiple codes. Amortizes NIF call overhead.
+ * tq_batch_adc_distance(Tables, Codes, Bits) -> [float()]
  */
-static ERL_NIF_TERM nif_batch_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_tq_batch_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary tables_bin;
     int bits;
 
@@ -360,7 +293,7 @@ static ERL_NIF_TERM nif_batch_adc_distance(ErlNifEnv* env, int argc, const ERL_N
     int radius_bytes = num_pairs * 2;
     int angle_bits = num_pairs * bits;
     int angle_bytes = (angle_bits + 7) / 8;
-    int min_code_size = TQ_HEADER_SIZE + radius_bytes + angle_bytes;
+    size_t min_code_size = TQ_HEADER_SIZE + radius_bytes + angle_bytes;
 
     const float* tables = (const float*)tables_bin.data;
 
@@ -391,7 +324,7 @@ static ERL_NIF_TERM nif_batch_adc_distance(ErlNifEnv* env, int argc, const ERL_N
     while (enif_get_list_cell(env, list, &head, &tail)) {
         ErlNifBinary code_bin;
         if (!enif_inspect_binary(env, head, &code_bin) ||
-            code_bin.size < (size_t)min_code_size ||
+            code_bin.size < min_code_size ||
             code_bin.data[0] != TQ_VERSION ||
             code_bin.data[1] != (uint8_t)bits) {
             enif_free(angle_indices);
@@ -419,38 +352,3 @@ static ERL_NIF_TERM nif_batch_adc_distance(ErlNifEnv* env, int argc, const ERL_N
 
     return result_list;
 }
-
-/**
- * simd_info() -> atom()
- *
- * Return the SIMD backend being used: avx2 | neon | scalar
- */
-static ERL_NIF_TERM nif_simd_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-#ifdef USE_AVX2
-    return enif_make_atom(env, "avx2");
-#elif defined(USE_NEON)
-    return enif_make_atom(env, "neon");
-#else
-    return enif_make_atom(env, "scalar");
-#endif
-}
-
-/* ============================================================
- * NIF Initialization
- * ============================================================ */
-
-static ErlNifFunc nif_funcs[] = {
-    {"adc_distance", 3, nif_adc_distance, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"batch_adc_distance", 3, nif_batch_adc_distance, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"simd_info", 0, nif_simd_info, 0}
-};
-
-static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
-    return 0;
-}
-
-static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, ERL_NIF_TERM load_info) {
-    return 0;
-}
-
-ERL_NIF_INIT(barrel_vectordb_turboquant_nif, nif_funcs, load, NULL, upgrade, NULL)

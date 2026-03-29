@@ -205,7 +205,7 @@ distance(Tables, <<?TQS_VERSION:8, Bits:8, M:8, _Flags:8, Rest/binary>>) ->
 -spec distance_nif(distance_tables(), tq_subspace_code()) -> float().
 distance_nif(Tables, Code) when is_binary(Tables), is_binary(Code) ->
     <<?TQS_VERSION:8, Bits:8, M:8, _:8, _/binary>> = Code,
-    barrel_vectordb_turboquant_subspace_nif:adc_distance(Tables, Code, Bits, M).
+    barrel_vectordb_nif:tqs_adc_distance(Tables, Code, Bits, M).
 
 %% @doc Batch compute ADC distance using SIMD-accelerated NIF
 -spec batch_distance_nif(distance_tables(), [tq_subspace_code()]) -> [float()].
@@ -213,7 +213,7 @@ batch_distance_nif(Tables, Codes) when is_binary(Tables), is_list(Codes) ->
     case Codes of
         [] -> [];
         [<<?TQS_VERSION:8, Bits:8, M:8, _:8, _/binary>> | _] ->
-            barrel_vectordb_turboquant_subspace_nif:batch_adc_distance(Tables, Codes, Bits, M)
+            barrel_vectordb_nif:tqs_batch_adc_distance(Tables, Codes, Bits, M)
     end.
 
 %% @doc Batch encode multiple vectors

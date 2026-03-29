@@ -1,68 +1,17 @@
 /**
- * barrel_vectordb_turboquant_subspace_nif.c
+ * barrel_vectordb_turboquant_subspace.c
  *
  * SIMD-accelerated NIF implementation for Subspace-TurboQuant ADC.
  * Processes M independent subspaces and sums their distance contributions.
  *
  * Supports AVX2 on x86_64 and NEON on ARM (if available).
- *
- * ADC Formula (per pair within each subspace):
- *   contrib = QRSq + DR^2 - CosTerm * DR
- *   subspace_dist_sq = sum(contrib)
- *   total_dist = sqrt(sum over subspaces of subspace_dist_sq)
  */
 
-#include <erl_nif.h>
-#include <string.h>
-#include <math.h>
-#include <stdint.h>
-
-/* Check for SIMD availability */
-#if defined(__AVX2__)
-    #include <immintrin.h>
-    #define USE_AVX2 1
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-    #include <arm_neon.h>
-    #define USE_NEON 1
-#endif
+#include "barrel_vectordb_nif_common.h"
 
 /* Subspace TurboQuant code header format */
 #define TQS_VERSION 2
 #define TQS_HEADER_SIZE 4
-
-/* ============================================================
- * Helper Functions
- * ============================================================ */
-
-/**
- * Dequantize radius from 16-bit log-scale encoding.
- */
-static inline float dequantize_radius(uint16_t quant) {
-    if (quant == 0) return 0.0f;
-    float t = (float)quant / 65535.0f * logf(11.0f);
-    return expf(t) - 1.0f;
-}
-
-/**
- * Unpack N-bit integers from packed binary.
- */
-static void unpack_bits(const uint8_t* packed, int bits, int count, uint32_t* out) {
-    uint32_t buffer = 0;
-    int buffer_bits = 0;
-    int byte_idx = 0;
-    uint32_t mask = (1 << bits) - 1;
-
-    for (int i = 0; i < count; i++) {
-        while (buffer_bits < bits) {
-            buffer = (buffer << 8) | packed[byte_idx++];
-            buffer_bits += 8;
-        }
-        int extra_bits = buffer_bits - bits;
-        out[i] = (buffer >> extra_bits) & mask;
-        buffer_bits = extra_bits;
-        buffer &= (1 << buffer_bits) - 1;
-    }
-}
 
 /* ============================================================
  * Per-Subspace Distance Computation
@@ -224,11 +173,10 @@ static double compute_subspace_dist_sq(
  * ============================================================ */
 
 /**
- * adc_distance(Tables, Code, Bits, M) -> float()
- *
- * Compute ADC distance across M subspaces using precomputed tables.
+ * tqs_adc_distance(Tables, Code, Bits, M) -> float()
  */
-static ERL_NIF_TERM nif_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_tqs_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary tables_bin, code_bin;
     int bits, m;
 
@@ -319,11 +267,10 @@ static ERL_NIF_TERM nif_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TER
 }
 
 /**
- * batch_adc_distance(Tables, Codes, Bits, M) -> [float()]
- *
- * Compute ADC distance for multiple codes.
+ * tqs_batch_adc_distance(Tables, Codes, Bits, M) -> [float()]
  */
-static ERL_NIF_TERM nif_batch_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM nif_tqs_batch_adc_distance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
     ErlNifBinary tables_bin;
     int bits, m;
 
@@ -459,36 +406,3 @@ static ERL_NIF_TERM nif_batch_adc_distance(ErlNifEnv* env, int argc, const ERL_N
 
     return result_list;
 }
-
-/**
- * simd_info() -> atom()
- */
-static ERL_NIF_TERM nif_simd_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-#ifdef USE_AVX2
-    return enif_make_atom(env, "avx2");
-#elif defined(USE_NEON)
-    return enif_make_atom(env, "neon");
-#else
-    return enif_make_atom(env, "scalar");
-#endif
-}
-
-/* ============================================================
- * NIF Initialization
- * ============================================================ */
-
-static ErlNifFunc nif_funcs[] = {
-    {"adc_distance", 4, nif_adc_distance, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"batch_adc_distance", 4, nif_batch_adc_distance, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"simd_info", 0, nif_simd_info, 0}
-};
-
-static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
-    return 0;
-}
-
-static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, ERL_NIF_TERM load_info) {
-    return 0;
-}
-
-ERL_NIF_INIT(barrel_vectordb_turboquant_subspace_nif, nif_funcs, load, NULL, upgrade, NULL)

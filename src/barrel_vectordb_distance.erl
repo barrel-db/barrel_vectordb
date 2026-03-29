@@ -33,24 +33,6 @@
     nif_available/0
 ]).
 
--on_load(init/0).
-
-%% NIF loading
-init() ->
-    PrivDir = case code:priv_dir(barrel_vectordb) of
-        {error, _} ->
-            %% Fallback for development
-            EbinDir = filename:dirname(code:which(?MODULE)),
-            filename:join(filename:dirname(EbinDir), "priv");
-        Dir -> Dir
-    end,
-    SoPath = filename:join(PrivDir, "barrel_vectordb_distance_nif"),
-    case erlang:load_nif(SoPath, 0) of
-        ok -> ok;
-        {error, _Reason} ->
-            %% NIF not available, use Erlang fallback
-            ok
-    end.
 
 %% ============================================================
 %% Distance functions
@@ -134,36 +116,64 @@ nif_available() ->
     end.
 
 %% ============================================================
-%% NIF stubs (replaced when NIF loads successfully)
+%% NIF calls (via unified barrel_vectordb_nif module)
 %% ============================================================
 
 nif_dot_product(Bin1, Bin2) ->
-    %% Fallback if NIF not loaded
-    dot_product_list(binary_to_list_fallback(Bin1), binary_to_list_fallback(Bin2), 0.0).
+    try
+        barrel_vectordb_nif:dot_product(Bin1, Bin2)
+    catch
+        error:undef ->
+            dot_product_list(binary_to_list_fallback(Bin1), binary_to_list_fallback(Bin2), 0.0)
+    end.
 
 nif_cosine_distance(Bin1, Bin2) ->
-    %% Fallback if NIF not loaded
-    cosine_distance_list(binary_to_list_fallback(Bin1), binary_to_list_fallback(Bin2)).
+    try
+        barrel_vectordb_nif:cosine_distance(Bin1, Bin2)
+    catch
+        error:undef ->
+            cosine_distance_list(binary_to_list_fallback(Bin1), binary_to_list_fallback(Bin2))
+    end.
 
 nif_cosine_distance_normalized(Bin1, Bin2) ->
-    %% Fallback if NIF not loaded
-    1.0 - nif_dot_product(Bin1, Bin2).
+    try
+        barrel_vectordb_nif:cosine_distance_normalized(Bin1, Bin2)
+    catch
+        error:undef ->
+            1.0 - nif_dot_product(Bin1, Bin2)
+    end.
 
 nif_euclidean_distance(Bin1, Bin2) ->
-    %% Fallback if NIF not loaded
-    euclidean_distance_list(binary_to_list_fallback(Bin1), binary_to_list_fallback(Bin2)).
+    try
+        barrel_vectordb_nif:euclidean_distance(Bin1, Bin2)
+    catch
+        error:undef ->
+            euclidean_distance_list(binary_to_list_fallback(Bin1), binary_to_list_fallback(Bin2))
+    end.
 
 nif_to_binary(List) ->
-    %% Fallback if NIF not loaded
-    << <<F:32/float-little>> || F <- List >>.
+    try
+        barrel_vectordb_nif:to_binary(List)
+    catch
+        error:undef ->
+            << <<F:32/float-little>> || F <- List >>
+    end.
 
 nif_from_binary(Bin) ->
-    %% Fallback if NIF not loaded
-    binary_to_list_fallback(Bin).
+    try
+        barrel_vectordb_nif:from_binary(Bin)
+    catch
+        error:undef ->
+            binary_to_list_fallback(Bin)
+    end.
 
 nif_simd_info() ->
-    %% Fallback if NIF not loaded
-    #{backend => erlang}.
+    try
+        #{backend => barrel_vectordb_nif:simd_info()}
+    catch
+        error:undef ->
+            #{backend => erlang}
+    end.
 
 %% ============================================================
 %% Erlang fallback implementations

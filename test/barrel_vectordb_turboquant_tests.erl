@@ -480,7 +480,7 @@ test_nif_bit_widths() ->
 
 test_nif_simd_info() ->
     %% simd_info should return a valid backend atom
-    Backend = barrel_vectordb_turboquant_nif:simd_info(),
+    Backend = barrel_vectordb_nif:simd_info(),
     ?assert(lists:member(Backend, [avx2, neon, scalar])).
 
 %%====================================================================
