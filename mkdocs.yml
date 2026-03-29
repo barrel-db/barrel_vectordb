@@ -43,10 +43,13 @@ nav:
     - Embedding Models: embeddings.md
   - Guides:
     - Features: features.md
+    - TurboQuant: guides/turboquant.md
     - BM25 Text Search: bm25-disk.md
     - Clustering: clustering.md
     - Multi-Tenant Gateway: gateway.md
     - Docker Deployment: deployment.md
+  - Internals:
+    - TurboQuant Internals: internals/turboquant.md
   - Erlang API: api/erlang.md
   - HTTP API: api/http.md
   - Development:

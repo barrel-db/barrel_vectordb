@@ -229,6 +229,36 @@ Requires FAISS library installed on your system. See [barrel_faiss README](https
 - Frequent deletions
 - Smaller indexes
 
+## Vector Quantization
+
+Reduce memory usage with TurboQuant compression:
+
+```erlang
+%% Create quantizer (no training needed)
+{ok, TQ} = barrel_vectordb_turboquant:new(#{
+    dimension => 768,
+    bits => 3
+}).
+
+%% Encode vector (768 floats -> ~388 bytes)
+Code = barrel_vectordb_turboquant:encode(TQ, Vector).
+
+%% Fast distance computation
+Tables = barrel_vectordb_turboquant:precompute_tables(TQ, Query),
+Distance = barrel_vectordb_turboquant:distance_nif(Tables, Code).
+```
+
+For large dimensions, use Subspace-TurboQuant:
+
+```erlang
+{ok, TQS} = barrel_vectordb_turboquant_subspace:new(#{
+    dimension => 1536,
+    m => 16  %% 16 subspaces
+}).
+```
+
+See [TurboQuant Documentation](https://docs.barrel-db.eu/vectordb/guides/turboquant) for details.
+
 ## Embedding Providers
 
 Embedder is **explicit** - if not configured, only `add_vector/5` and `search_vector/3` work.
