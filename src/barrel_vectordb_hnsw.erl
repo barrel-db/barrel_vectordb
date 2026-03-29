@@ -133,7 +133,10 @@
 %% Quantization (exported for server/store modules)
 -export([
     quantize/1,
+    quantize/2,
     dequantize/1,
+    dequantize/2,
+    scalar_quantize/1,
     compute_norm/1
 ]).
 
@@ -154,6 +157,15 @@ new() ->
     new(#{}).
 
 %% @doc Create a new empty HNSW index with custom configuration
+%% Options:
+%%   - m: Max connections per layer (default: 16)
+%%   - m_max0: Max connections at layer 0 (default: 2*M)
+%%   - ef_construction: Build-time ef (default: 200)
+%%   - distance_fn: cosine | euclidean (default: cosine)
+%%   - dimension: Vector dimension (default: 768)
+%%   - quantization: scalar | turboquant | none (default: scalar)
+%%   - tq_bits: TurboQuant bits per component (default: 3, when quantization=turboquant)
+%%   - tq_seed: TurboQuant random seed (default: 42)
 -spec new(map()) -> hnsw_index().
 new(Options) ->
     M = maps:get(m, Options, 16),
@@ -161,15 +173,35 @@ new(Options) ->
     EfConstruction = maps:get(ef_construction, Options, 200),
     DistanceFn = maps:get(distance_fn, Options, cosine),
     Dimension = maps:get(dimension, Options, ?DEFAULT_DIMENSION),
+    Quantization = maps:get(quantization, Options, scalar),
 
     Ml = 1.0 / math:log(M),
+
+    %% Initialize TurboQuant if requested
+    TQState = case Quantization of
+        turboquant ->
+            TQBits = maps:get(tq_bits, Options, 3),
+            TQSeed = maps:get(tq_seed, Options, 42),
+            case barrel_vectordb_turboquant:new(#{
+                bits => TQBits,
+                dimension => Dimension,
+                seed => TQSeed
+            }) of
+                {ok, TQ} -> TQ;
+                {error, Reason} -> error({turboquant_init_failed, Reason})
+            end;
+        _ ->
+            undefined
+    end,
 
     Config = #hnsw_config{
         m = M,
         m_max0 = MMax0,
         ef_construction = EfConstruction,
         ml = Ml,
-        distance_fn = DistanceFn
+        distance_fn = DistanceFn,
+        quantization = Quantization,
+        tq_state = TQState
     },
 
     #hnsw_index{
@@ -279,6 +311,15 @@ size(#hnsw_index{size = Size}) -> Size.
 -spec info(hnsw_index()) -> map().
 info(#hnsw_index{entry_point = EP, max_layer = MaxLayer, size = Size,
                   config = Config, dimension = Dim}) ->
+    QuantInfo = case Config#hnsw_config.quantization of
+        turboquant ->
+            TQInfo = barrel_vectordb_turboquant:info(Config#hnsw_config.tq_state),
+            #{method => turboquant,
+              bits => maps:get(bits, TQInfo),
+              bytes_per_vector => maps:get(bytes_per_vector, TQInfo)};
+        Other ->
+            #{method => Other}
+    end,
     #{
         entry_point => EP,
         max_layer => MaxLayer,
@@ -289,7 +330,8 @@ info(#hnsw_index{entry_point = EP, max_layer = MaxLayer, size = Size,
             m_max0 => Config#hnsw_config.m_max0,
             ef_construction => Config#hnsw_config.ef_construction,
             distance_fn => Config#hnsw_config.distance_fn
-        }
+        },
+        quantization => QuantInfo
     }.
 
 %% @doc Get a node by ID
@@ -304,10 +346,26 @@ get_node(#hnsw_index{nodes = Nodes}, Id) ->
 %% Quantization Functions
 %%====================================================================
 
-%% @doc Quantize a float vector to 8-bit signed integers.
+%% @doc Quantize a float vector to 8-bit signed integers (scalar quantization).
 %% Format: `<<Scale:32/float-little, Components/binary>>'
+%% This is the default/legacy function for backward compatibility.
 -spec quantize([float()]) -> binary().
 quantize(Vector) ->
+    scalar_quantize(Vector).
+
+%% @doc Quantize a vector using the method specified in config
+-spec quantize([float()], #hnsw_config{}) -> binary().
+quantize(Vector, #hnsw_config{quantization = scalar}) ->
+    scalar_quantize(Vector);
+quantize(Vector, #hnsw_config{quantization = turboquant, tq_state = TQ}) ->
+    barrel_vectordb_turboquant:encode(TQ, Vector);
+quantize(Vector, #hnsw_config{quantization = none}) ->
+    %% Store as float32 binary (no quantization)
+    << <<V:32/float-little>> || V <- Vector >>.
+
+%% @doc 8-bit scalar quantization
+-spec scalar_quantize([float()]) -> binary().
+scalar_quantize(Vector) ->
     MaxAbs = lists:max([abs(V) || V <- Vector]),
     Scale = case MaxAbs < 1.0e-10 of
         true -> 1.0;
@@ -316,7 +374,7 @@ quantize(Vector) ->
     Components = << <<(clamp(round(V * Scale), -127, 127)):8/signed>> || V <- Vector >>,
     <<MaxAbs:32/float-little, Components/binary>>.
 
-%% @doc Dequantize back to float vector
+%% @doc Dequantize back to float vector (scalar quantization)
 -spec dequantize(binary()) -> [float()].
 dequantize(<<MaxAbs:32/float-little, Components/binary>>) ->
     Scale = case MaxAbs < 1.0e-10 of
@@ -324,6 +382,16 @@ dequantize(<<MaxAbs:32/float-little, Components/binary>>) ->
         false -> MaxAbs / 127.0
     end,
     [V * Scale || <<V:8/signed>> <= Components].
+
+%% @doc Dequantize using the method specified in config
+-spec dequantize(binary(), #hnsw_config{}) -> [float()].
+dequantize(Quantized, #hnsw_config{quantization = scalar}) ->
+    dequantize(Quantized);
+dequantize(Quantized, #hnsw_config{quantization = turboquant, tq_state = TQ}) ->
+    barrel_vectordb_turboquant:decode(TQ, Quantized);
+dequantize(Quantized, #hnsw_config{quantization = none}) ->
+    %% Stored as float32 binary
+    [V || <<V:32/float-little>> <= Quantized].
 
 %% @doc Compute L2 norm of a float vector
 -spec compute_norm([float()]) -> float().

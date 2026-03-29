@@ -25,7 +25,10 @@
     m_max0 = 32 :: pos_integer(),      %% Max connections at layer 0
     ef_construction = 200 :: pos_integer(), %% Build-time ef
     ml :: float() | undefined,          %% Level multiplier (1/ln(M))
-    distance_fn = cosine :: cosine | euclidean
+    distance_fn = cosine :: cosine | euclidean,
+    %% Quantization settings
+    quantization = scalar :: quantization_method(),
+    tq_state :: term() | undefined      %% TurboQuant config (when quantization=turboquant)
 }).
 
 -type hnsw_config() :: #hnsw_config{}.
@@ -90,6 +93,16 @@
     filters => map(),
     include_vectors => boolean()
 }.
+
+%%====================================================================
+%% Quantization Types
+%%====================================================================
+
+%% TurboQuant code: compact binary from polar + QJL encoding
+-type turboquant_code() :: binary().
+
+%% Quantization method used for vector compression
+-type quantization_method() :: scalar | pq | turboquant | none.
 
 %%====================================================================
 %% Constants
