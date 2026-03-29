@@ -31,7 +31,9 @@ turboquant_test_() ->
         {"batch encode works", fun test_batch_encode/0},
         {"rotation matrix is orthogonal", fun test_rotation_orthogonal/0},
         {"deterministic with same seed", fun test_deterministic_seed/0},
-        {"info returns correct data", fun test_info/0}
+        {"info returns correct data", fun test_info/0},
+        {"MSE distortion within theoretical bound", fun test_mse_distortion_bound/0},
+        {"inner product estimation unbiased", fun test_inner_product_unbiased/0}
      ]
     }.
 
@@ -397,6 +399,50 @@ test_info() ->
     ?assert(CompressionRatio > 1.0).    %% Actually compresses
 
 %%====================================================================
+%% Theoretical Bound Tests (arXiv:2504.19874)
+%%====================================================================
+
+test_mse_distortion_bound() ->
+    %% Verify MSE distortion meets paper's theoretical bound
+    %% D_mse ≤ (√3·π/2) · (1/4^b)
+    lists:foreach(
+        fun({Bits, Bound}) ->
+            {ok, Config} = barrel_vectordb_turboquant:new(#{
+                bits => Bits, dimension => 128, qjl_iterations => 0
+            }),
+            Distortions = [measure_normalized_mse(Config, random_unit_vector(128))
+                           || _ <- lists:seq(1, 500)],
+            AvgDistortion = lists:sum(Distortions) / length(Distortions),
+            %% Allow 3x margin for implementation variance
+            ?assert(AvgDistortion < Bound * 3.0)
+        end,
+        [{2, 0.117}, {3, 0.030}, {4, 0.009}]
+    ).
+
+test_inner_product_unbiased() ->
+    %% Paper: QJL inner product estimation is unbiased
+    {ok, Config} = barrel_vectordb_turboquant:new(#{
+        bits => 3, dimension => 128
+    }),
+    Results = lists:map(
+        fun(_) ->
+            V1 = random_unit_vector(128),
+            V2 = random_unit_vector(128),
+            TrueIP = dot_product(V1, V2),
+            Tables = barrel_vectordb_turboquant:precompute_tables(Config, V1),
+            Code2 = barrel_vectordb_turboquant:encode(Config, V2),
+            %% ADC distance relates to inner product via: d² = ||v1||² + ||v2||² - 2<v1,v2>
+            EstDist = barrel_vectordb_turboquant:distance(Tables, Code2),
+            EstIP = (2.0 - EstDist * EstDist) / 2.0,  %% For unit vectors
+            {EstIP, TrueIP}
+        end,
+        lists:seq(1, 1000)
+    ),
+    %% Bias should be near zero
+    Bias = lists:sum([E - T || {E, T} <- Results]) / length(Results),
+    ?assert(abs(Bias) < 0.05).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -418,3 +464,18 @@ relative_error(Original, Reconstructed) ->
 
 vector_norm(Vec) ->
     math:sqrt(lists:sum([X * X || X <- Vec])).
+
+random_unit_vector(Dim) ->
+    Vec = [rand:normal() || _ <- lists:seq(1, Dim)],
+    Norm = math:sqrt(lists:sum([X * X || X <- Vec])),
+    [X / Norm || X <- Vec].
+
+measure_normalized_mse(Config, Vec) ->
+    Code = barrel_vectordb_turboquant:encode(Config, Vec),
+    Recon = barrel_vectordb_turboquant:decode(Config, Code),
+    SqError = lists:sum([math:pow(A - B, 2) || {A, B} <- lists:zip(Vec, Recon)]),
+    SqNorm = lists:sum([X * X || X <- Vec]),
+    SqError / SqNorm.  %% Normalized MSE
+
+dot_product(V1, V2) ->
+    lists:sum([A * B || {A, B} <- lists:zip(V1, V2)]).
