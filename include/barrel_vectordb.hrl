@@ -102,7 +102,7 @@
 -type turboquant_code() :: binary().
 
 %% Quantization method used for vector compression
--type quantization_method() :: scalar | pq | turboquant | none.
+-type quantization_method() :: scalar | pq | turboquant | subspace_turboquant | none.
 
 %%====================================================================
 %% Constants

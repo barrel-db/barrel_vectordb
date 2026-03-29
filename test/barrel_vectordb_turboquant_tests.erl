@@ -33,7 +33,11 @@ turboquant_test_() ->
         {"deterministic with same seed", fun test_deterministic_seed/0},
         {"info returns correct data", fun test_info/0},
         {"MSE distortion within theoretical bound", fun test_mse_distortion_bound/0},
-        {"inner product estimation unbiased", fun test_inner_product_unbiased/0}
+        {"inner product estimation unbiased", fun test_inner_product_unbiased/0},
+        {"NIF matches Erlang implementation", fun test_nif_matches_erlang/0},
+        {"NIF batch matches individual calls", fun test_nif_batch_matches_individual/0},
+        {"NIF works with different bit widths", fun test_nif_bit_widths/0},
+        {"NIF simd_info returns valid backend", fun test_nif_simd_info/0}
      ]
     }.
 
@@ -397,6 +401,87 @@ test_info() ->
     %% Compression: ~2.6x
     ?assert(BytesPerVector < 128 * 4),  %% Less than float32
     ?assert(CompressionRatio > 1.0).    %% Actually compresses
+
+%%====================================================================
+%% NIF Tests
+%%====================================================================
+
+test_nif_matches_erlang() ->
+    %% NIF distance should match Erlang implementation within float tolerance
+    {ok, Config} = barrel_vectordb_turboquant:new(#{bits => 3, dimension => 64, seed => 42}),
+
+    Errors = lists:map(
+        fun(I) ->
+            rand:seed(exsss, {I * 17, I * 31, I * 47}),
+            V1 = random_vector(64),
+            V2 = random_vector(64),
+
+            Tables = barrel_vectordb_turboquant:precompute_tables(Config, V1),
+            Code2 = barrel_vectordb_turboquant:encode(Config, V2),
+
+            ErlangDist = barrel_vectordb_turboquant:distance(Tables, Code2),
+            NifDist = barrel_vectordb_turboquant:distance_nif(Tables, Code2),
+
+            abs(ErlangDist - NifDist)
+        end,
+        lists:seq(1, 50)
+    ),
+
+    MaxError = lists:max(Errors),
+    %% Should match within float precision (1e-5)
+    ?assert(MaxError < 1.0e-5).
+
+test_nif_batch_matches_individual() ->
+    %% Batch NIF should return same results as individual calls
+    {ok, Config} = barrel_vectordb_turboquant:new(#{bits => 3, dimension => 32, seed => 42}),
+
+    Query = random_vector(32),
+    Tables = barrel_vectordb_turboquant:precompute_tables(Config, Query),
+
+    %% Encode multiple vectors
+    Vectors = [random_vector(32) || _ <- lists:seq(1, 20)],
+    Codes = [barrel_vectordb_turboquant:encode(Config, V) || V <- Vectors],
+
+    %% Compute distances individually
+    IndividualDists = [barrel_vectordb_turboquant:distance_nif(Tables, C) || C <- Codes],
+
+    %% Compute distances in batch
+    BatchDists = barrel_vectordb_turboquant:batch_distance_nif(Tables, Codes),
+
+    %% Should be identical
+    ?assertEqual(length(IndividualDists), length(BatchDists)),
+
+    Errors = [abs(I - B) || {I, B} <- lists:zip(IndividualDists, BatchDists)],
+    MaxError = lists:max(Errors),
+    ?assert(MaxError < 1.0e-10).
+
+test_nif_bit_widths() ->
+    %% Test NIF works correctly with different bit widths (2, 3, 4)
+    lists:foreach(
+        fun(Bits) ->
+            {ok, Config} = barrel_vectordb_turboquant:new(#{
+                bits => Bits, dimension => 32, seed => 42
+            }),
+
+            V1 = random_vector(32),
+            V2 = random_vector(32),
+
+            Tables = barrel_vectordb_turboquant:precompute_tables(Config, V1),
+            Code2 = barrel_vectordb_turboquant:encode(Config, V2),
+
+            ErlangDist = barrel_vectordb_turboquant:distance(Tables, Code2),
+            NifDist = barrel_vectordb_turboquant:distance_nif(Tables, Code2),
+
+            Error = abs(ErlangDist - NifDist),
+            ?assert(Error < 1.0e-5)
+        end,
+        [2, 3, 4]
+    ).
+
+test_nif_simd_info() ->
+    %% simd_info should return a valid backend atom
+    Backend = barrel_vectordb_turboquant_nif:simd_info(),
+    ?assert(lists:member(Backend, [avx2, neon, scalar])).
 
 %%====================================================================
 %% Theoretical Bound Tests (arXiv:2504.19874)

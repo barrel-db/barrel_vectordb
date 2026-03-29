@@ -88,7 +88,7 @@
     next_int_id = 0 :: non_neg_integer(),
 
     %% Quantization settings
-    quantization_method = none :: pq | turboquant | none,
+    quantization_method = none :: pq | turboquant | subspace_turboquant | none,
 
     %% PQ compression (always in RAM)
     pq_state :: term() | undefined,       %% Trained PQ for compression
@@ -171,9 +171,10 @@
 %%   - hot_layer: Enable hot memory layer for fast writes (default: false)
 %%   - hot_max_size: Maximum vectors in hot layer before compaction (default: 10000)
 %%   - hot_compaction_threshold: Trigger compaction at this % of max (default: 0.8)
-%%   - quantization: none | pq | turboquant (default: none)
-%%   - tq_bits: TurboQuant bits per component (default: 3, when quantization=turboquant)
+%%   - quantization: none | pq | turboquant | subspace_turboquant (default: none)
+%%   - tq_bits: TurboQuant bits per component (default: 3, when quantization=turboquant or subspace_turboquant)
 %%   - tq_seed: TurboQuant random seed (default: 42)
+%%   - tq_m: Number of subspaces for subspace_turboquant (default: auto, based on dimension)
 -spec new(map()) -> {ok, diskann_index()} | {error, term()}.
 new(Options) ->
     R = maps:get(r, Options, 64),
@@ -199,7 +200,7 @@ new(Options) ->
         _ when Dimension > 0 ->
             case validate_storage_options(StorageMode, BasePath) of
                 ok ->
-                    %% Initialize TurboQuant if requested
+                    %% Initialize TurboQuant or Subspace-TurboQuant if requested
                     TQResult = case QuantizationMethod of
                         turboquant ->
                             TQBits = maps:get(tq_bits, Options, 3),
@@ -208,6 +209,16 @@ new(Options) ->
                                 bits => TQBits,
                                 dimension => Dimension,
                                 seed => TQSeed
+                            });
+                        subspace_turboquant ->
+                            TQBits = maps:get(tq_bits, Options, 3),
+                            TQSeed = maps:get(tq_seed, Options, 42),
+                            TQM = maps:get(tq_m, Options, barrel_vectordb_turboquant_subspace:select_m(Dimension)),
+                            barrel_vectordb_turboquant_subspace:new(#{
+                                bits => TQBits,
+                                dimension => Dimension,
+                                seed => TQSeed,
+                                m => TQM
                             });
                         _ ->
                             {ok, undefined}
@@ -244,7 +255,7 @@ new(Options) ->
                                     new_disk_mode(Config, BasePath, CacheMaxSize, HotOpts, QuantizationMethod, TQState)
                             end;
                         {error, TQError} ->
-                            {error, {turboquant_init_failed, TQError}}
+                            {error, {quantization_init_failed, QuantizationMethod, TQError}}
                     end;
                 {error, _} = Error ->
                     Error
@@ -1396,13 +1407,22 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
         false ->
             #{enabled => false}
     end,
-    %% TurboQuant info
+    %% Quantization info
     QuantizationInfo = case QuantMethod of
         turboquant when TQState =/= undefined ->
             TQInfo = barrel_vectordb_turboquant:info(TQState),
             #{
                 method => turboquant,
                 bits => maps:get(bits, TQInfo),
+                bytes_per_vector => maps:get(bytes_per_vector, TQInfo),
+                num_codes => maps:size(TQCodes)
+            };
+        subspace_turboquant when TQState =/= undefined ->
+            TQInfo = barrel_vectordb_turboquant_subspace:info(TQState),
+            #{
+                method => subspace_turboquant,
+                bits => maps:get(bits, TQInfo),
+                m => maps:get(m, TQInfo),
                 bytes_per_vector => maps:get(bytes_per_vector, TQInfo),
                 num_codes => maps:size(TQCodes)
             };

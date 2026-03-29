@@ -32,6 +32,8 @@
     decode/2,
     precompute_tables/2,
     distance/2,
+    distance_nif/2,
+    batch_distance_nif/2,
     batch_encode/2,
     info/1
 ]).
@@ -285,6 +287,23 @@ info(#tq_config{bits = Bits, qjl_bits = QJLBits, dimension = Dim,
         compression_ratio => (Dim * 4) / TotalBytes,  %% vs float32
         training_required => false
     }.
+
+%% @doc Compute ADC distance using SIMD-accelerated NIF.
+%% This is the optimized version that should be used for production workloads.
+-spec distance_nif(distance_tables(), tq_code()) -> float().
+distance_nif(Tables, Code) when is_binary(Tables), is_binary(Code) ->
+    <<?TQ_VERSION:8, Bits:8, _:16, _/binary>> = Code,
+    barrel_vectordb_turboquant_nif:adc_distance(Tables, Code, Bits).
+
+%% @doc Compute ADC distance for multiple codes using SIMD-accelerated NIF.
+%% Amortizes NIF call overhead for batch operations.
+-spec batch_distance_nif(distance_tables(), [tq_code()]) -> [float()].
+batch_distance_nif(Tables, Codes) when is_binary(Tables), is_list(Codes) ->
+    case Codes of
+        [] -> [];
+        [<<_:8, Bits:8, _/binary>> | _] ->
+            barrel_vectordb_turboquant_nif:batch_adc_distance(Tables, Codes, Bits)
+    end.
 
 %%====================================================================
 %% Internal Functions

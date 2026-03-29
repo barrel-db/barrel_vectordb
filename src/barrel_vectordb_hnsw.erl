@@ -163,9 +163,10 @@ new() ->
 %%   - ef_construction: Build-time ef (default: 200)
 %%   - distance_fn: cosine | euclidean (default: cosine)
 %%   - dimension: Vector dimension (default: 768)
-%%   - quantization: scalar | turboquant | none (default: scalar)
-%%   - tq_bits: TurboQuant bits per component (default: 3, when quantization=turboquant)
+%%   - quantization: scalar | turboquant | subspace_turboquant | none (default: scalar)
+%%   - tq_bits: TurboQuant bits per component (default: 3, when quantization=turboquant or subspace_turboquant)
 %%   - tq_seed: TurboQuant random seed (default: 42)
+%%   - tq_m: Number of subspaces for subspace_turboquant (default: auto, based on dimension)
 -spec new(map()) -> hnsw_index().
 new(Options) ->
     M = maps:get(m, Options, 16),
@@ -177,7 +178,7 @@ new(Options) ->
 
     Ml = 1.0 / math:log(M),
 
-    %% Initialize TurboQuant if requested
+    %% Initialize TurboQuant or Subspace-TurboQuant if requested
     TQState = case Quantization of
         turboquant ->
             TQBits = maps:get(tq_bits, Options, 3),
@@ -189,6 +190,19 @@ new(Options) ->
             }) of
                 {ok, TQ} -> TQ;
                 {error, Reason} -> error({turboquant_init_failed, Reason})
+            end;
+        subspace_turboquant ->
+            TQBits = maps:get(tq_bits, Options, 3),
+            TQSeed = maps:get(tq_seed, Options, 42),
+            TQM = maps:get(tq_m, Options, barrel_vectordb_turboquant_subspace:select_m(Dimension)),
+            case barrel_vectordb_turboquant_subspace:new(#{
+                bits => TQBits,
+                dimension => Dimension,
+                seed => TQSeed,
+                m => TQM
+            }) of
+                {ok, TQ} -> TQ;
+                {error, Reason} -> error({subspace_turboquant_init_failed, Reason})
             end;
         _ ->
             undefined
