@@ -328,7 +328,7 @@ validate_config(_, _) ->
 %% per config and reused for all encode/decode operations.
 generate_rotation_matrix(Dim, Seed) ->
     %% Seed the random generator
-    rand:seed(exsss, {Seed, Seed + 1, Seed + 2}),
+    _ = rand:seed(exsss, {Seed, Seed + 1, Seed + 2}),
 
     %% Generate random Gaussian matrix (stored as list of column vectors)
     %% We orthogonalize columns to get Q from QR decomposition
@@ -597,7 +597,7 @@ unpack_bits(<<>>, _Bits, _Count, _Buffer, _BufferBits, Acc) ->
 %% Generate QJL random sign matrix
 %% Returns D x QJLDim matrix of +1/-1 values packed as bits
 generate_qjl_matrix(Dim, QJLDim, Seed) ->
-    rand:seed(exsss, {Seed, Seed + 1, Seed + 2}),
+    _ = rand:seed(exsss, {Seed, Seed + 1, Seed + 2}),
     %% Generate random signs for D x QJLDim matrix
     %% Store as bits (1 = +1, 0 = -1)
     Signs = [rand:uniform(2) - 1 || _ <- lists:seq(1, Dim * QJLDim)],
