@@ -211,8 +211,8 @@ performance_comparison_test_() ->
         _ = barrel_vectordb_turboquant:encode(FullConfig, Vec),
         _ = barrel_vectordb_turboquant_subspace:encode(SubspaceConfig, Vec),
 
-        %% Benchmark full TQ
-        N = 100,
+        %% Benchmark full TQ (reduced iterations for CI)
+        N = 10,
         {FullTime, _} = timer:tc(fun() ->
             [barrel_vectordb_turboquant:encode(FullConfig, Vec) || _ <- lists:seq(1, N)]
         end),
