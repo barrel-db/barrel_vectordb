@@ -14,9 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory /__w/barrel_vectordb/barrel_vectordb
+
       - name: Install dependencies
         run: |
-          apt-get update && apt-get install -y cmake libsnappy-dev liblz4-dev libzstd-dev python3 python3-pip python3-venv
+          apt-get update && apt-get install -y cmake libsnappy-dev liblz4-dev libzstd-dev python3 python3-pip python3-venv python3-dev
 
       - name: Cache Python venv
         uses: actions/cache@v4
@@ -75,6 +78,9 @@ jobs:
           rebar3 eunit --module=barrel_vectordb_cluster_tests
           # Rerank unit tests
           rebar3 eunit --module=barrel_vectordb_rerank_tests
+          # TurboQuant tests
+          rebar3 eunit --module=barrel_vectordb_turboquant_tests
+          rebar3 eunit --module=barrel_vectordb_turboquant_subspace_tests
 
       - name: Coverage
         run: rebar3 cover --verbose
@@ -87,9 +93,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory /__w/barrel_vectordb/barrel_vectordb
+
       - name: Install dependencies
         run: |
-          apt-get update && apt-get install -y cmake libsnappy-dev liblz4-dev libzstd-dev
+          apt-get update && apt-get install -y cmake libsnappy-dev liblz4-dev libzstd-dev python3-dev
 
       - name: Cache PLT
         uses: actions/cache@v4

@@ -87,11 +87,19 @@
     id_db_standalone = false :: boolean(),  %% true if we opened standalone DB (not from store)
     next_int_id = 0 :: non_neg_integer(),
 
+    %% Quantization settings
+    quantization_method = none :: pq | turboquant | subspace_turboquant | none,
+
     %% PQ compression (always in RAM)
     pq_state :: term() | undefined,       %% Trained PQ for compression
     pq_codes = #{} :: #{binary() => binary()},  %% Id -> PQ code (M bytes)
     pq_codes_int = #{} :: #{non_neg_integer() => binary()},  %% IntId -> PQ code
-    use_pq = false :: boolean(),          %% Whether to use PQ for search
+    use_pq = false :: boolean(),          %% Whether to use PQ for search (legacy, use quantization_method)
+
+    %% TurboQuant compression (always in RAM, no training required)
+    tq_state :: term() | undefined,       %% TurboQuant config
+    tq_codes = #{} :: #{binary() => binary()},  %% Id -> TQ code
+    tq_codes_int = #{} :: #{non_neg_integer() => binary()},  %% IntId -> TQ code
 
     %% Deletion tracking
     deleted_set = sets:new() :: sets:set(binary()),
@@ -128,6 +136,7 @@
     hot_next_int_id = 0 :: non_neg_integer(),
     hot_deleted = sets:new() :: sets:set(non_neg_integer()),
     hot_pq_codes = #{} :: #{non_neg_integer() => binary()},
+    hot_tq_codes = #{} :: #{non_neg_integer() => binary()},  %% Hot layer TQ codes
     hot_size = 0 :: non_neg_integer(),
     compaction_in_progress = false :: boolean()
 }).
@@ -162,6 +171,10 @@
 %%   - hot_layer: Enable hot memory layer for fast writes (default: false)
 %%   - hot_max_size: Maximum vectors in hot layer before compaction (default: 10000)
 %%   - hot_compaction_threshold: Trigger compaction at this % of max (default: 0.8)
+%%   - quantization: none | pq | turboquant | subspace_turboquant (default: none)
+%%   - tq_bits: TurboQuant bits per component (default: 3, when quantization=turboquant or subspace_turboquant)
+%%   - tq_seed: TurboQuant random seed (default: 42)
+%%   - tq_m: Number of subspaces for subspace_turboquant (default: auto, based on dimension)
 -spec new(map()) -> {ok, diskann_index()} | {error, term()}.
 new(Options) ->
     R = maps:get(r, Options, 64),
@@ -178,6 +191,8 @@ new(Options) ->
     HotEnabled = maps:get(hot_layer, Options, false),
     HotMaxSize = maps:get(hot_max_size, Options, 10000),
     HotCompactionThreshold = maps:get(hot_compaction_threshold, Options, 0.8),
+    %% Quantization options
+    QuantizationMethod = maps:get(quantization, Options, none),
 
     case Dimension of
         undefined ->
@@ -185,32 +200,62 @@ new(Options) ->
         _ when Dimension > 0 ->
             case validate_storage_options(StorageMode, BasePath) of
                 ok ->
-                    Config = #diskann_config{
-                        r = R,
-                        l_build = LBuild,
-                        l_search = LSearch,
-                        alpha = Alpha,
-                        dimension = Dimension,
-                        distance_fn = DistanceFn,
-                        assume_normalized = AssumeNormalized
-                    },
-                    HotOpts = #{
-                        enabled => HotEnabled,
-                        max_size => HotMaxSize,
-                        compaction_threshold => HotCompactionThreshold
-                    },
-                    case StorageMode of
-                        memory ->
-                            {ok, #diskann_index{
-                                config = Config,
-                                storage_mode = memory,
-                                base_path = undefined,
-                                cache_max_size = CacheMaxSize,
-                                cache_table = undefined
-                            }};
-                        disk ->
-                            %% V2 format: Set up RocksDB and disk files
-                            new_disk_mode(Config, BasePath, CacheMaxSize, HotOpts)
+                    %% Initialize TurboQuant or Subspace-TurboQuant if requested
+                    TQResult = case QuantizationMethod of
+                        turboquant ->
+                            TQBits = maps:get(tq_bits, Options, 3),
+                            TQSeed = maps:get(tq_seed, Options, 42),
+                            barrel_vectordb_turboquant:new(#{
+                                bits => TQBits,
+                                dimension => Dimension,
+                                seed => TQSeed
+                            });
+                        subspace_turboquant ->
+                            TQBits = maps:get(tq_bits, Options, 3),
+                            TQSeed = maps:get(tq_seed, Options, 42),
+                            TQM = maps:get(tq_m, Options, barrel_vectordb_turboquant_subspace:select_m(Dimension)),
+                            barrel_vectordb_turboquant_subspace:new(#{
+                                bits => TQBits,
+                                dimension => Dimension,
+                                seed => TQSeed,
+                                m => TQM
+                            });
+                        _ ->
+                            {ok, undefined}
+                    end,
+                    case TQResult of
+                        {ok, TQState} ->
+                            Config = #diskann_config{
+                                r = R,
+                                l_build = LBuild,
+                                l_search = LSearch,
+                                alpha = Alpha,
+                                dimension = Dimension,
+                                distance_fn = DistanceFn,
+                                assume_normalized = AssumeNormalized
+                            },
+                            HotOpts = #{
+                                enabled => HotEnabled,
+                                max_size => HotMaxSize,
+                                compaction_threshold => HotCompactionThreshold
+                            },
+                            case StorageMode of
+                                memory ->
+                                    {ok, #diskann_index{
+                                        config = Config,
+                                        storage_mode = memory,
+                                        base_path = undefined,
+                                        cache_max_size = CacheMaxSize,
+                                        cache_table = undefined,
+                                        quantization_method = QuantizationMethod,
+                                        tq_state = TQState
+                                    }};
+                                disk ->
+                                    %% V2 format: Set up RocksDB and disk files
+                                    new_disk_mode(Config, BasePath, CacheMaxSize, HotOpts, QuantizationMethod, TQState)
+                            end;
+                        {error, TQError} ->
+                            {error, {quantization_init_failed, QuantizationMethod, TQError}}
                     end;
                 {error, _} = Error ->
                     Error
@@ -225,7 +270,7 @@ validate_storage_options(_, _) ->
     ok.
 
 %% Create new disk mode index (V2 format with RocksDB)
-new_disk_mode(Config, BasePath, CacheMaxSize, HotOpts) ->
+new_disk_mode(Config, BasePath, CacheMaxSize, HotOpts, QuantizationMethod, TQState) ->
     BasePathBin = to_binary_or_undefined(BasePath),
     %% Extract hot layer options
     HotEnabled = maps:get(enabled, HotOpts, false),
@@ -261,7 +306,10 @@ new_disk_mode(Config, BasePath, CacheMaxSize, HotOpts) ->
                         %% Hot layer configuration
                         hot_enabled = HotEnabled,
                         hot_max_size = HotMaxSize,
-                        hot_compaction_threshold = HotCompactionThreshold
+                        hot_compaction_threshold = HotCompactionThreshold,
+                        %% Quantization configuration
+                        quantization_method = QuantizationMethod,
+                        tq_state = TQState
                     }};
                 {error, Reason} ->
                     close_id_db(IdDb, Standalone),
@@ -1333,6 +1381,7 @@ size(#diskann_index{size = Size, deleted_set = Deleted,
 info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
                     deleted_set = Deleted, nodes = Nodes, use_pq = UsePQ,
                     pq_state = PQState, pq_codes = PQCodes,
+                    quantization_method = QuantMethod, tq_state = TQState, tq_codes = TQCodes,
                     storage_mode = StorageMode, base_path = BasePath,
                     cache_table = CacheTable, cache_max_size = CacheMaxSize,
                     hot_size = HotSize} = Index) ->
@@ -1358,6 +1407,30 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
         false ->
             #{enabled => false}
     end,
+    %% Quantization info
+    QuantizationInfo = case QuantMethod of
+        turboquant when TQState =/= undefined ->
+            TQInfo = barrel_vectordb_turboquant:info(TQState),
+            #{
+                method => turboquant,
+                bits => maps:get(bits, TQInfo),
+                bytes_per_vector => maps:get(bytes_per_vector, TQInfo),
+                num_codes => maps:size(TQCodes)
+            };
+        subspace_turboquant when TQState =/= undefined ->
+            TQInfo = barrel_vectordb_turboquant_subspace:info(TQState),
+            #{
+                method => subspace_turboquant,
+                bits => maps:get(bits, TQInfo),
+                m => maps:get(m, TQInfo),
+                bytes_per_vector => maps:get(bytes_per_vector, TQInfo),
+                num_codes => maps:size(TQCodes)
+            };
+        pq when UsePQ, PQState =/= undefined ->
+            #{method => pq, enabled => true};
+        _ ->
+            #{method => none}
+    end,
     CacheSize = case CacheTable of
         undefined -> 0;
         _ -> ets:info(CacheTable, size)
@@ -1377,6 +1450,7 @@ info(#diskann_index{config = Config, size = Size, medoid_id = Medoid,
         medoid => Medoid,
         avg_degree => AvgDegree,
         pq => PQInfo,
+        quantization => QuantizationInfo,
         storage => StorageInfo,
         hot_layer => hot_layer_info(Index),
         config => #{
@@ -3678,6 +3752,7 @@ clear_hot_layer(Index) ->
         hot_next_int_id = 0,
         hot_deleted = sets:new(),
         hot_pq_codes = #{},
+        hot_tq_codes = #{},
         hot_size = 0,
         compaction_in_progress = false
     }.

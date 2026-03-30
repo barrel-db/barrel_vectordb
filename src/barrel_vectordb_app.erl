@@ -24,8 +24,6 @@
 %% @doc Start the barrel_vectordb application.
 %% @private
 start(_StartType, _StartArgs) ->
-    %% Initialize Python execution queue (ETS-based rate limiter)
-    ok = barrel_embed_python_queue:init(),
     %% Start cluster dependencies if enabled
     ok = maybe_start_cluster_deps(),
     barrel_vectordb_sup:start_link().
