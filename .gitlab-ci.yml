@@ -13,7 +13,7 @@ variables:
 default:
   image: erlang:27
   before_script:
-    - apt-get update && apt-get install -y cmake libsnappy-dev liblz4-dev libzstd-dev
+    - apt-get update && apt-get install -y cmake libsnappy-dev liblz4-dev libzstd-dev python3
     # Configure git credentials for private dependencies using CI job token
     - git config --global credential.helper store
     - echo "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.enki.io" > ~/.git-credentials

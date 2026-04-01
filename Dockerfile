@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsnappy-dev \
     liblz4-dev \
     libzstd-dev \
+    python3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
