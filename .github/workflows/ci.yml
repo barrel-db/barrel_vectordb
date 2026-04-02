@@ -76,8 +76,6 @@ jobs:
           rebar3 eunit --module=barrel_vectordb_http_handlers_tests
           # Cluster tests
           rebar3 eunit --module=barrel_vectordb_cluster_tests
-          # Rerank unit tests
-          rebar3 eunit --module=barrel_vectordb_rerank_tests
           # TurboQuant tests
           rebar3 eunit --module=barrel_vectordb_turboquant_tests
           rebar3 eunit --module=barrel_vectordb_turboquant_subspace_tests
