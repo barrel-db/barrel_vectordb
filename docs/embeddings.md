@@ -211,7 +211,7 @@ Add `barrel_rerank` to your dependencies:
 %% rebar.config
 {deps, [
     {barrel_vectordb, "1.4.0"},
-    {barrel_embed, "2.2.0"},
+    {barrel_embed, "2.2.1"},
     {barrel_rerank, "0.1.1"}
 ]}.
 ```

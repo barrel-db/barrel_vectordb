@@ -22,7 +22,7 @@
 ### With Embeddings (requires barrel_embed)
 
 ```erlang
-%% rebar.config: {deps, [{barrel_vectordb, "1.4.0"}, {barrel_embed, "2.2.0"}]}.
+%% rebar.config: {deps, [{barrel_vectordb, "1.4.0"}, {barrel_embed, "2.2.1"}]}.
 
 %% Start a store with local Python embeddings
 {ok, _} = barrel_vectordb:start_link(#{
@@ -533,7 +533,7 @@ Cross-encoder reranking for improved search relevance. Use after initial vector 
 %% Add barrel_rerank to your deps
 {deps, [
     {barrel_vectordb, "1.4.0"},
-    {barrel_embed, "2.2.0"},
+    {barrel_embed, "2.2.1"},
     {barrel_rerank, "0.1.1"}
 ]}.
 ```
