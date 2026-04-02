@@ -22,7 +22,7 @@
 ### With Embeddings (requires barrel_embed)
 
 ```erlang
-%% rebar.config: {deps, [{barrel_vectordb, "1.4.0"}, {barrel_embed, "2.1.0"}]}.
+%% rebar.config: {deps, [{barrel_vectordb, "1.4.0"}, {barrel_embed, "2.2.0"}]}.
 
 %% Start a store with local Python embeddings
 {ok, _} = barrel_vectordb:start_link(#{
@@ -67,23 +67,18 @@ Add to your `rebar.config`:
 ]}.
 ```
 
-### Optional Dependencies
+### Optional: Reranking
 
-barrel_vectordb has optional dependencies for embeddings and reranking:
+For cross-encoder reranking, add barrel_rerank:
 
 ```erlang
 {deps, [
     {barrel_vectordb, "1.4.0"},
-    %% Optional: automatic text embeddings
-    {barrel_embed, "2.1.0"},
-    %% Optional: cross-encoder reranking
-    {barrel_rerank, "0.1.1"}
+    {barrel_rerank, "0.1.1"}  %% Optional: cross-encoder reranking
 ]}.
 ```
 
-**Without barrel_embed**: Use `add_vector/5` and `search_vector/3` with pre-computed vectors.
-
-**With barrel_embed**: Use `add/4` and `search/3` with automatic text embedding.
+**Note:** barrel_embed is included as a dependency of barrel_vectordb. To use text-based operations (`add/4`, `search/3`), configure an embedder. Without an embedder configured, use `add_vector/5` and `search_vector/3` with pre-computed vectors.
 
 ## Core API
 
@@ -281,18 +276,8 @@ See [TurboQuant Documentation](https://docs.barrel-db.eu/vectordb/guides/turboqu
 
 ## Embedding Providers
 
-> **Requires**: `barrel_embed` dependency
-
 Embedder is **explicit** - if not configured, only `add_vector/5` and `search_vector/3` work.
 Text-based operations return `{error, embedder_not_configured}`.
-
-```erlang
-%% Add barrel_embed to your deps
-{deps, [
-    {barrel_vectordb, "1.4.0"},
-    {barrel_embed, "2.1.0"}
-]}.
-```
 
 ### Local
 
@@ -548,7 +533,7 @@ Cross-encoder reranking for improved search relevance. Use after initial vector 
 %% Add barrel_rerank to your deps
 {deps, [
     {barrel_vectordb, "1.4.0"},
-    {barrel_embed, "2.1.0"},
+    {barrel_embed, "2.2.0"},
     {barrel_rerank, "0.1.1"}
 ]}.
 ```

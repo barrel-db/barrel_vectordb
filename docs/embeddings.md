@@ -1,24 +1,6 @@
 # Embedding Models
 
-Barrel VectorDB supports multiple embedding providers through the optional `barrel_embed` dependency.
-
-## Installation
-
-Add `barrel_embed` to your dependencies:
-
-```erlang
-%% rebar.config
-{deps, [
-    {barrel_vectordb, "1.4.0"},
-    {barrel_embed, "2.1.0"}
-]}.
-```
-
-Or use the embed profile:
-
-```bash
-rebar3 as embed compile
-```
+Barrel VectorDB supports multiple embedding providers through the `barrel_embed` library (included as a dependency).
 
 The embedder is **explicit** - if not configured, only `add_vector/5` and `search_vector/3` work. Text-based operations return `{error, embedder_not_configured}`.
 
@@ -229,7 +211,7 @@ Add `barrel_rerank` to your dependencies:
 %% rebar.config
 {deps, [
     {barrel_vectordb, "1.4.0"},
-    {barrel_embed, "2.1.0"},
+    {barrel_embed, "2.2.0"},
     {barrel_rerank, "0.1.1"}
 ]}.
 ```
