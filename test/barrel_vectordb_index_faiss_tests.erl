@@ -258,13 +258,13 @@ setup_faiss_store() ->
               integer_to_list(erlang:unique_integer([positive])),
 
     %% Mock embedder for deterministic tests
-    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_embed)),
     timer:sleep(10),
-    meck:new(barrel_vectordb_embed, [passthrough, no_link]),
-    meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
+    meck:new(barrel_embed, [passthrough, no_link]),
+    meck:expect(barrel_embed, init, fun(_Config) ->
         {ok, #{providers => [], dimension => 4, batch_size => 32}}
     end),
-    meck:expect(barrel_vectordb_embed, embed, fun(Text, _State) ->
+    meck:expect(barrel_embed, embed, fun(Text, _State) ->
         Hash = erlang:phash2(Text, 1000000),
         Vec = [Hash / 1000000.0, (Hash rem 1000) / 1000.0,
                ((Hash rem 100) / 100.0), ((Hash rem 10) / 10.0)],
@@ -282,7 +282,7 @@ setup_faiss_store() ->
 cleanup_faiss_store(TestDir) ->
     catch barrel_vectordb:stop(faiss_test_store),
     timer:sleep(50),
-    catch meck:unload(barrel_vectordb_embed),
+    catch meck:unload(barrel_embed),
     os:cmd("rm -rf " ++ TestDir),
     ok.
 

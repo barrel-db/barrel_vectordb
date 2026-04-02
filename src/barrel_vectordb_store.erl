@@ -46,7 +46,7 @@
     cf_diskann_ids_rev :: rocksdb:cf_handle(),
     hnsw_index :: hnsw_index(),
     dimension :: pos_integer(),
-    embed_state :: barrel_vectordb_embed:embed_state() | undefined,
+    embed_state :: barrel_embed:embed_state() | undefined,
     config :: map()
 }).
 
@@ -128,7 +128,7 @@ init(Config) ->
 
     %% Ensure dimensions is in config for embed init
     EmbedConfig = Config#{dimensions => Dimension},
-    case barrel_vectordb_embed:init(EmbedConfig) of
+    case barrel_embed:init(EmbedConfig) of
         {ok, EmbedState} ->
             case init_rocksdb(DbPath) of
                 {ok, Db, CfHandles} ->
@@ -340,7 +340,7 @@ rebuild_loop(Db, Iter, {ok, Key, VectorBin}, CfHnsw, Index) ->
 %% Get vector for add operation
 get_vector_for_add(auto, Text, #state{dimension = Dim, embed_state = EmbedState}) ->
     %% Call embedding service
-    case barrel_vectordb_embed:embed(Text, EmbedState) of
+    case barrel_embed:embed(Text, EmbedState) of
         {ok, Vector} when length(Vector) =:= Dim ->
             {ok, Vector};
         {ok, Vector} ->
@@ -431,7 +431,7 @@ do_delete(ChunkId, #state{db = Db, cf_vectors = CfV, cf_metadata = CfM,
 do_search(Query, K, Options, #state{dimension = Dim, embed_state = EmbedState} = State)
     when is_binary(Query) ->
     %% Text query - need to embed first
-    case barrel_vectordb_embed:embed(Query, EmbedState) of
+    case barrel_embed:embed(Query, EmbedState) of
         {ok, Vector} when length(Vector) =:= Dim ->
             do_search(Vector, K, Options, State);
         {ok, Vector} ->

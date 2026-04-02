@@ -19,9 +19,11 @@
 
 ## Quick Start
 
-### With Embeddings
+### With Embeddings (requires barrel_embed)
 
 ```erlang
+%% rebar.config: {deps, [{barrel_vectordb, "1.4.0"}, {barrel_embed, "2.1.0"}]}.
+
 %% Start a store with local Python embeddings
 {ok, _} = barrel_vectordb:start_link(#{
     name => my_store,
@@ -61,9 +63,27 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {barrel_vectordb, {git, "https://github.com/barrel-db/barrel_vectordb.git", {branch, "main"}}}
+    {barrel_vectordb, "1.4.0"}
 ]}.
 ```
+
+### Optional Dependencies
+
+barrel_vectordb has optional dependencies for embeddings and reranking:
+
+```erlang
+{deps, [
+    {barrel_vectordb, "1.4.0"},
+    %% Optional: automatic text embeddings
+    {barrel_embed, "2.1.0"},
+    %% Optional: cross-encoder reranking
+    {barrel_rerank, "0.1.1"}
+]}.
+```
+
+**Without barrel_embed**: Use `add_vector/5` and `search_vector/3` with pre-computed vectors.
+
+**With barrel_embed**: Use `add/4` and `search/3` with automatic text embedding.
 
 ## Core API
 
@@ -261,8 +281,18 @@ See [TurboQuant Documentation](https://docs.barrel-db.eu/vectordb/guides/turboqu
 
 ## Embedding Providers
 
+> **Requires**: `barrel_embed` dependency
+
 Embedder is **explicit** - if not configured, only `add_vector/5` and `search_vector/3` work.
 Text-based operations return `{error, embedder_not_configured}`.
+
+```erlang
+%% Add barrel_embed to your deps
+{deps, [
+    {barrel_vectordb, "1.4.0"},
+    {barrel_embed, "2.1.0"}
+]}.
+```
 
 ### Local
 
@@ -430,7 +460,7 @@ Neural sparse embeddings with term expansion. Produces sparse vectors for hybrid
 
 ```erlang
 %% Initialize SPLADE provider
-{ok, State} = barrel_vectordb_embed:init(#{
+{ok, State} = barrel_embed:init(#{
     embedder => {splade, #{
         model => "prithivida/Splade_PP_en_v1"
     }}
@@ -453,7 +483,7 @@ Multi-vector embeddings for fine-grained token-level matching.
 
 ```erlang
 %% Initialize ColBERT provider
-{ok, State} = barrel_vectordb_embed:init(#{
+{ok, State} = barrel_embed:init(#{
     embedder => {colbert, #{
         model => "colbert-ir/colbertv2.0"
     }}
@@ -479,7 +509,7 @@ Cross-modal embeddings for image-text search. Images and text share the same vec
 
 ```erlang
 %% Initialize CLIP provider
-{ok, State} = barrel_vectordb_embed:init(#{
+{ok, State} = barrel_embed:init(#{
     embedder => {clip, #{
         model => "openai/clip-vit-base-patch32"
     }}
@@ -510,11 +540,22 @@ pip install transformers torch pillow
 
 ## Reranking
 
+> **Requires**: `barrel_rerank` dependency
+
 Cross-encoder reranking for improved search relevance. Use after initial vector search.
 
 ```erlang
-%% Initialize reranker
-{ok, Reranker} = barrel_vectordb_rerank:init(#{
+%% Add barrel_rerank to your deps
+{deps, [
+    {barrel_vectordb, "1.4.0"},
+    {barrel_embed, "2.1.0"},
+    {barrel_rerank, "0.1.1"}
+]}.
+```
+
+```erlang
+%% Start the reranker
+{ok, Reranker} = barrel_rerank:start_link(#{
     model => "cross-encoder/ms-marco-MiniLM-L-6-v2"
 }).
 
@@ -524,20 +565,22 @@ Cross-encoder reranking for improved search relevance. Use after initial vector 
 
 %% Stage 2: Rerank candidates
 Docs = [maps:get(text, C) || C <- Candidates],
-{ok, Ranked} = barrel_vectordb_rerank:rerank(Query, Docs, Reranker).
+{ok, Ranked} = barrel_rerank:rerank(Reranker, Query, Docs).
 %% => [{0, 0.95}, {2, 0.82}, {1, 0.45}, ...]  %% {Index, Score}
 
 %% Get top 10 after reranking
 Top10 = [lists:nth(Idx + 1, Candidates) || {Idx, _} <- lists:sublist(Ranked, 10)].
 
 %% Cleanup
-ok = barrel_vectordb_rerank:stop(Reranker).
+ok = barrel_rerank:stop(Reranker).
 ```
 
 **Setup:**
 
-```bash
-pip install transformers torch
+The venv with dependencies is auto-created on first use, or manually:
+
+```erlang
+{ok, _} = barrel_rerank_venv:ensure_venv().
 ```
 
 **Supported Models:**
@@ -605,28 +648,19 @@ Unit tests use mocking and don't require external dependencies:
 rebar3 eunit
 ```
 
-### Integration Tests
+### With Optional Dependencies
 
-Integration tests verify real embedding providers. They require backends to be available:
+To run tests that exercise barrel_embed:
 
 ```bash
-# Setup for local provider
-pip install sentence-transformers
-
-# Setup for Ollama provider
-ollama serve &
-ollama pull nomic-embed-text
-
-# Setup for OpenAI provider
-export OPENAI_API_KEY=sk-...
-
-# Run integration tests
-rebar3 eunit --module=barrel_vectordb_integration_tests
+rebar3 as test_embed eunit
 ```
 
-Tests automatically skip if their required backend is unavailable.
+To run tests with all optional dependencies:
 
-See `test/integration/README.md` for details.
+```bash
+rebar3 as test_full eunit
+```
 
 ## Performance
 

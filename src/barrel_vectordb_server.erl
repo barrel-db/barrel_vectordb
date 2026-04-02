@@ -241,7 +241,7 @@ init({Name, Config}) ->
 
     %% Initialize embedder
     EmbedConfig = Config#{dimensions => Dimension},
-    case barrel_vectordb_embed:init(EmbedConfig) of
+    case barrel_embed:init(EmbedConfig) of
         {ok, EmbedState} ->
             case init_rocksdb(DbPath) of
                 {ok, Db, CfHandles} ->
@@ -431,7 +431,7 @@ process_single_op({call, From, count}, #state{index = Index, index_module = Mod}
     {{reply, From, Mod:size(Index)}, State};
 
 process_single_op({call, From, embedder_info}, #state{embed_state = EmbedState} = State) ->
-    Info = barrel_vectordb_embed:info(EmbedState),
+    Info = barrel_embed:info(EmbedState),
     {{reply, From, {ok, Info}}, State};
 
 process_single_op({call, From, checkpoint}, #state{db = Db, cf_hnsw = CfHnsw,
@@ -774,11 +774,11 @@ rebuild_loop(Iter, {ok, Key, VectorBin}, Index, Mod) ->
 
 %% Embed text using the configured provider
 do_embed(Text, #state{embed_state = EmbedState}) ->
-    barrel_vectordb_embed:embed(Text, EmbedState).
+    barrel_embed:embed(Text, EmbedState).
 
 %% Embed batch of texts
 do_embed_batch(Texts, #state{embed_state = EmbedState}) ->
-    barrel_vectordb_embed:embed_batch(Texts, EmbedState).
+    barrel_embed:embed_batch(Texts, EmbedState).
 
 %% Add a document
 do_add(Id, Text, Metadata, Vector, #state{db = Db, cf_vectors = CfV,

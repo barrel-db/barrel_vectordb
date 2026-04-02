@@ -83,22 +83,22 @@ setup_test() ->
               integer_to_list(erlang:unique_integer([positive])),
 
     %% Ensure meck is clean
-    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_embed)),
     timer:sleep(10),
 
     %% Mock embedder with deterministic vectors based on text hash
-    meck:new(barrel_vectordb_embed, [passthrough, no_link]),
-    meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
+    meck:new(barrel_embed, [passthrough, no_link]),
+    meck:expect(barrel_embed, init, fun(_Config) ->
         {ok, #{providers => [], dimension => 8, batch_size => 32}}
     end),
-    meck:expect(barrel_vectordb_embed, embed, fun(Text, _State) ->
+    meck:expect(barrel_embed, embed, fun(Text, _State) ->
         {ok, text_to_vector(Text, 8)}
     end),
-    meck:expect(barrel_vectordb_embed, embed_batch, fun(Texts, _State) ->
+    meck:expect(barrel_embed, embed_batch, fun(Texts, _State) ->
         Vectors = [text_to_vector(T, 8) || T <- Texts],
         {ok, Vectors}
     end),
-    meck:expect(barrel_vectordb_embed, info, fun(_State) ->
+    meck:expect(barrel_embed, info, fun(_State) ->
         #{providers => [], dimension => 8}
     end),
 
@@ -114,7 +114,7 @@ setup_test() ->
 cleanup_test({_Pid, TestDir}) ->
     catch barrel_vectordb:stop(comprehensive_test_store),
     timer:sleep(50),
-    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_embed)),
     os:cmd("rm -rf " ++ TestDir),
     ok.
 

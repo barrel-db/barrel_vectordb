@@ -57,15 +57,15 @@ setup_test() ->
     TestDir = "/tmp/barrel_vectordb_api_test_" ++ integer_to_list(erlang:unique_integer([positive])),
 
     %% Ensure meck is clean before starting
-    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_embed)),
     timer:sleep(10),
 
     %% Mock the embedder to return deterministic vectors
-    meck:new(barrel_vectordb_embed, [passthrough, no_link]),
-    meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
+    meck:new(barrel_embed, [passthrough, no_link]),
+    meck:expect(barrel_embed, init, fun(_Config) ->
         {ok, #{providers => [], dimension => 3, batch_size => 32}}
     end),
-    meck:expect(barrel_vectordb_embed, embed, fun(Text, _State) ->
+    meck:expect(barrel_embed, embed, fun(Text, _State) ->
         Hash = erlang:phash2(Text, 1000000),
         Vec = [
             Hash / 1000000.0,
@@ -74,7 +74,7 @@ setup_test() ->
         ],
         {ok, Vec}
     end),
-    meck:expect(barrel_vectordb_embed, embed_batch, fun(Texts, _State) ->
+    meck:expect(barrel_embed, embed_batch, fun(Texts, _State) ->
         Vectors = lists:map(fun(Text) ->
             Hash = erlang:phash2(Text, 1000000),
             [
@@ -85,7 +85,7 @@ setup_test() ->
         end, Texts),
         {ok, Vectors}
     end),
-    meck:expect(barrel_vectordb_embed, info, fun(_State) ->
+    meck:expect(barrel_embed, info, fun(_State) ->
         #{providers => [], dimension => 3}
     end),
 
@@ -102,7 +102,7 @@ cleanup_test({_Pid, TestDir}) ->
     catch barrel_vectordb:stop(test_store),
     %% Make sure meck is fully unloaded
     timer:sleep(50),  %% Allow gen_server to stop
-    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_embed)),
     os:cmd("rm -rf " ++ TestDir),
     ok.
 

@@ -1,6 +1,26 @@
 # Embedding Models
 
-Barrel VectorDB supports multiple embedding providers. The embedder is **explicit** - if not configured, only `add_vector/5` and `search_vector/3` work. Text-based operations return `{error, embedder_not_configured}`.
+Barrel VectorDB supports multiple embedding providers through the optional `barrel_embed` dependency.
+
+## Installation
+
+Add `barrel_embed` to your dependencies:
+
+```erlang
+%% rebar.config
+{deps, [
+    {barrel_vectordb, "1.4.0"},
+    {barrel_embed, "2.1.0"}
+]}.
+```
+
+Or use the embed profile:
+
+```bash
+rebar3 as embed compile
+```
+
+The embedder is **explicit** - if not configured, only `add_vector/5` and `search_vector/3` work. Text-based operations return `{error, embedder_not_configured}`.
 
 ## Providers
 
@@ -137,7 +157,7 @@ embedder => [
 Neural sparse embeddings with term expansion for hybrid search.
 
 ```erlang
-{ok, State} = barrel_vectordb_embed:init(#{
+{ok, State} = barrel_embed:init(#{
     embedder => {splade, #{
         model => "prithivida/Splade_PP_en_v1"
     }}
@@ -158,7 +178,7 @@ pip install transformers torch
 Multi-vector embeddings for fine-grained token-level matching.
 
 ```erlang
-{ok, State} = barrel_vectordb_embed:init(#{
+{ok, State} = barrel_embed:init(#{
     embedder => {colbert, #{
         model => "colbert-ir/colbertv2.0"
     }}
@@ -175,7 +195,7 @@ Score = barrel_vectordb_embed_colbert:maxsim_score(QueryVecs, DocVecs).
 Cross-modal embeddings for image-text search.
 
 ```erlang
-{ok, State} = barrel_vectordb_embed:init(#{
+{ok, State} = barrel_embed:init(#{
     embedder => {clip, #{
         model => "openai/clip-vit-base-patch32"
     }}
@@ -199,10 +219,32 @@ pip install transformers torch pillow
 
 ## Reranking
 
-Cross-encoder reranking for improved search relevance:
+Cross-encoder reranking for improved search relevance using the optional `barrel_rerank` package.
+
+### Installation
+
+Add `barrel_rerank` to your dependencies:
 
 ```erlang
-{ok, Reranker} = barrel_vectordb_rerank:init(#{
+%% rebar.config
+{deps, [
+    {barrel_vectordb, "1.4.0"},
+    {barrel_embed, "2.1.0"},
+    {barrel_rerank, "0.1.1"}
+]}.
+```
+
+Or use the rerank profile:
+
+```bash
+rebar3 as rerank compile
+```
+
+### Usage
+
+```erlang
+%% Start the reranker
+{ok, Reranker} = barrel_rerank:start_link(#{
     model => "cross-encoder/ms-marco-MiniLM-L-6-v2"
 }).
 
@@ -210,10 +252,11 @@ Cross-encoder reranking for improved search relevance:
 {ok, Candidates} = barrel_vectordb:search(Store, Query, #{k => 100}).
 
 Docs = [maps:get(text, C) || C <- Candidates],
-{ok, Ranked} = barrel_vectordb_rerank:rerank(Query, Docs, Reranker).
+{ok, Ranked} = barrel_rerank:rerank(Reranker, Query, Docs).
 %% => [{0, 0.95}, {2, 0.82}, {1, 0.45}, ...]
 
-ok = barrel_vectordb_rerank:stop(Reranker).
+%% Stop when done
+ok = barrel_rerank:stop(Reranker).
 ```
 
 **Supported Reranker Models:**

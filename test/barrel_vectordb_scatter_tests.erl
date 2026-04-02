@@ -59,14 +59,14 @@ setup() ->
     (catch meck:unload(barrel_vectordb_cluster_client)),
     (catch meck:unload(barrel_vectordb_shard_manager)),
     (catch meck:unload(barrel_vectordb_shard_locator)),
-    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_embed)),
     (catch meck:unload(barrel_vectordb)),
     (catch meck:unload(rpc)),
     timer:sleep(10),
     meck:new(barrel_vectordb_cluster_client, [passthrough, no_link]),
     meck:new(barrel_vectordb_shard_manager, [passthrough, no_link]),
     meck:new(barrel_vectordb_shard_locator, [passthrough, no_link]),
-    meck:new(barrel_vectordb_embed, [passthrough, no_link]),
+    meck:new(barrel_embed, [passthrough, no_link]),
     meck:new(barrel_vectordb, [passthrough, no_link]),
     meck:new(rpc, [unstick, passthrough, no_link]),
     ok.
@@ -75,7 +75,7 @@ cleanup(_) ->
     meck:unload(barrel_vectordb_cluster_client),
     meck:unload(barrel_vectordb_shard_manager),
     meck:unload(barrel_vectordb_shard_locator),
-    meck:unload(barrel_vectordb_embed),
+    meck:unload(barrel_embed),
     meck:unload(barrel_vectordb),
     meck:unload(rpc),
     ok.
@@ -98,7 +98,7 @@ test_search_valid_embedder() ->
     %% Mock embedder
     MockEmbedder = mock_embedder,
     MockVector = [0.1, 0.2, 0.3],
-    meck:expect(barrel_vectordb_embed, embed, fun(<<"query">>, mock_embedder) ->
+    meck:expect(barrel_embed, embed, fun(<<"query">>, mock_embedder) ->
         {ok, MockVector}
     end),
 
@@ -125,10 +125,10 @@ test_search_valid_embedder() ->
                                              #{embedder => MockEmbedder}),
 
     ?assertMatch({ok, [#{key := <<"doc1">>, score := 0.95}]}, Result),
-    ?assert(meck:called(barrel_vectordb_embed, embed, [<<"query">>, mock_embedder])).
+    ?assert(meck:called(barrel_embed, embed, [<<"query">>, mock_embedder])).
 
 test_search_embed_error() ->
-    meck:expect(barrel_vectordb_embed, embed, fun(_, _) ->
+    meck:expect(barrel_embed, embed, fun(_, _) ->
         {error, embedding_failed}
     end),
 

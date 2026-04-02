@@ -53,15 +53,15 @@ setup_test() ->
     },
 
     %% Ensure meck is clean before starting - be thorough
-    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_embed)),
     timer:sleep(10),  %% Allow meck to fully unload
 
     %% Start a mock embeddings server that just returns dummy vectors
-    meck:new(barrel_vectordb_embed, [non_strict, no_link]),
-    meck:expect(barrel_vectordb_embed, init, fun(_Config) ->
+    meck:new(barrel_embed, [non_strict, no_link]),
+    meck:expect(barrel_embed, init, fun(_Config) ->
         {ok, #{providers => [], dimension => 3, batch_size => 32}}
     end),
-    meck:expect(barrel_vectordb_embed, embed, fun(Text, _EmbedState) ->
+    meck:expect(barrel_embed, embed, fun(Text, _EmbedState) ->
         %% Generate deterministic vector from text
         Hash = erlang:phash2(Text, 1000000),
         Vec = [
@@ -82,7 +82,7 @@ cleanup_test({_Pid, TestDir}) ->
     timer:sleep(50),  %% Allow gen_server to stop
 
     %% Cleanup meck
-    (catch meck:unload(barrel_vectordb_embed)),
+    (catch meck:unload(barrel_embed)),
 
     %% Remove test directory
     os:cmd("rm -rf " ++ TestDir),
