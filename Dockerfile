@@ -49,6 +49,7 @@ COPY include/ include/
 COPY c_src/ c_src/
 COPY priv/ priv/
 COPY config/ config/
+COPY do_cmake.sh ./
 
 # Initialize git repo (needed by rocksdb build hooks)
 RUN git init && git config user.email "build@local" && git config user.name "build"
