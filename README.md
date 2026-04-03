@@ -19,11 +19,9 @@
 
 ## Quick Start
 
-### With Embeddings (requires barrel_embed)
+### With Embeddings
 
 ```erlang
-%% rebar.config: {deps, [{barrel_vectordb, "1.4.0"}, {barrel_embed, "2.2.1"}]}.
-
 %% Start a store with local Python embeddings
 {ok, _} = barrel_vectordb:start_link(#{
     name => my_store,
@@ -67,6 +65,8 @@ Add to your `rebar.config`:
 ]}.
 ```
 
+This includes `barrel_embed` for embedding support. To use text-based operations (`add/4`, `search/3`), configure an embedder provider. Without an embedder configured, use `add_vector/5` and `search_vector/3` with pre-computed vectors.
+
 ### Optional: Reranking
 
 For cross-encoder reranking, add barrel_rerank:
@@ -74,11 +74,9 @@ For cross-encoder reranking, add barrel_rerank:
 ```erlang
 {deps, [
     {barrel_vectordb, "1.4.0"},
-    {barrel_rerank, "0.1.1"}  %% Optional: cross-encoder reranking
+    {barrel_rerank, "0.1.1"}
 ]}.
 ```
-
-**Note:** barrel_embed is included as a dependency of barrel_vectordb. To use text-based operations (`add/4`, `search/3`), configure an embedder. Without an embedder configured, use `add_vector/5` and `search_vector/3` with pre-computed vectors.
 
 ## Core API
 
