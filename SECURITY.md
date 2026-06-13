@@ -29,9 +29,7 @@ If you discover a security vulnerability in barrel_vectordb, please report it re
 
 This policy applies to:
 - barrel_vectordb core library
-- HTTP Gateway API
 - Vector index backends (HNSW, FAISS, DiskANN)
-- Multi-tenant isolation
 - Storage layer
 
 ### Out of Scope
@@ -48,14 +46,11 @@ This policy applies to:
 
 ## Security Best Practices
 
-When deploying barrel_vectordb:
+When embedding barrel_vectordb:
 
-1. **Network Security**: Use TLS for HTTP endpoints
-2. **API Keys**: Use strong, unique API keys for multi-tenant gateway
-3. **Tenant Isolation**: Verify tenant isolation is properly configured
-4. **Rate Limiting**: Enable rate limiting in production
-5. **Updates**: Keep dependencies updated
-6. **Monitoring**: Enable metrics and alerting
+1. **Storage**: Protect the RocksDB data directory with appropriate filesystem permissions
+2. **Embedder Endpoints**: Use TLS when calling remote embedding providers (Ollama, OpenAI)
+3. **Updates**: Keep dependencies updated
 
 ## Acknowledgments
 

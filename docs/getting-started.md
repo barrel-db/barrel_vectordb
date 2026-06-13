@@ -225,5 +225,5 @@ See [DiskANN documentation](features.md#diskann-index) for detailed configuratio
 ## Next Steps
 
 - [Embedding Models](embeddings.md) - Configure embedding providers
-- [Clustering](clustering.md) - Scale out with sharding
-- [HTTP API](api/http.md) - REST API reference
+- [BM25 Text Search](bm25-disk.md) - Lexical and hybrid search
+- [Erlang API](api/erlang.md) - Full API reference

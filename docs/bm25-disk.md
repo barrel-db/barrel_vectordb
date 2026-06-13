@@ -15,7 +15,6 @@ and Lucene operate.
 - **Block-Max MaxScore** - Early termination skips 95%+ of postings
 - **Hot layer** - Sub-millisecond writes, background compaction
 - **O(1) startup** - Lazy loading, no full index load
-- **Cluster-ready** - Scatter-gather search across shards
 - **Hybrid search** - Combine BM25 + vector search with RRF or linear fusion
 
 ### When to Use
@@ -163,64 +162,6 @@ ok = barrel_vectordb_server:bm25_compact(Store).
 %%     avgdl => 150.5
 %% }
 ```
-
-## Cluster Usage
-
-### Creating a Collection with BM25
-
-```erlang
-%% Create a sharded collection with disk BM25
-ok = barrel_vectordb:create_collection(<<"articles">>, #{
-    dimension => 768,
-    shards => 4,
-    replication_factor => 2,
-    backend => diskann,
-    bm25_backend => disk,
-    bm25_config => #{
-        hot_max_size => 100000,
-        k1 => 1.2,
-        b => 0.75
-    }
-}).
-```
-
-Each shard gets its own independent BM25 index with:
-
-- Own postings files on disk
-- Own block-max index (mmap'd)
-- Own hot layer
-- Own RocksDB term/doc ID mapping
-
-### Cluster BM25 Search
-
-```erlang
-%% BM25 search across all shards (scatter-gather)
-{ok, Results} = barrel_vectordb:cluster_search_bm25(<<"articles">>, <<"erlang">>, #{
-    k => 10
-}).
-%% Returns: [{<<"doc123">>, 3.45}, {<<"doc456">>, 2.89}, ...]
-```
-
-### Cluster Hybrid Search
-
-```erlang
-%% Hybrid search across all shards
-{ok, Results} = barrel_vectordb:cluster_search_hybrid(<<"articles">>, <<"erlang">>, #{
-    k => 10,
-    bm25_weight => 0.5,
-    vector_weight => 0.5,
-    fusion => rrf
-}).
-```
-
-The cluster hybrid search:
-
-1. Embeds the query once (using collection's embedder)
-2. Scatters both BM25 and vector queries to all shards
-3. Each shard returns its local results
-4. Gathers and deduplicates results
-5. Applies fusion algorithm (RRF or linear)
-6. Returns top-K results
 
 ## Architecture
 

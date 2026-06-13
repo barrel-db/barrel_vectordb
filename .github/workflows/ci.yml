@@ -58,7 +58,6 @@ jobs:
           rebar3 eunit --module=barrel_vectordb_pq_tests
           rebar3 eunit --module=barrel_vectordb_diskann_tests
           rebar3 eunit --module=barrel_vectordb_diskann_file_tests
-          rebar3 eunit --module=barrel_vectordb_scatter_tests
           rebar3 eunit --module=barrel_vectordb_library_tests
           # BM25 tests
           rebar3 eunit --module=barrel_vectordb_bm25_tests
@@ -66,16 +65,6 @@ jobs:
           rebar3 eunit --module=barrel_vectordb_bm25_disk_file_tests
           rebar3 eunit --module=barrel_vectordb_bm25_formula_tests
           rebar3 eunit --module=barrel_vectordb_bm25_corpus_tests
-          # Gateway tests
-          rebar3 eunit --module=barrel_vectordb_gateway_keys_tests
-          rebar3 eunit --module=barrel_vectordb_gateway_prefix_tests
-          rebar3 eunit --module=barrel_vectordb_gateway_quotas_tests
-          rebar3 eunit --module=barrel_vectordb_gateway_rate_tests
-          rebar3 eunit --module=barrel_vectordb_system_db_tests
-          # HTTP tests
-          rebar3 eunit --module=barrel_vectordb_http_handlers_tests
-          # Cluster tests
-          rebar3 eunit --module=barrel_vectordb_cluster_tests
           # TurboQuant tests
           rebar3 eunit --module=barrel_vectordb_turboquant_tests
           rebar3 eunit --module=barrel_vectordb_turboquant_subspace_tests

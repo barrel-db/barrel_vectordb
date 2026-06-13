@@ -45,16 +45,11 @@ nav:
     - Features: features.md
     - TurboQuant: guides/turboquant.md
     - BM25 Text Search: bm25-disk.md
-    - Clustering: clustering.md
-    - Multi-Tenant Gateway: gateway.md
-    - Docker Deployment: deployment.md
   - Internals:
     - TurboQuant Internals: internals/turboquant.md
   - Erlang API: api/erlang.md
-  - HTTP API: api/http.md
   - Development:
     - Contributing: development/contributing.md
-    - Cluster Testing: development/testing.md
 
 markdown_extensions:
   - pymdownx.highlight:

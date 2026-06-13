@@ -22,21 +22,21 @@ Build AI-powered search into your Erlang applications. Barrel VectorDB provides 
 
     [:octicons-arrow-right-24: Embeddings](embeddings.md)
 
--   :material-server-network: __Clustering__
+-   :material-text-search: __BM25 Text Search__
 
     ---
 
-    Scale out with sharding and automatic rebalancing
+    Lexical and hybrid search alongside vectors
 
-    [:octicons-arrow-right-24: Clustering](clustering.md)
+    [:octicons-arrow-right-24: BM25](bm25-disk.md)
 
 -   :material-api: __API Reference__
 
     ---
 
-    HTTP and Erlang APIs for full control
+    Embedded Erlang API for full control
 
-    [:octicons-arrow-right-24: HTTP API](api/http.md)
+    [:octicons-arrow-right-24: Erlang API](api/erlang.md)
 
 </div>
 
