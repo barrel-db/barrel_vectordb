@@ -3162,8 +3162,8 @@ open_standalone_id_db(BasePath) ->
     CfNames = ["default", "ids_fwd", "ids_rev"],
     DbOpts = [{create_if_missing, true}, {create_missing_column_families, true}],
     CfOpts = [],
-    case rocksdb:open_with_cf(binary_to_list(DbPath), DbOpts,
-                              [{Name, CfOpts} || Name <- CfNames]) of
+    case rocksdb:open(binary_to_list(DbPath), DbOpts,
+                      [{Name, CfOpts} || Name <- CfNames]) of
         {ok, Db, [_Default, CfFwd, CfRev]} ->
             %% Track open database for cleanup
             register_standalone_db(Db),
