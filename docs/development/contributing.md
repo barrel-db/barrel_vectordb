@@ -138,13 +138,6 @@ Add support for new embedding provider
 - Vectors stored with 8-bit quantization
 - HNSW index checkpoints for fast restart
 
-### Clustering
-
-- **barrel_vectordb_mesh.erl**: Cluster coordinator
-- **barrel_vectordb_ra_sm.erl**: Ra state machine
-- **barrel_vectordb_shard_router.erl**: Request routing
-- **barrel_vectordb_scatter.erl**: Scatter-gather for search
-
 ## Reporting Issues
 
 Use the GitLab issue tracker:

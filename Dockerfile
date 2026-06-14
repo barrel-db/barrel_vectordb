@@ -67,7 +67,7 @@ ARG VERSION
 
 # OCI Image labels
 LABEL org.opencontainers.image.title="Barrel VectorDB" \
-      org.opencontainers.image.description="Embeddable vector database with HNSW indexing and clustering" \
+      org.opencontainers.image.description="Embeddable vector database with HNSW indexing" \
       org.opencontainers.image.vendor="Enki" \
       org.opencontainers.image.url="https://gitlab.enki.io/barrel-db/barrel_vectordb" \
       org.opencontainers.image.source="https://gitlab.enki.io/barrel-db/barrel_vectordb" \
@@ -108,25 +108,15 @@ RUN mkdir -p /app/data /app/log \
 # Configuration via Environment Variables
 # ============================================
 #
+# barrel_vectordb is an embedded library. This image runs it as a standalone
+# Erlang node that you interact with over Erlang distribution / a remote shell.
+#
 # Node Configuration:
 #   BARREL_NODE_NAME     - Erlang node name (default: barrel_vectordb@<hostname>)
-#   RELEASE_COOKIE       - Erlang distribution cookie (required for clustering)
+#   RELEASE_COOKIE       - Erlang distribution cookie
 #
 # Storage:
 #   BARREL_DATA_PATH     - Data directory path (default: /app/data)
-#
-# HTTP API:
-#   BARREL_HTTP_PORT     - HTTP API port (default: 8080)
-#   BARREL_HTTP_IP       - HTTP bind address (default: 0.0.0.0)
-#
-# Clustering:
-#   BARREL_ENABLE_CLUSTER - Enable cluster mode (default: false)
-#   BARREL_SEED_NODES     - Comma-separated seed nodes for discovery
-#   BARREL_CLUSTER_NAME   - Cluster name (default: barrel_vectordb)
-#
-# Sharding:
-#   BARREL_DEFAULT_SHARDS          - Default shard count for new collections (default: 1)
-#   BARREL_REPLICATION_FACTOR      - Default replication factor (default: 1)
 #
 # Embedding (optional):
 #   BARREL_EMBEDDER_PROVIDER - Embedding provider: ollama, openai, local, fastembed
@@ -146,17 +136,8 @@ RUN mkdir -p /app/data /app/log \
 # Environment defaults
 ENV RELEASE_COOKIE=barrel_vectordb_secret \
     BARREL_DATA_PATH=/app/data \
-    BARREL_HTTP_PORT=8080 \
-    BARREL_HTTP_IP=0.0.0.0 \
-    BARREL_ENABLE_CLUSTER=false \
-    BARREL_CLUSTER_NAME=barrel_vectordb \
-    BARREL_DEFAULT_SHARDS=1 \
-    BARREL_REPLICATION_FACTOR=1 \
     BARREL_LOG_LEVEL=info \
     BARREL_ASYNC_THREADS=64
-
-# HTTP API port
-EXPOSE 8080
 
 # EPMD port
 EXPOSE 4369
@@ -164,15 +145,12 @@ EXPOSE 4369
 # Erlang distribution ports
 EXPOSE 9100-9200
 
-# Prometheus metrics port (optional)
-EXPOSE 9090
-
 # Volume for persistent data
 VOLUME ["/app/data"]
 
-# Health check
+# Health check - ping the Erlang node
 HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -sf http://localhost:${BARREL_HTTP_PORT}/vectordb/cluster/status || exit 1
+    CMD /app/bin/barrel_vectordb ping || exit 1
 
 # Run as non-root user
 USER barrel

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-06-14
+
+### Removed
+
+- **Clustering**: removed the Ra/Raft mesh, sharding, scatter-gather, and the
+  cluster API (`start_cluster`, `cluster_join`, `cluster_status`,
+  `create_collection`, `cluster_add`, `cluster_search`, and related functions).
+- **HTTP API**: removed the cowboy-based HTTP server, routes, and handlers.
+- **Multi-tenant gateway**: removed the gateway, API keys, quotas, and rate limiting.
+- Dropped the `ra` and `cowboy` dependencies.
+
+barrel_vectordb is now an embedded-only library. The cluster and HTTP code is
+preserved on the `backup/cluster-http-api` branch.
+
 ## [1.5.0] - 2026-02-03
 
 ### Added

@@ -1,6 +1,6 @@
 {application, barrel_vectordb, [
-    {description, "Erlang vector database with pluggable backends (HNSW, FAISS) and RocksDB for semantic search"},
-    {vsn, "1.5.0"},
+    {description, "Embedded Erlang vector database with pluggable backends (HNSW, FAISS) and RocksDB for semantic search"},
+    {vsn, "2.0.0"},
     {registered, [barrel_vectordb_sup]},
     {mod, {barrel_vectordb_app, []}},
     {applications, [
@@ -10,20 +10,16 @@
         ssl,
         inets,
         rocksdb,
-        hackney
+        hackney,
+        gen_batch_server
     ]},
-    %% Cluster deps - loaded on demand, not auto-started
-    {included_applications, [ra, cowboy]},
     {env, [
         {default_dimensions, 768},
         {default_embedder, {local, #{}}},
         {hnsw_m, 16},
         {hnsw_ef_construction, 200},
         {hnsw_ef_search, 50},
-        {embed_cache_size, 10000},
-        %% Clustering (disabled by default)
-        {enable_cluster, false},
-        {cluster_options, #{}}
+        {embed_cache_size, 10000}
     ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
