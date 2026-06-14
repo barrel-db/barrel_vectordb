@@ -246,7 +246,7 @@ init_rocksdb(DbPath) ->
         {?CF_DISKANN_IDS_REV, []}
     ],
 
-    case rocksdb:open_with_cf(DbPath, Options, CfDefs) of
+    case rocksdb:open(DbPath, Options, CfDefs) of
         {ok, Db, [_Default, CfVectors, CfMetadata, CfText, CfHnsw,
                   CfDiskannIdsFwd, CfDiskannIdsRev]} ->
             {ok, Db, #{
