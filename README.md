@@ -1,3 +1,8 @@
+
+> [!IMPORTANT]
+> This repository is archived. `barrel_vectordb` now lives in the Barrel umbrella
+> at [barrel-db/barrel](https://github.com/barrel-db/barrel), under
+> `apps/barrel_vectordb`. Development, issues, and releases happen there.
 <div align="center">
 
 # barrel_vectordb
